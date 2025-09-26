@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuro-ant-optimizer"
+version = "2.0.0"
+description = "Neural-guided Ant Colony Portfolio Optimizer with robust constraints"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name="Quantitative Research Team"}]
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+  "torch>=2.0",
+  "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5.0", "mypy>=1.10"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
