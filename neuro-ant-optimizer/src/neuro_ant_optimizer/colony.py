@@ -20,6 +20,7 @@ class Ant:
         risk_net,
         alpha: float,
         beta: float,
+        trans_matrix: np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Build a tour using pheromone transitions and (optional) risk heuristics.
@@ -27,7 +28,17 @@ class Ant:
         """
 
         n = self.n_assets
-        trans = pheromone_net.transition_matrix().detach().cpu().numpy()
+        if trans_matrix is None:
+            # Inference path: avoid building a grad graph
+            with torch.no_grad():
+                trans = (
+                    pheromone_net.transition_matrix()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+        else:
+            trans = trans_matrix
         risk = np.ones(n, dtype=float)
         if risk_net is not None:
             I = torch.eye(n, device=risk_net.param_device, dtype=risk_net.param_dtype)

@@ -130,9 +130,14 @@ class NeuroAntPortfolioOptimizer:
         else:
             self.risk_optim = None
 
-        self.phero_optim = torch.optim.Adam(self.phero_net.parameters(), lr=self.cfg.lr)
         self.mse = nn.MSELoss()
-        self.bce = nn.BCELoss()
+        # Stable policy trainer (KL + entropy)
+        self.policy_trainer = PolicyTrainer(
+            self.phero_net,
+            device=self.device,
+            dtype=self.cfg.dtype,
+            lr=self.cfg.lr,
+        )
 
         self.history: List[Dict[str, float]] = []
         self.best_w: Optional[np.ndarray] = None
@@ -168,6 +173,14 @@ class NeuroAntPortfolioOptimizer:
 
         for iteration in range(self.cfg.max_iter):
             ants = [Ant(self.n_assets) for _ in range(self.cfg.n_ants)]
+            # Cache transition matrix once for this iteration
+            with torch.no_grad():
+                cached_T = (
+                    self.phero_net.transition_matrix()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
             portfolios: List[np.ndarray] = []
             scores: List[float] = []
 
@@ -177,6 +190,7 @@ class NeuroAntPortfolioOptimizer:
                     self.risk_net,
                     alpha=1.0,
                     beta=self.cfg.risk_weight,
+                    trans_matrix=cached_T,
                 )
                 weights = self._apply_constraints(weights, constraints)
                 score = self._score(weights, mu, cov, objective, constraints)
@@ -462,21 +476,13 @@ class NeuroAntPortfolioOptimizer:
 
         k = min(self.cfg.topk_train, len(portfolios))
         idx = np.argsort(scores)[-k:]
-        targets = [np.tile(np.clip(portfolios[i], 0.0, 1.0), (self.n_assets, 1)) for i in idx]
-        target_mat = np.mean(targets, axis=0)
-        target_mat = np.clip(target_mat, 1e-6, 1 - 1e-6).astype(np.float32)
-
-        asset_idx = torch.arange(self.n_assets, dtype=torch.long, device=self.device)
-        target_tensor = torch.from_numpy(target_mat).to(self.device, dtype=self.cfg.dtype)
-
-        self.phero_net.train()
-        self.phero_optim.zero_grad()
-        pred = torch.clamp(self.phero_net(asset_idx), 1e-6, 1 - 1e-6)
-        loss = self.bce(pred, target_tensor)
-        loss.backward()
-        clip_grad_norm_(self.phero_net.parameters(), self.cfg.grad_clip)
-        self.phero_optim.step()
-        self.phero_net.eval()
+        # Build a small batch of (N,N) targets from top portfolios
+        targets = np.stack(
+            [np.tile(np.clip(portfolios[i], 0.0, 1.0), (self.n_assets, 1)) for i in idx],
+            axis=0,
+        ).astype(np.float32)
+        # One stable trainer step (KL to EMA + entropy bonus)
+        _ = self.policy_trainer.step(targets)
 
 
 class PolicyTrainer:
