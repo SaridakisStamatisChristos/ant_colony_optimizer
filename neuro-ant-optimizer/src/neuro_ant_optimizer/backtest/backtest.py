@@ -1221,6 +1221,8 @@ _OBJECTIVE_MAP: Dict[str, OptimizationObjective] = {
     "min_cvar": OptimizationObjective.MIN_CVAR,
     "tracking_error": OptimizationObjective.TRACKING_ERROR_MIN,
     "info_ratio": OptimizationObjective.INFO_RATIO_MAX,
+    "te_target": OptimizationObjective.TRACKING_ERROR_TARGET,
+    "multi_term": OptimizationObjective.MULTI_TERM,
 }
 
 
@@ -1251,6 +1253,9 @@ def backtest(
     active_max: Optional[Any] = None,
     active_group_caps: Optional[Any] = None,
     factor_bounds: Optional[Any] = None,
+    te_target: float = 0.0,
+    lambda_te: float = 0.0,
+    gamma_turnover: float = 0.0,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -1318,10 +1323,14 @@ def backtest(
         in {
             OptimizationObjective.TRACKING_ERROR_MIN,
             OptimizationObjective.INFO_RATIO_MAX,
+            OptimizationObjective.TRACKING_ERROR_TARGET,
+            OptimizationObjective.MULTI_TERM,
         }
         and benchmark_series is None
     ):
-        raise ValueError("Benchmark series required for tracking_error/info_ratio objectives")
+        raise ValueError(
+            "Benchmark series required for tracking_error/info_ratio/te_target/multi_term objectives"
+        )
 
     asset_names = (
         list(getattr(df, "columns", []))
@@ -1382,6 +1391,15 @@ def backtest(
     constraint_manifest["factor_bounds"] = factor_bounds_manifest
 
     optimizer = _build_optimizer(returns.shape[1], seed)
+    if te_target < 0.0:
+        raise ValueError("te_target must be non-negative")
+    if lambda_te < 0.0:
+        raise ValueError("lambda_te must be non-negative")
+    if gamma_turnover < 0.0:
+        raise ValueError("gamma_turnover must be non-negative")
+    optimizer.cfg.te_target = float(te_target)
+    optimizer.cfg.lambda_te = float(lambda_te)
+    optimizer.cfg.gamma_turnover = float(gamma_turnover)
     constraints = _build_constraints(returns.shape[1])
     constraints.factor_tolerance = factor_tolerance
     constraints.min_active_weight = float("-inf") if min_active_val is None else float(min_active_val)
@@ -1824,6 +1842,9 @@ def backtest(
         "realized_cvar": realized_cvar,
         "tracking_error": tracking_error,
         "info_ratio": info_ratio,
+        "te_target": float(optimizer.cfg.te_target),
+        "lambda_te": float(optimizer.cfg.lambda_te),
+        "gamma_turnover": float(optimizer.cfg.gamma_turnover),
         "factor_records": factor_records,
         "factor_names": factor_names,
         "factor_tolerance": factor_tolerance,
@@ -1854,6 +1875,9 @@ def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
             "realized_cvar",
             "tracking_error",
             "info_ratio",
+            "te_target",
+            "lambda_te",
+            "gamma_turnover",
         ]:
             writer.writerow([key, results[key]])
 
@@ -2141,6 +2165,24 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         choices=sorted(_OBJECTIVE_MAP.keys()),
         default="sharpe",
     )
+    parser.add_argument(
+        "--te-target",
+        type=float,
+        default=0.0,
+        help="Target tracking error level for te_target objective",
+    )
+    parser.add_argument(
+        "--lambda-te",
+        type=float,
+        default=0.0,
+        help="Penalty weight applied to tracking error in multi_term objective",
+    )
+    parser.add_argument(
+        "--gamma-turnover",
+        type=float,
+        default=0.0,
+        help="Penalty weight applied to turnover in multi_term objective",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
     parser.add_argument(
@@ -2264,6 +2306,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         active_max=parsed.active_max,
         active_group_caps=active_group_spec,
         factor_bounds=factor_bounds_spec,
+        te_target=parsed.te_target,
+        lambda_te=parsed.lambda_te,
+        gamma_turnover=parsed.gamma_turnover,
     )
 
     out_dir = Path(parsed.out)
