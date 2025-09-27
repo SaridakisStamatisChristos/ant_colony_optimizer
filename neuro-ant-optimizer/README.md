@@ -56,3 +56,26 @@ python -m pip install "neuro-ant-optimizer[backtest]"
 neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 --objective sharpe --out bt_out
 ```
 Outputs `metrics.csv`, `equity.csv`, and (if matplotlib is present) `equity.png`.
+## Offline usage (no install)
+If your environment blocks package downloads:
+```bash
+# Run the CLI module directly via PYTHONPATH
+PYTHONPATH=neuro-ant-optimizer/src \
+python -m neuro_ant_optimizer.backtest \
+  --csv neuro-ant-optimizer/backtest/sample_returns.csv \
+  --lookback 5 --step 2 --ewma_span 3 --objective sharpe --out neuro-ant-optimizer/backtest/out_local
+```
+
+## Offline wheel build & install
+You can build a wheel locally and install it without hitting the internet:
+```bash
+# Build wheel from source (no network needed for your own package)
+python -m pip install --upgrade pip wheel setuptools   # if available locally
+python -m pip wheel . -w dist
+
+# Install the wheel offline (no deps)
+python -m pip install --no-deps --no-index dist/neuro_ant_optimizer-*.whl
+```
+> Note: optional extras like `[backtest]` pull external packages. For fully offline use,
+> prefer the `python -m neuro_ant_optimizer.backtest` invocation shown above, or pre-stage
+> wheels for `pandas`/`matplotlib` on an internal index and install with `--find-links`.
