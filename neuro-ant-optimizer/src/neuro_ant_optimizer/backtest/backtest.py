@@ -295,6 +295,17 @@ def _read_csv(csv_path: Path):
     if pd is not None:
         return pd.read_csv(csv_path, index_col=0, parse_dates=True)
 
+    header_cols: Optional[List[str]] = None
+    with csv_path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            header_row = next(reader)
+        except StopIteration:
+            header_row = []
+    if header_row:
+        extracted = [col.strip() for col in header_row[1:]]
+        header_cols = extracted if any(extracted) else None
+
     raw = np.genfromtxt(csv_path, delimiter=",", skip_header=1, dtype=str)
     if raw.size == 0:
         values = np.empty((0, 0), dtype=float)
@@ -305,9 +316,15 @@ def _read_csv(csv_path: Path):
         values = raw[:, 1:].astype(float)
 
     class _Frame:
-        def __init__(self, arr: np.ndarray, idx: Sequence[str]):
+        def __init__(
+            self,
+            arr: np.ndarray,
+            idx: Sequence[str],
+            cols: Optional[Sequence[str]] = None,
+        ):
             self._arr = arr
             self._idx = [np.datetime64(d) for d in idx]
+            self._cols = list(cols) if cols is not None else []
 
         def to_numpy(self, dtype=float):
             return self._arr.astype(dtype)
@@ -316,7 +333,11 @@ def _read_csv(csv_path: Path):
         def index(self):
             return self._idx
 
-    return _Frame(values, dates)
+        @property
+        def columns(self):
+            return self._cols
+
+    return _Frame(values, dates, header_cols)
 
 
 def main(args: Optional[Iterable[str]] = None) -> None:
