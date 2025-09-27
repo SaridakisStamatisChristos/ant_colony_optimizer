@@ -220,6 +220,17 @@ def _write_equity(equity_path: Path, results: Dict[str, Any]) -> None:
     np.savetxt(equity_path, data, fmt="%s", delimiter=",", header=header, comments="")
 
 
+def _write_weights(weights_path: Path, results: Dict[str, Any]) -> None:
+    W = np.asarray(results["weights"], dtype=float)
+    if pd is not None:
+        df = pd.DataFrame(W)
+        df.to_csv(weights_path, index=False)
+        return
+
+    header = ",".join(f"w{i}" for i in range(W.shape[1])) if W.size else ""
+    np.savetxt(weights_path, W, delimiter=",", header=header, comments="")
+
+
 def _read_csv(csv_path: Path):
     if pd is not None:
         return pd.read_csv(csv_path, index_col=0, parse_dates=True)
@@ -261,6 +272,11 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
+    parser.add_argument(
+        "--save-weights",
+        action="store_true",
+        help="Write weights.csv with per-step allocations",
+    )
     parsed = parser.parse_args(args=args)
 
     df = _read_csv(Path(parsed.csv))
@@ -277,6 +293,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_metrics(out_dir / "metrics.csv", results)
     _write_equity(out_dir / "equity.csv", results)
+    if parsed.save_weights:
+        _write_weights(out_dir / "weights.csv", results)
 
     try:
         import matplotlib.pyplot as plt  # type: ignore

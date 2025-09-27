@@ -18,12 +18,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install numpy scipy torch pytest
+          pip install ruff mypy
           # optional extras for CLI smoke
           pip install pandas matplotlib
       - name: Run tests
         env:
           PYTHONPATH: neuro-ant-optimizer/src
         run: pytest -q
+      - name: Ruff (lint)
+        run: |
+          ruff --version
+          ruff check neuro-ant-optimizer/src neuro-ant-optimizer/tests
+      - name: mypy (types)
+        env:
+          MYPYPATH: neuro-ant-optimizer/src
+        run: |
+          mypy neuro-ant-optimizer/src
       - name: CLI smoke (backtest)
         run: |
           neuro-ant-optimizer/src/neuro_ant_optimizer/backtest/backtest.py >/dev/null 2>&1 || true

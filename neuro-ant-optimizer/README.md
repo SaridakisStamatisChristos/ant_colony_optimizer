@@ -53,7 +53,7 @@ print("Sharpe:", res.sharpe_ratio, "Vol:", res.volatility)
 Install optional deps then run:
 ```bash
 python -m pip install "neuro-ant-optimizer[backtest]"
-neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 --objective sharpe --out bt_out
+neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 --objective sharpe --out bt_out --save-weights
 ```
 Outputs `metrics.csv`, `equity.csv`, and (if matplotlib is present) `equity.png`.
 ## Offline usage (no install)
