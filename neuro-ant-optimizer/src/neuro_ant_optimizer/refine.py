@@ -11,6 +11,8 @@ def refine_slsqp(
     bounds: Iterable[tuple[float, float]],
     Aeq: Optional[np.ndarray] = None,
     beq: Optional[np.ndarray] = None,
+    Aineq: Optional[np.ndarray] = None,
+    bineq: Optional[np.ndarray] = None,
     prev: Optional[np.ndarray] = None,
     T: float = 0.0,
     transaction_cost: float = 0.0,
@@ -39,7 +41,9 @@ def refine_slsqp(
 
     cons = []
     if Aeq is not None and beq is not None:
-        cons.append({"type": "eq", "fun": lambda w: Aeq @ w - beq})
+        cons.append({"type": "eq", "fun": lambda w, A=Aeq, b=beq: A @ w - b})
+    if Aineq is not None and bineq is not None:
+        cons.append({"type": "ineq", "fun": lambda w, A=Aineq, b=bineq: b - A @ w})
 
     res = minimize(
         obj,
