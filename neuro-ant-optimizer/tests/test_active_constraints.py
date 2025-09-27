@@ -105,3 +105,47 @@ def test_conflicting_factor_bounds_report_infeasible():
     assert result.feasible is False
     assert result.projection_iterations >= 1
 
+
+def test_projection_idempotence_with_active_and_factors():
+    n = 6
+    opt = NeuroAntPortfolioOptimizer(n_assets=n)
+    benchmark = np.array([0.2, 0.15, 0.2, 0.15, 0.2, 0.1], dtype=float)
+    prev = benchmark.copy()
+    loadings = np.array(
+        [
+            [1.0, 0.2],
+            [0.8, 0.0],
+            [0.2, 1.0],
+            [0.1, 0.6],
+            [0.5, -0.4],
+            [0.3, 0.3],
+        ],
+        dtype=float,
+    )
+    constraints = PortfolioConstraints(
+        min_weight=0.0,
+        max_weight=0.6,
+        leverage_limit=1.0,
+        equality_enforce=True,
+        benchmark_weights=benchmark,
+        min_active_weight=-0.05,
+        max_active_weight=0.05,
+        active_group_map=[0, 0, 1, 1, 2, 2],
+        active_group_bounds={0: (-0.02, 0.03), 1: (-0.03, 0.04)},
+        sector_map=[0, 0, 1, 1, 2, 2],
+        max_sector_concentration=0.55,
+        factor_loadings=loadings,
+        factor_lower_bounds=np.array([0.15, -0.25], dtype=float),
+        factor_upper_bounds=np.array([0.65, 0.35], dtype=float),
+        factor_tolerance=1e-6,
+        prev_weights=prev,
+        max_turnover=0.25,
+    )
+
+    weights = np.array([0.55, 0.05, 0.05, 0.1, 0.15, 0.1], dtype=float)
+    projected = opt._apply_constraints(weights, constraints)
+    reprojection = opt._apply_constraints(projected, constraints)
+
+    assert np.allclose(projected, reprojection, atol=1e-8)
+    assert opt._feasible(projected, constraints)
+

@@ -357,26 +357,26 @@ class NeuroAntPortfolioOptimizer:
 
     def _apply_constraints(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
         lower, upper, bench = self._compute_weight_bounds(constraints)
-        clipped = np.clip(weights, lower, upper)
         projection_iters = 0
 
-        if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
-            clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
-        else:
+        def project_leverage(vec: np.ndarray) -> np.ndarray:
+            clipped = np.clip(vec, lower, upper)
+            if (
+                constraints.equality_enforce
+                and abs(constraints.leverage_limit - 1.0) < 1e-12
+            ):
+                return self._project_sum_with_bounds(clipped, lower, upper, 1.0)
             limit = float(constraints.leverage_limit)
             if clipped.sum() > limit:
-                clipped = self._project_sum_with_bounds(clipped, lower, upper, limit)
-        clipped = np.clip(clipped, lower, upper)
+                return self._project_sum_with_bounds(clipped, lower, upper, limit)
+            return clipped
+
+        adjusted = project_leverage(weights)
 
         if constraints.sector_map is not None:
-            clipped = self._enforce_sector_caps(clipped, constraints)
-            clipped = np.clip(clipped, lower, upper)
-            if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
-                clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
-            elif clipped.sum() > constraints.leverage_limit:
-                clipped = self._project_sum_with_bounds(
-                    clipped, lower, upper, constraints.leverage_limit
-                )
+            adjusted = project_leverage(
+                self._enforce_sector_caps(adjusted, constraints)
+            )
 
         if (
             bench is not None
@@ -385,29 +385,32 @@ class NeuroAntPortfolioOptimizer:
         ):
             for _ in range(5):
                 projection_iters += 1
-                clipped = self._enforce_active_groups(clipped, bench, constraints, lower, upper)
-                if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
-                    clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
-                elif clipped.sum() > constraints.leverage_limit:
-                    clipped = self._project_sum_with_bounds(
-                        clipped, lower, upper, constraints.leverage_limit
+                adjusted = project_leverage(
+                    self._enforce_active_groups(
+                        adjusted, bench, constraints, lower, upper
                     )
-                clipped = np.clip(clipped, lower, upper)
-                if self._active_groups_feasible(clipped, bench, constraints):
+                )
+                if self._active_groups_feasible(adjusted, bench, constraints):
                     break
 
         if constraints.factors_enabled() or constraints.factor_bounds_enabled():
             for _ in range(12):
                 projection_iters += 1
-                clipped = self._enforce_factor_constraints(clipped, constraints, lower, upper)
-                clipped = np.clip(clipped, lower, upper)
-                if self._factor_constraints_satisfied(clipped, constraints, tol=0.0):
+                adjusted = project_leverage(
+                    self._enforce_factor_constraints(
+                        adjusted, constraints, lower, upper
+                    )
+                )
+                if self._factor_constraints_satisfied(adjusted, constraints, tol=0.0):
                     break
 
         if constraints.prev_weights is not None:
-            clipped = self._enforce_turnover(clipped, constraints, lower, upper)
+            adjusted = project_leverage(
+                self._enforce_turnover(adjusted, constraints, lower, upper)
+            )
 
-        adjusted = np.clip(clipped, lower, upper)
+        adjusted = project_leverage(adjusted)
+        adjusted = np.clip(adjusted, lower, upper)
         self._last_projection_iterations = projection_iters
         return adjusted
 
@@ -972,6 +975,9 @@ class NeuroAntPortfolioOptimizer:
                 bineq=bineq,
                 prev=prev,
                 T=T,
+                projector=lambda w, _c=constraints: self._apply_constraints(
+                    np.asarray(w, dtype=float), _c
+                ),
             )
             active_breaches = 0
             if bench is not None:

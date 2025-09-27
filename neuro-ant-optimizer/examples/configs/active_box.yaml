@@ -1,0 +1,12 @@
+# Active weight box constraints relative to a benchmark
+csv: data/returns.csv
+benchmark_csv: data/benchmark.csv
+lookback: 252
+step: 21
+objective: sharpe
+cov_model: lw
+active_min: -0.05
+active_max: 0.05
+refine_every: 1
+seed: 7
+out: runs/active_box

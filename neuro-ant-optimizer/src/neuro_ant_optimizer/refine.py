@@ -16,6 +16,8 @@ def refine_slsqp(
     prev: Optional[np.ndarray] = None,
     T: float = 0.0,
     transaction_cost: float = 0.0,
+    projector: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    projector_tol: float = 1e-6,
 ):
     """
     SLSQP refine with turnover allowance (T) and optional linear transaction cost.
@@ -27,7 +29,7 @@ def refine_slsqp(
     lb = np.array([b[0] for b in bounds], dtype=float)
     ub = np.array([b[1] for b in bounds], dtype=float)
 
-    def proj(w: np.ndarray) -> np.ndarray:
+    def box_project(w: np.ndarray) -> np.ndarray:
         return np.clip(w, lb, ub)
 
     def obj(w: np.ndarray) -> float:
@@ -47,12 +49,18 @@ def refine_slsqp(
 
     res = minimize(
         obj,
-        proj(w0),
+        box_project(w0),
         method="SLSQP",
         bounds=list(bounds),
         constraints=cons,
         options=dict(maxiter=300, ftol=1e-9, disp=False),
     )
-    w = proj(res.x if res.success else w0)
-    return w, res
+    candidate = box_project(res.x if res.success else w0)
+    if projector is None:
+        return candidate, res
+
+    projected = projector(candidate)
+    if not np.allclose(candidate, projected, atol=projector_tol, rtol=1e-6):
+        raise RuntimeError("SLSQP projection drift exceeds tolerance")
+    return projected, res
 
