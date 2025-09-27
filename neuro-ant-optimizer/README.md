@@ -53,8 +53,21 @@ print("Sharpe:", res.sharpe_ratio, "Vol:", res.volatility)
 Install optional deps then run:
 ```bash
 python -m pip install "neuro-ant-optimizer[backtest]"
-neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 --objective sharpe --out bt_out --save-weights
+neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 \
+  --objective sharpe --out bt_out --save-weights --tx-cost-bps 5 --tx-cost-mode upfront
+# tx-cost-mode: upfront | amortized | posthoc | none
+# writes metrics.csv (incl. sortino, cvar), equity.csv, equity_net_of_tc.csv (if posthoc), and weights.csv
 ```
+Behavior summary
+
+--tx-cost-mode upfront → costs applied inside the loop on the first day of each block.
+
+--tx-cost-mode amortized → costs applied inside the loop evenly across the block.
+
+--tx-cost-mode posthoc → no costs during loop; after the run, we create equity_net_of_tc.csv with amortized costs.
+
+--tx-cost-mode none → no costs at all.
+
 Outputs `metrics.csv`, `equity.csv`, and (if matplotlib is present) `equity.png`.
 ## Offline usage (no install)
 If your environment blocks package downloads:
