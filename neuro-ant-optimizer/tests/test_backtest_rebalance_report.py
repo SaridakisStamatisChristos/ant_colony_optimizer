@@ -107,6 +107,7 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         assert record["net_slip_ret"] == pytest.approx(expected_net_tx)
         assert record["sector_breaches"] == 0
         assert record["factor_inf_norm"] == pytest.approx(0.0)
+        assert record["factor_missing"] is False
 
     # Ensure per-period net returns align with report calculations
     np.testing.assert_allclose(
@@ -117,5 +118,8 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     report_path = tmp_path / "rebalance_report.csv"
     bt._write_rebalance_report(report_path, results)
     text = report_path.read_text().splitlines()
-    assert text[0].startswith("date,gross_ret,net_tx_ret")
+    assert text[0] == (
+        "date,gross_ret,net_tx_ret,net_slip_ret,turnover,tx_cost,slippage_cost,"
+        "sector_breaches,factor_inf_norm,factor_missing"
+    )
 

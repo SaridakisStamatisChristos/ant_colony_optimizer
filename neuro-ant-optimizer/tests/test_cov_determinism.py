@@ -36,3 +36,4 @@ def test_cov_model_determinism():
     r2 = bt.backtest(frame, lookback=40, step=10, cov_model="oas", seed=7)
 
     np.testing.assert_allclose(r1["equity"], r2["equity"], rtol=0, atol=0)
+    assert r1["rebalance_records"] == r2["rebalance_records"]
