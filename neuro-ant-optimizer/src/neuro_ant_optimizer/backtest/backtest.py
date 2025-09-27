@@ -559,6 +559,56 @@ def ewma_cov(returns: np.ndarray, span: int = 60) -> np.ndarray:
     return cov
 
 
+def _sample_cov(returns: np.ndarray) -> np.ndarray:
+    """Unbiased sample covariance (rowvar=False)."""
+
+    if returns.size == 0:
+        return np.zeros((0, 0), dtype=float)
+    cov = np.cov(returns, rowvar=False)
+    cov = 0.5 * (cov + cov.T)
+    return cov
+
+
+def _lw_cov(returns: np.ndarray) -> np.ndarray:
+    """Ledoit–Wolf shrinkage toward identity (σ^2 I)."""
+
+    X = np.asarray(returns, dtype=float)
+    T, N = X.shape
+    if T <= 1:
+        return np.eye(N, dtype=float)
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = (Xc.T @ Xc) / (T - 1)
+    mu = np.trace(S) / N
+    F = mu * np.eye(N, dtype=float)
+    X2 = Xc ** 2
+    phi_mat = (X2.T @ X2) / (T - 1) - S ** 2
+    pi_hat = np.sum(phi_mat)
+    gamma_hat = np.linalg.norm(S - F, ord="fro") ** 2
+    rho_hat = pi_hat
+    kappa = max(0.0, min(1.0, rho_hat / max(gamma_hat, 1e-18)))
+    Sigma = (1 - kappa) * S + kappa * F
+    return 0.5 * (Sigma + Sigma.T)
+
+
+def _oas_cov(returns: np.ndarray) -> np.ndarray:
+    """Oracle Approximating Shrinkage toward scaled identity."""
+
+    X = np.asarray(returns, dtype=float)
+    T, N = X.shape
+    if T <= 1:
+        return np.eye(N, dtype=float)
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = (Xc.T @ Xc) / (T - 1)
+    mu = np.trace(S) / N
+    tr_S2 = np.sum(S * S)
+    num = (1 - 2 / N) * tr_S2 + (np.trace(S) ** 2)
+    den = (T + 1 - 2 / N) * (tr_S2 - (np.trace(S) ** 2) / N)
+    alpha = 0.0 if den <= 0 else min(1.0, max(0.0, num / (den + 1e-18)))
+    F = mu * np.eye(N, dtype=float)
+    Sigma = (1 - alpha) * S + alpha * F
+    return 0.5 * (Sigma + Sigma.T)
+
+
 def turnover(previous: Optional[np.ndarray], current: np.ndarray) -> float:
     """Compute the L1 turnover between two weight vectors."""
 
@@ -633,6 +683,9 @@ _OBJECTIVE_MAP: Dict[str, OptimizationObjective] = {
 }
 
 
+_COV_MODELS = {"sample", "ewma", "lw", "oas"}
+
+
 def backtest(
     df: Any,
     lookback: int = 252,
@@ -648,6 +701,7 @@ def backtest(
     factor_tolerance: float = 1e-6,
     slippage: Optional[SlippageConfig] = None,
     refine_every: int = 1,
+    cov_model: str = "sample",
     benchmark: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
@@ -658,6 +712,11 @@ def backtest(
         raise ValueError("refine_every must be positive")
     if objective not in _OBJECTIVE_MAP:
         raise ValueError(f"Unknown objective '{objective}'")
+    cov_model = str(cov_model).lower()
+    if cov_model not in _COV_MODELS:
+        raise ValueError(
+            f"Unknown cov_model '{cov_model}' (choose from {sorted(_COV_MODELS)})"
+        )
 
     returns = _frame_to_numpy(df)
     if returns.size == 0:
@@ -777,15 +836,20 @@ def backtest(
                 variance=max(variance, 0.0),
                 cov_vector=cov_vector,
             )
-        if ewma_span is not None:
-            cov_raw = ewma_cov(train, span=ewma_span)
+        if cov_model == "ewma":
+            span = int(ewma_span if ewma_span is not None else 60)
+            cov_raw = ewma_cov(train, span=span)
+        elif cov_model == "lw":
+            cov_raw = _lw_cov(train)
+        elif cov_model == "oas":
+            cov_raw = _oas_cov(train)
         else:
-            cov_raw = np.cov(train, rowvar=False)
+            cov_raw = _sample_cov(train)
         if optimizer.cfg.use_shrinkage:
             cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
         cov_key: Optional[bytes] = None
         cov: Optional[np.ndarray] = None
-        if ewma_span is not None:
+        if cov_model == "ewma":
             cov_key = cov_raw.tobytes()
             cached_cov = cov_cache.get(cov_key)
             if cached_cov is not None:
@@ -978,6 +1042,7 @@ def backtest(
         "weights": np.asarray(weights),
         "rebalance_dates": rebalance_dates,
         "asset_names": asset_names,
+        "cov_model": cov_model,
         "benchmark_returns": benchmark_returns_arr if benchmark_returns_arr.size else None,
         "sharpe": sharpe,
         "ann_return": ann_return,
@@ -1239,7 +1304,18 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     )
     parser.add_argument("--lookback", type=int, default=252)
     parser.add_argument("--step", type=int, default=21)
-    parser.add_argument("--ewma_span", type=int, default=60)
+    parser.add_argument(
+        "--ewma_span",
+        type=int,
+        default=60,
+        help="EWMA span (only used when --cov-model=ewma)",
+    )
+    parser.add_argument(
+        "--cov-model",
+        choices=sorted(_COV_MODELS),
+        default="sample",
+        help="Covariance backend: sample|ewma|lw|oas",
+    )
     parser.add_argument(
         "--objective",
         choices=sorted(_OBJECTIVE_MAP.keys()),
@@ -1339,6 +1415,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         factor_tolerance=parsed.factor_tolerance,
         slippage=slippage_cfg,
         refine_every=parsed.refine_every,
+        cov_model=parsed.cov_model,
         benchmark=benchmark_df,
     )
 
