@@ -1,48 +1,54 @@
 from __future__ import annotations
+
+from typing import Callable, Iterable, Optional
+
 import numpy as np
-from typing import Tuple, Optional, List
-from scipy.optimize import minimize
-from .constraints import PortfolioConstraints
+
 
 def refine_slsqp(
+    score_fn: Callable[[np.ndarray], float],
     w0: np.ndarray,
-    score_fn,
-    n_assets: int,
-    constraints: PortfolioConstraints,
-    maxiter: int = 200,
-) -> Tuple[np.ndarray, float, bool]:
-    n = n_assets
-    c = constraints
-    bounds = [(c.min_weight, c.max_weight)] * n
+    bounds: Iterable[tuple[float, float]],
+    Aeq: Optional[np.ndarray] = None,
+    beq: Optional[np.ndarray] = None,
+    prev: Optional[np.ndarray] = None,
+    T: float = 0.0,
+    transaction_cost: float = 0.0,
+):
+    """
+    SLSQP refine with turnover allowance (T) and optional linear transaction cost.
+    Maximizes score_fn by minimizing its negative with penalties.
+    """
 
-    A = []; b = []; Aeq = []; beq = []
+    from scipy.optimize import minimize
 
-    if c.equality_enforce and abs(c.leverage_limit - 1.0) < 1e-12:
-        Aeq.append(np.ones(n)); beq.append(1.0)
-    else:
-        A.append(np.ones(n)); b.append(c.leverage_limit)
+    lb = np.array([b[0] for b in bounds], dtype=float)
+    ub = np.array([b[1] for b in bounds], dtype=float)
 
-    if c.sector_map is not None:
-        sects = np.array(c.sector_map, dtype=int)
-        for s in np.unique(sects):
-            row = np.zeros(n); row[sects == s] = 1.0
-            A.append(row); b.append(c.max_sector_concentration)
+    def proj(w: np.ndarray) -> np.ndarray:
+        return np.clip(w, lb, ub)
 
-    prev = np.asarray(c.prev_weights, dtype=float) if c.prev_weights is not None else None
-    T = float(c.max_turnover) if prev is not None else 0.0
-
-    def obj(w):
-        base = score_fn(w)
+    def obj(w: np.ndarray) -> float:
+        base = float(score_fn(w))
         if prev is not None:
             l1 = np.abs(w - prev).sum()
             if l1 > T:
-                base = base - 1000.0 * (T - l1)  # penalty
+                base -= 1000.0 * (l1 - T)
+            base -= float(transaction_cost) * l1
         return -base
 
-    lin_ineq = [{"type": "ineq", "fun": (lambda w, row=row, rhs=rhs: rhs - float(row @ w))} for row, rhs in zip(A, b)]
-    lin_eq = [{"type": "eq", "fun": (lambda w, row=row, rhs=rhs: float(row @ w - rhs))} for row, rhs in zip(Aeq, beq)]
-    cons = lin_ineq + lin_eq
+    cons = []
+    if Aeq is not None and beq is not None:
+        cons.append({"type": "eq", "fun": lambda w: Aeq @ w - beq})
 
-    res = minimize(obj, w0, method="SLSQP", bounds=bounds, constraints=cons,
-                   options={"maxiter": maxiter, "ftol": 1e-9, "disp": False})
-    return np.asarray(res.x, dtype=float), float(-res.fun), bool(res.success)
+    res = minimize(
+        obj,
+        proj(w0),
+        method="SLSQP",
+        bounds=list(bounds),
+        constraints=cons,
+        options=dict(maxiter=300, ftol=1e-9, disp=False),
+    )
+    w = proj(res.x if res.success else w0)
+    return w, res
+
