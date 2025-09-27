@@ -2,6 +2,7 @@ import numpy as np
 
 from neuro_ant_optimizer.constraints import PortfolioConstraints
 from neuro_ant_optimizer.optimizer import NeuroAntPortfolioOptimizer
+from neuro_ant_optimizer.utils import nearest_psd, shrink_covariance
 
 
 def test_apply_constraints_respects_active_bounds():
@@ -148,4 +149,57 @@ def test_projection_idempotence_with_active_and_factors():
 
     assert np.allclose(projected, reprojection, atol=1e-8)
     assert opt._feasible(projected, constraints)
+
+
+def test_near_singular_covariance_feasible_with_active_bounds():
+    n = 5
+    opt = NeuroAntPortfolioOptimizer(n_assets=n)
+    base = np.linspace(0.9, 1.1, n)
+    cov_raw = np.outer(base, base)
+    cov_raw[0, 1] += 5e-4
+    cov_raw[1, 0] -= 5e-4
+    mu = np.linspace(0.01, 0.02, n, dtype=float)
+    benchmark = np.full(n, 1.0 / n, dtype=float)
+    constraints = PortfolioConstraints(
+        min_weight=0.0,
+        max_weight=0.7,
+        equality_enforce=True,
+        leverage_limit=1.0,
+        benchmark_weights=benchmark,
+        min_active_weight=-0.02,
+        max_active_weight=0.02,
+    )
+    cov_processed = nearest_psd(
+        shrink_covariance(cov_raw, delta=opt.cfg.shrinkage_delta)
+    )
+    assert np.min(np.linalg.eigvalsh(cov_processed)) >= -1e-10
+    result = opt.optimize(mu, cov_raw, constraints, refine=False)
+    assert result.feasible
+    assert opt._feasible(result.weights, constraints)
+
+
+def test_turnover_projection_respects_active_bounds():
+    n = 6
+    opt = NeuroAntPortfolioOptimizer(n_assets=n)
+    benchmark = np.array([0.15, 0.18, 0.17, 0.16, 0.19, 0.15], dtype=float)
+    prev = benchmark.copy()
+    constraints = PortfolioConstraints(
+        min_weight=0.0,
+        max_weight=0.5,
+        equality_enforce=True,
+        leverage_limit=1.0,
+        benchmark_weights=benchmark,
+        min_active_weight=-0.03,
+        max_active_weight=0.03,
+        prev_weights=prev,
+        max_turnover=0.12,
+    )
+    weights = np.array([0.4, 0.05, 0.05, 0.05, 0.3, 0.15], dtype=float)
+    adjusted = opt._apply_constraints(weights, constraints)
+    active = adjusted - benchmark
+    assert np.all(active <= constraints.max_active_weight + 1e-8)
+    assert np.all(active >= constraints.min_active_weight - 1e-8)
+    turnover = np.abs(adjusted - prev).sum()
+    assert turnover <= constraints.max_turnover + 1e-8
+    assert opt._feasible(adjusted, constraints)
 
