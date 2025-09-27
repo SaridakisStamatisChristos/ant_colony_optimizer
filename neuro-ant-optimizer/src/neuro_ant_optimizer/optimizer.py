@@ -106,12 +106,30 @@ class OptimizationResult:
         self.risk_contributions = np.asarray(self.risk_contributions, dtype=float)
 
 
+@dataclass
+class BenchmarkStats:
+    """Summary statistics describing a benchmark return series."""
+
+    mean: float
+    variance: float
+    cov_vector: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.cov_vector = np.asarray(self.cov_vector, dtype=float)
+        if self.cov_vector.ndim != 1:
+            raise ValueError("cov_vector must be one-dimensional")
+        if self.variance < 0.0:
+            raise ValueError("variance must be non-negative")
+
+
 class OptimizationObjective(Enum):
     SHARPE_RATIO = "sharpe_ratio"
     MAX_RETURN = "max_return"
     MIN_VARIANCE = "min_variance"
     RISK_PARITY = "risk_parity"
     MIN_CVAR = "min_cvar"
+    TRACKING_ERROR_MIN = "tracking_error_min"
+    INFO_RATIO_MAX = "info_ratio_max"
 
 
 class NeuroAntPortfolioOptimizer:
@@ -158,6 +176,7 @@ class NeuroAntPortfolioOptimizer:
         constraints: PortfolioConstraints,
         objective: OptimizationObjective = OptimizationObjective.SHARPE_RATIO,
         refine: bool = True,
+        benchmark: Optional[BenchmarkStats] = None,
     ) -> OptimizationResult:
         """Run the optimization loop and return an :class:`OptimizationResult`."""
 
@@ -208,12 +227,27 @@ class NeuroAntPortfolioOptimizer:
                     initial=int(start_node),
                 )
                 weights = self._apply_constraints(weights, constraints)
-                score = self._score(weights, mu, cov, objective, constraints)
+                score = self._score(
+                    weights,
+                    mu,
+                    cov,
+                    objective,
+                    constraints,
+                    benchmark=benchmark,
+                )
                 portfolios.append(weights)
                 scores.append(score)
 
             if portfolios and refine:
-                self._refine_topk(portfolios, scores, mu, cov, objective, constraints)
+                self._refine_topk(
+                    portfolios,
+                    scores,
+                    mu,
+                    cov,
+                    objective,
+                    constraints,
+                    benchmark=benchmark,
+                )
 
             self.colony.update_pheromone(ants, scores)
 
@@ -279,6 +313,7 @@ class NeuroAntPortfolioOptimizer:
         cov: np.ndarray,
         objective: OptimizationObjective,
         constraints: PortfolioConstraints,
+        benchmark: Optional[BenchmarkStats] = None,
     ) -> float:
         if not self._feasible(weights, constraints):
             return -1e9
@@ -300,6 +335,15 @@ class NeuroAntPortfolioOptimizer:
         if objective == OptimizationObjective.MIN_CVAR:
             cvar = self._cvar_normal(weights, mu, cov, self.cfg.cvar_alpha)
             return -cvar
+        if objective == OptimizationObjective.TRACKING_ERROR_MIN:
+            if benchmark is None:
+                raise ValueError("Benchmark statistics required for tracking error objective")
+            te = self._tracking_error(weights, mu, cov, benchmark)
+            return -te
+        if objective == OptimizationObjective.INFO_RATIO_MAX:
+            if benchmark is None:
+                raise ValueError("Benchmark statistics required for information ratio objective")
+            return self._information_ratio(weights, mu, cov, benchmark)
         return self._sharpe(weights, mu, cov)
 
     def _apply_constraints(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
@@ -467,6 +511,39 @@ class NeuroAntPortfolioOptimizer:
         phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
         return mean_loss + std_loss * (phi / alpha)
 
+    def _tracking_error(
+        self,
+        weights: np.ndarray,
+        mu: np.ndarray,
+        cov: np.ndarray,
+        benchmark: BenchmarkStats,
+    ) -> float:
+        if benchmark.cov_vector.shape[0] != weights.shape[0]:
+            raise ValueError("Benchmark covariance vector dimension mismatch")
+        active_variance = float(
+            weights @ cov @ weights
+            + benchmark.variance
+            - 2.0 * (weights @ benchmark.cov_vector)
+        )
+        if active_variance < 0.0 and active_variance > -1e-12:
+            active_variance = 0.0
+        return math.sqrt(max(active_variance, 0.0))
+
+    def _information_ratio(
+        self,
+        weights: np.ndarray,
+        mu: np.ndarray,
+        cov: np.ndarray,
+        benchmark: BenchmarkStats,
+    ) -> float:
+        active_return = float(weights @ mu - benchmark.mean)
+        te = self._tracking_error(weights, mu, cov, benchmark)
+        if te <= 1e-12:
+            if abs(active_return) <= 1e-12:
+                return 0.0
+            return math.copysign(1e6, active_return)
+        return active_return / te
+
     def _validate(self, mu: np.ndarray, cov: np.ndarray) -> None:
         n = mu.shape[0]
         if cov.shape != (n, n):
@@ -482,6 +559,7 @@ class NeuroAntPortfolioOptimizer:
         cov: np.ndarray,
         objective: OptimizationObjective,
         constraints: PortfolioConstraints,
+        benchmark: Optional[BenchmarkStats] = None,
     ) -> None:
         if not portfolios:
             return
@@ -540,6 +618,7 @@ class NeuroAntPortfolioOptimizer:
                     cov,
                     objective,
                     constraints,
+                    benchmark=benchmark,
                 )
 
             refined, res = refine_slsqp(

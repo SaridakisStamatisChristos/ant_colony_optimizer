@@ -5,6 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .constraints import PortfolioConstraints
 from .optimizer import (
+    BenchmarkStats,
     NeuroAntPortfolioOptimizer,
     OptimizationObjective,
     OptimizationResult,
@@ -17,6 +18,7 @@ __all__ = [
     "OptimizationObjective",
     "OptimizationResult",
     "PortfolioConstraints",
+    "BenchmarkStats",
     "__version__",
 ]
 

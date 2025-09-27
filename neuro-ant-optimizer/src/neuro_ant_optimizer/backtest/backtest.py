@@ -18,6 +18,7 @@ import numpy as np
 from neuro_ant_optimizer import __version__
 from neuro_ant_optimizer.constraints import PortfolioConstraints
 from neuro_ant_optimizer.optimizer import (
+    BenchmarkStats,
     NeuroAntPortfolioOptimizer,
     OptimizationObjective,
     OptimizerConfig,
@@ -627,6 +628,8 @@ _OBJECTIVE_MAP: Dict[str, OptimizationObjective] = {
     "min_variance": OptimizationObjective.MIN_VARIANCE,
     "risk_parity": OptimizationObjective.RISK_PARITY,
     "min_cvar": OptimizationObjective.MIN_CVAR,
+    "tracking_error": OptimizationObjective.TRACKING_ERROR_MIN,
+    "info_ratio": OptimizationObjective.INFO_RATIO_MAX,
 }
 
 
@@ -645,6 +648,7 @@ def backtest(
     factor_tolerance: float = 1e-6,
     slippage: Optional[SlippageConfig] = None,
     refine_every: int = 1,
+    benchmark: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -662,6 +666,33 @@ def backtest(
     set_seed(seed)
     n_periods, n_assets = returns.shape
     dates = _frame_index(df, n_periods)
+    benchmark_series: Optional[np.ndarray] = None
+    if benchmark is not None:
+        bench_values = _frame_to_numpy(benchmark)
+        bench_values = np.asarray(bench_values, dtype=float)
+        if bench_values.ndim > 2:
+            raise ValueError("Benchmark series must be one or two dimensional")
+        if bench_values.ndim == 2:
+            if bench_values.shape[1] == 0:
+                raise ValueError("Benchmark series contains no columns")
+            if bench_values.shape[1] > 1:
+                raise ValueError("Benchmark series must contain exactly one column")
+            bench_values = bench_values[:, 0]
+        benchmark_series = np.asarray(bench_values, dtype=float).reshape(-1)
+        if benchmark_series.size != n_periods:
+            raise ValueError("Benchmark length must match returns length")
+
+    objective_enum = _OBJECTIVE_MAP[objective]
+    if (
+        objective_enum
+        in {
+            OptimizationObjective.TRACKING_ERROR_MIN,
+            OptimizationObjective.INFO_RATIO_MAX,
+        }
+        and benchmark_series is None
+    ):
+        raise ValueError("Benchmark series required for tracking_error/info_ratio objectives")
+
     asset_names = (
         list(getattr(df, "columns", []))
         if hasattr(df, "columns") and getattr(df, "columns") is not None
@@ -722,6 +753,7 @@ def backtest(
     net_tx_returns: List[float] = []
     net_slip_returns: List[float] = []
     rebalance_records: List[Dict[str, Any]] = []
+    benchmark_realized: List[float] = []
     cov_cache: "OrderedDict[bytes, np.ndarray]" = OrderedDict()
 
     for start in range(lookback, n_periods, step):
@@ -729,6 +761,22 @@ def backtest(
         train = returns[start - lookback : start]
         test = returns[start:end]
         mu = train.mean(axis=0)
+        bench_stats: Optional[BenchmarkStats] = None
+        if benchmark_series is not None:
+            bench_train = benchmark_series[start - lookback : start]
+            if bench_train.shape[0] != train.shape[0]:
+                raise ValueError("Benchmark lookback does not match returns lookback")
+            bench_mean = float(bench_train.mean())
+            centered_b = bench_train - bench_mean
+            centered_assets = train - mu
+            denom = max(1, centered_b.shape[0] - 1)
+            cov_vector = centered_assets.T @ centered_b / denom
+            variance = float(np.dot(centered_b, centered_b) / denom)
+            bench_stats = BenchmarkStats(
+                mean=bench_mean,
+                variance=max(variance, 0.0),
+                cov_vector=cov_vector,
+            )
         if ewma_span is not None:
             cov_raw = ewma_cov(train, span=ewma_span)
         else:
@@ -774,8 +822,9 @@ def backtest(
             mu,
             cov,
             constraints,
-            objective=_OBJECTIVE_MAP[objective],
+            objective=objective_enum,
             refine=should_refine,
+            benchmark=bench_stats,
         )
         w = result.weights
         weights.append(w)
@@ -826,6 +875,8 @@ def backtest(
         turnovers.append(turn)
         prev_weights = w
         realized_dates.extend(dates[start:end])
+        if benchmark_series is not None:
+            benchmark_realized.extend(benchmark_series[start:end].tolist())
 
         sector_breaches = 0
         sector_exposures: Dict[str, float] = {}
@@ -876,6 +927,11 @@ def backtest(
     gross_returns_arr = np.asarray(gross_returns, dtype=float)
     net_tx_returns_arr = np.asarray(net_tx_returns, dtype=float)
     net_slip_returns_arr = np.asarray(net_slip_returns, dtype=float)
+    benchmark_returns_arr = (
+        np.asarray(benchmark_realized, dtype=float)
+        if benchmark_realized
+        else np.array([])
+    )
     equity = np.cumprod(1.0 + realized_returns_arr)
     slippage_costs_arr = np.asarray(slippage_costs, dtype=float) if slippage_costs else np.array([])
     avg_slippage_bps = (
@@ -901,6 +957,17 @@ def backtest(
     mdd = max_drawdown(equity)
     avg_turn = float(np.mean(turnovers)) if turnovers else 0.0
 
+    tracking_error = None
+    info_ratio = None
+    if benchmark_returns_arr.size == realized_returns_arr.size and realized_returns_arr.size:
+        active = realized_returns_arr - benchmark_returns_arr
+        te = float(np.std(active))
+        tracking_error = te
+        if te <= 1e-12:
+            info_ratio = 0.0 if abs(active.mean()) <= 1e-12 else math.copysign(1e6, active.mean())
+        else:
+            info_ratio = float(active.mean() / te)
+
     return {
         "dates": realized_dates,
         "returns": realized_returns_arr,
@@ -911,6 +978,7 @@ def backtest(
         "weights": np.asarray(weights),
         "rebalance_dates": rebalance_dates,
         "asset_names": asset_names,
+        "benchmark_returns": benchmark_returns_arr if benchmark_returns_arr.size else None,
         "sharpe": sharpe,
         "ann_return": ann_return,
         "ann_vol": ann_vol,
@@ -919,6 +987,8 @@ def backtest(
         "downside_vol": downside_vol,
         "sortino": sortino,
         "realized_cvar": realized_cvar,
+        "tracking_error": tracking_error,
+        "info_ratio": info_ratio,
         "factor_records": factor_records,
         "factor_names": factor_names,
         "factor_tolerance": factor_tolerance,
@@ -943,6 +1013,8 @@ def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
             "downside_vol",
             "sortino",
             "realized_cvar",
+            "tracking_error",
+            "info_ratio",
         ]:
             writer.writerow([key, results[key]])
 
@@ -1159,6 +1231,12 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         help="YAML/JSON file containing run parameters",
     )
     parser.add_argument("--csv", type=str, default=None, help="CSV of daily returns with date index")
+    parser.add_argument(
+        "--benchmark-csv",
+        type=str,
+        default=None,
+        help="Optional CSV of benchmark returns (single column)",
+    )
     parser.add_argument("--lookback", type=int, default=252)
     parser.add_argument("--step", type=int, default=21)
     parser.add_argument("--ewma_span", type=int, default=60)
@@ -1236,6 +1314,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         raise ValueError("--csv must be provided via CLI or config")
 
     df = _read_csv(Path(parsed.csv))
+    benchmark_df = _read_csv(Path(parsed.benchmark_csv)) if parsed.benchmark_csv else None
     factor_panel = load_factor_panel(Path(parsed.factors)) if parsed.factors else None
     slippage_cfg = parse_slippage(parsed.slippage)
     factor_target_vec = None
@@ -1260,6 +1339,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         factor_tolerance=parsed.factor_tolerance,
         slippage=slippage_cfg,
         refine_every=parsed.refine_every,
+        benchmark=benchmark_df,
     )
 
     out_dir = Path(parsed.out)
