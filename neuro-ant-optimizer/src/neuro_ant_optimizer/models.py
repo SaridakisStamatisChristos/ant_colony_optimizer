@@ -21,6 +21,21 @@ class BaseNeuralNetwork(nn.Module):
     def to_device(self) -> "BaseNeuralNetwork":
         return self.to(dtype=self._dtype, device=self._device)
 
+    # Helpers that always reflect the real module state (after any .to(...))
+    @property
+    def param_device(self) -> torch.device:
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return self._device
+
+    @property
+    def param_dtype(self) -> torch.dtype:
+        try:
+            return next(self.parameters()).dtype
+        except StopIteration:
+            return self._dtype
+
     def save_model(self, path: str) -> None:
         torch.save(
             {
@@ -57,7 +72,7 @@ class RiskAssessmentNetwork(BaseNeuralNetwork):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return self.net(x.to(self._device, dtype=self._dtype))
+        return self.net(x.to(device=self.param_device, dtype=self.param_dtype))
 
 
 class PheromoneNetwork(BaseNeuralNetwork):
@@ -83,13 +98,14 @@ class PheromoneNetwork(BaseNeuralNetwork):
             nn.Linear(48, n_assets),
         )
 
+    @torch.no_grad()
     def transition_matrix(self) -> torch.Tensor:
-        idx = torch.arange(self.n_assets, device=self._device)
+        idx = torch.arange(self.n_assets, device=self.param_device)
         x = self.emb(idx).unsqueeze(0)
         a, _ = self.attn(x, x, x)
         h = self.norm(a + x)
         logits = self.ffn(h)
-        return torch.softmax(logits, dim=-1).squeeze(0).to(dtype=self._dtype)
+        return torch.softmax(logits, dim=-1).squeeze(0).to(dtype=self.param_dtype)
 
     def forward(self, *_args, **_kw) -> torch.Tensor:  # back-compat
         return self.transition_matrix()

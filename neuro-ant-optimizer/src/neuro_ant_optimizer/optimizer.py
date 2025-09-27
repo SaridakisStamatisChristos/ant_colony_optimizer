@@ -15,7 +15,7 @@ from .models import RiskAssessmentNetwork, PheromoneNetwork
 from .colony import Ant, AntColony
 from .constraints import PortfolioConstraints
 from .refine import refine_slsqp
-from .utils import nearest_psd, safe_softmax, set_seed
+from .utils import nearest_psd, set_seed
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
