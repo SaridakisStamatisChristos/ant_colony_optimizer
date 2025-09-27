@@ -11,6 +11,7 @@ from .colony import Ant, AntColony
 from .constraints import PortfolioConstraints
 from .utils import nearest_psd, set_seed
 from .refine import refine_slsqp
+from torch.nn.utils import clip_grad_norm_
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -197,3 +198,49 @@ class NeuroAntPortfolioOptimizer:
         n = mu.shape[0]
         if cov.shape != (n, n): raise ValueError("covariance must be (n,n)")
         if not np.allclose(cov, cov.T, atol=1e-10): raise ValueError("covariance must be symmetric")
+
+    # ---- learning routines ----
+    def _train_risk(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> None:
+        if self.risk_net is None:
+            return
+
+        # Features mirror the predict() pathway to keep inference consistent.
+        avg_corr = (corr.sum(axis=1) - 1.0) / max(self.n_assets - 1, 1)
+        feats = np.stack([mu, sigma, avg_corr], axis=1).reshape(-1).astype(np.float32)
+        target = (sigma / (sigma.max() + 1e-12)).astype(np.float32)
+
+        x = torch.from_numpy(feats).unsqueeze(0)
+        y = torch.from_numpy(target).unsqueeze(0)
+
+        self.risk_net.train()
+        self.risk_optim.zero_grad()
+
+        pred = self.risk_net(x)
+        loss = self.mse(pred, y)
+        loss.backward()
+        clip_grad_norm_(self.risk_net.parameters(), 1.0)
+        self.risk_optim.step()
+        self.risk_net.eval()
+
+    def _train_pheromone(self, portfolios: List[np.ndarray], scores: List[float]) -> None:
+        if len(portfolios) == 0:
+            return
+
+        k = min(self.cfg["topk_train"], len(portfolios))
+        idx = np.argsort(scores)[-k:]
+        targets = [np.tile(np.clip(portfolios[i], 0.0, 1.0), (self.n_assets, 1)) for i in idx]
+        target_mat = np.mean(targets, axis=0)
+        target_mat = np.clip(target_mat, 1e-6, 1 - 1e-6).astype(np.float32)
+
+        asset_idx = torch.arange(self.n_assets, dtype=torch.long)
+        target_tensor = torch.from_numpy(target_mat)
+
+        self.phero_net.train()
+        self.phero_optim.zero_grad()
+
+        pred = torch.clamp(self.phero_net(asset_idx), 1e-6, 1 - 1e-6)
+        loss = self.bce(pred, target_tensor)
+        loss.backward()
+        clip_grad_norm_(self.phero_net.parameters(), 1.0)
+        self.phero_optim.step()
+        self.phero_net.eval()
