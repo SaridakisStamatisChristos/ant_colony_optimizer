@@ -82,3 +82,26 @@ def test_factor_bounds_enforced_without_targets():
     assert np.all(exposures >= lower - 1e-6)
     assert opt._feasible(adjusted, constraints)
 
+
+def test_conflicting_factor_bounds_report_infeasible():
+    n = 3
+    opt = NeuroAntPortfolioOptimizer(n_assets=n)
+    mu = np.ones(n, dtype=float) / n
+    cov = np.eye(n, dtype=float)
+    loadings = np.zeros((n, 1), dtype=float)
+    lower = np.array([0.1], dtype=float)
+    upper = np.array([0.2], dtype=float)
+    constraints = PortfolioConstraints(
+        min_weight=0.0,
+        max_weight=1.0,
+        equality_enforce=True,
+        leverage_limit=1.0,
+        factor_loadings=loadings,
+        factor_lower_bounds=lower,
+        factor_upper_bounds=upper,
+        factor_tolerance=1e-6,
+    )
+    result = opt.optimize(mu, cov, constraints)
+    assert result.feasible is False
+    assert result.projection_iterations >= 1
+

@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
@@ -189,6 +189,378 @@ def _load_run_config(path: Path) -> Dict[str, Any]:
     return normalized
 
 
+def _load_data_structure(path: Path) -> Any:
+    text = path.read_text(encoding="utf-8")
+    suffix = path.suffix.lower()
+    if suffix in {".yaml", ".yml"}:
+        if yaml is not None:
+            return yaml.safe_load(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            raise ValueError(
+                "PyYAML is required to parse structured YAML constraint files"
+            ) from exc
+    if suffix == ".json":
+        return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return _parse_simple_mapping(text)
+
+
+def _maybe_load_structure(spec: Any) -> Any:
+    if spec is None:
+        return None
+    if isinstance(spec, (str, Path)):
+        path = Path(spec)
+        if not path.exists():
+            raise FileNotFoundError(f"Configuration file '{path}' not found")
+        return _load_data_structure(path)
+    return spec
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (float, int, np.floating, np.integer)):
+        return float(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "none", "null"}:
+            return None
+        return float(value)
+    raise TypeError(f"Unable to coerce value '{value}' to float")
+
+
+def _normalize_active_bounds(
+    min_active: Optional[float], max_active: Optional[float]
+) -> Tuple[Optional[float], Optional[float]]:
+    if min_active is not None:
+        if min_active < -1.0 - 1e-12:
+            raise ValueError("active_min must be greater than or equal to -1")
+        if min_active > 0.0 + 1e-12:
+            raise ValueError("active_min must be less than or equal to 0")
+    if max_active is not None:
+        if max_active > 1.0 + 1e-12:
+            raise ValueError("active_max must be less than or equal to 1")
+        if max_active < 0.0 - 1e-12:
+            raise ValueError("active_max must be greater than or equal to 0")
+    if min_active is not None and max_active is not None and min_active > max_active + 1e-12:
+        raise ValueError("active_min must not exceed active_max")
+    return min_active, max_active
+
+
+def _manifest_bound(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    if not np.isfinite(value):
+        return None
+    return float(value)
+
+
+def _prepare_benchmark_weights(
+    spec: Any, asset_names: Sequence[str]
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, Optional[float]]]:
+    data = _maybe_load_structure(spec)
+    resolved: Dict[str, Optional[float]] = {name: None for name in asset_names}
+    if data is None:
+        return None, None, resolved
+
+    weights = np.zeros(len(asset_names), dtype=float)
+    mask = np.zeros(len(asset_names), dtype=bool)
+    index = {name: idx for idx, name in enumerate(asset_names)}
+    unknown: Set[str] = set()
+
+    def _assign(name: Any, value: Any) -> None:
+        if name is None:
+            raise ValueError("Benchmark weight entry missing asset name")
+        asset = str(name)
+        if value is None:
+            return
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+            return
+        val = float(value)
+        idx = index.get(asset)
+        if idx is None:
+            unknown.add(asset)
+            return
+        weights[idx] = val
+        mask[idx] = True
+        resolved[asset] = val
+
+    if isinstance(data, Mapping):
+        for key, value in data.items():
+            _assign(key, value)
+    elif isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        if len(data) == len(asset_names) and all(
+            not isinstance(item, Mapping) for item in data
+        ):
+            for idx, value in enumerate(data):
+                if value is None:
+                    continue
+                weights[idx] = float(value)
+                mask[idx] = True
+                resolved[asset_names[idx]] = float(value)
+        else:
+            for entry in data:
+                if isinstance(entry, Mapping):
+                    name = entry.get("asset") or entry.get("name") or entry.get("ticker")
+                    weight_val = entry.get("weight")
+                    if weight_val is None:
+                        weight_val = entry.get("value")
+                    _assign(name, weight_val)
+                elif isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                    _assign(entry[0], entry[1])
+                else:
+                    raise ValueError("Unable to parse benchmark weight entry")
+    else:
+        raise ValueError("Benchmark weights must be a mapping or list")
+
+    if unknown:
+        print(
+            "Warning: benchmark weights provided for unknown assets: "
+            + ", ".join(sorted(unknown))
+        )
+
+    if not mask.any():
+        return None, None, resolved
+
+    return weights, mask, resolved
+
+
+def _coerce_group_entry(
+    raw_name: Optional[str], value: Any, index: int
+) -> Tuple[str, List[str], Optional[float], Optional[float]]:
+    name = raw_name
+    members: Optional[List[str]] = None
+    lower: Optional[float] = None
+    upper: Optional[float] = None
+
+    if isinstance(value, Mapping):
+        maybe_name = value.get("name") or value.get("label") or value.get("group_name")
+        if maybe_name is not None:
+            name = str(maybe_name)
+        maybe_group = value.get("group")
+        if members is None and isinstance(maybe_group, (list, tuple, set)):
+            members = [str(item) for item in maybe_group]
+        if members is None:
+            alt_members = value.get("members") or value.get("assets") or value.get("tickers")
+            if isinstance(alt_members, (list, tuple, set)):
+                members = [str(item) for item in alt_members]
+        if name is None and isinstance(maybe_group, str):
+            name = maybe_group
+        lower_val = value.get("lower")
+        if lower_val is None:
+            lower_val = value.get("min")
+        upper_val = value.get("upper")
+        if upper_val is None:
+            upper_val = value.get("max")
+        cap_val = value.get("cap")
+        if lower_val is None and upper_val is None and cap_val is not None:
+            cap = float(cap_val)
+            lower = -abs(cap)
+            upper = abs(cap)
+        else:
+            if lower_val is not None:
+                lower = float(lower_val)
+            if upper_val is not None:
+                upper = float(upper_val)
+    elif isinstance(value, (list, tuple)) and len(value) >= 2:
+        if name is None:
+            name = str(value[0])
+        members_candidate = value[1]
+        if isinstance(members_candidate, (list, tuple, set)):
+            members = [str(item) for item in members_candidate]
+        cap = value[2] if len(value) > 2 else None
+        if cap is not None:
+            cap_val = float(cap)
+            lower = -abs(cap_val)
+            upper = abs(cap_val)
+    elif isinstance(value, (float, int, np.floating, np.integer)):
+        cap = float(value)
+        lower = -abs(cap)
+        upper = abs(cap)
+    else:
+        raise ValueError("Unable to parse active group entry")
+
+    if members is None:
+        raise ValueError("Active group entry must provide a list of members")
+    if name is None:
+        name = f"group_{index}"
+    if lower is None and upper is None:
+        raise ValueError("Active group entry must provide a cap or explicit bounds")
+    if lower is None:
+        lower = float("-inf")
+    if upper is None:
+        upper = float("inf")
+    if lower > upper + 1e-12:
+        raise ValueError("Active group lower bound exceeds upper bound")
+    return str(name), members, lower, upper
+
+
+def _prepare_active_groups(
+    spec: Any, asset_names: Sequence[str]
+) -> Tuple[
+    Optional[List[int]],
+    Optional[Dict[int, Tuple[float, float]]],
+    List[Dict[str, Any]],
+]:
+    data = _maybe_load_structure(spec)
+    if data is None:
+        return None, None, []
+
+    entries: List[Tuple[str, List[str], float, float]] = []
+    if isinstance(data, Mapping):
+        for idx, (key, value) in enumerate(data.items()):
+            entries.append(_coerce_group_entry(str(key), value, idx))
+    elif isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        for idx, value in enumerate(data):
+            raw_name = None
+            if isinstance(value, Mapping):
+                maybe_name = value.get("name") or value.get("label")
+                raw_name = str(maybe_name) if maybe_name is not None else None
+            entries.append(_coerce_group_entry(raw_name, value, idx))
+    else:
+        raise ValueError("Active group caps must be a mapping or list")
+
+    if not entries:
+        return None, None, []
+
+    asset_index = {name: idx for idx, name in enumerate(asset_names)}
+    group_map = np.full(len(asset_names), -1, dtype=int)
+    bounds: Dict[int, Tuple[float, float]] = {}
+    manifest: List[Dict[str, Any]] = []
+    assigned: Dict[str, str] = {}
+    unknown: Set[str] = set()
+    group_id = 0
+
+    for name, members, lower, upper in entries:
+        known_members: List[str] = []
+        mask = np.zeros(len(asset_names), dtype=bool)
+        for member in members:
+            idx = asset_index.get(member)
+            if idx is None:
+                unknown.add(member)
+                continue
+            mask[idx] = True
+            known_members.append(member)
+        if not known_members:
+            continue
+        for member in known_members:
+            if member in assigned:
+                raise ValueError(
+                    f"Asset '{member}' assigned to multiple active groups: {assigned[member]} and {name}"
+                )
+            assigned[member] = name
+            group_map[asset_index[member]] = group_id
+        bounds[group_id] = (float(lower), float(upper))
+        manifest.append(
+            {
+                "name": name,
+                "members": known_members,
+                "lower": _manifest_bound(lower),
+                "upper": _manifest_bound(upper),
+            }
+        )
+        group_id += 1
+
+    if unknown:
+        print(
+            "Warning: active group definitions include unknown assets: "
+            + ", ".join(sorted(unknown))
+        )
+
+    if group_id == 0:
+        return None, None, []
+
+    return group_map.tolist(), bounds, manifest
+
+
+def _prepare_factor_bounds(
+    spec: Any, factor_names: Sequence[str]
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Dict[str, Dict[str, Optional[float]]],
+]:
+    if not factor_names:
+        return None, None, {}
+    data = _maybe_load_structure(spec)
+    if data is None:
+        return None, None, {}
+
+    lower = np.full(len(factor_names), -np.inf, dtype=float)
+    upper = np.full(len(factor_names), np.inf, dtype=float)
+    manifest: Dict[str, Dict[str, Optional[float]]] = {}
+    name_to_idx = {name: idx for idx, name in enumerate(factor_names)}
+    unknown: Set[str] = set()
+
+    def _assign(name: Any, bounds_val: Any) -> None:
+        if name is None:
+            raise ValueError("Factor bound entry missing factor name")
+        factor = str(name)
+        idx = name_to_idx.get(factor)
+        if idx is None:
+            unknown.add(factor)
+            return
+        lo: Optional[float] = None
+        hi: Optional[float] = None
+        if isinstance(bounds_val, Mapping):
+            if "bounds" in bounds_val and isinstance(bounds_val["bounds"], Sequence):
+                seq = bounds_val["bounds"]
+                if len(seq) >= 1:
+                    lo = _coerce_optional_float(seq[0])
+                if len(seq) >= 2:
+                    hi = _coerce_optional_float(seq[1])
+            else:
+                lo = _coerce_optional_float(
+                    bounds_val.get("lower", bounds_val.get("min"))
+                )
+                hi = _coerce_optional_float(bounds_val.get("upper", bounds_val.get("max")))
+        elif isinstance(bounds_val, Sequence) and not isinstance(bounds_val, (str, bytes)):
+            if len(bounds_val) == 0:
+                return
+            lo = _coerce_optional_float(bounds_val[0])
+            hi = _coerce_optional_float(bounds_val[1]) if len(bounds_val) > 1 else None
+        else:
+            raise ValueError("Factor bounds must be specified as a mapping or sequence")
+
+        lo_val = -np.inf if lo is None else float(lo)
+        hi_val = np.inf if hi is None else float(hi)
+        if lo_val > hi_val + 1e-12:
+            raise ValueError("Factor lower bound exceeds upper bound")
+        lower[idx] = lo_val
+        upper[idx] = hi_val
+        manifest[factor] = {"lower": _manifest_bound(lo_val), "upper": _manifest_bound(hi_val)}
+
+    if isinstance(data, Mapping):
+        for key, value in data.items():
+            _assign(key, value)
+    elif isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        for entry in data:
+            if isinstance(entry, Mapping):
+                name = entry.get("factor") or entry.get("name")
+                if name is None and "group" in entry:
+                    name = entry["group"]
+                _assign(name, entry)
+            else:
+                raise ValueError("Factor bounds list entries must be mappings")
+    else:
+        raise ValueError("Factor bounds must be a mapping or list")
+
+    if unknown:
+        print(
+            "Warning: factor bounds specified for unknown factors: "
+            + ", ".join(sorted(unknown))
+        )
+
+    if not manifest:
+        return None, None, {}
+
+    return lower, upper, manifest
+
+
 def _serialize_args(args: argparse.Namespace) -> Dict[str, Any]:
     blob: Dict[str, Any] = {}
     for key, value in vars(args).items():
@@ -214,7 +586,10 @@ def _resolve_git_sha() -> Optional[str]:
 
 
 def _write_run_manifest(
-    out_dir: Path, args: argparse.Namespace, config_path: Optional[Path]
+    out_dir: Path,
+    args: argparse.Namespace,
+    config_path: Optional[Path],
+    extras: Optional[Dict[str, Any]] = None,
 ) -> None:
     manifest: Dict[str, Any] = {
         "args": _serialize_args(args),
@@ -223,6 +598,11 @@ def _write_run_manifest(
     }
     if config_path is not None:
         manifest["config_path"] = str(config_path)
+    if extras:
+        try:
+            manifest["resolved_constraints"] = json.loads(json.dumps(extras))
+        except TypeError:
+            manifest["resolved_constraints"] = extras
     try:  # optional torch dependency
         import torch
 
@@ -866,6 +1246,11 @@ def backtest(
     refine_every: int = 1,
     cov_model: str = "sample",
     benchmark: Optional[Any] = None,
+    benchmark_weights: Optional[Any] = None,
+    active_min: Optional[Any] = None,
+    active_max: Optional[Any] = None,
+    active_group_caps: Optional[Any] = None,
+    factor_bounds: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -891,6 +1276,18 @@ def backtest(
             raise ValueError("ewma_span must be an integer") from exc
         if ewma_span < 2:
             raise ValueError("ewma_span must be >= 2")
+
+    min_active_val = _coerce_optional_float(active_min)
+    max_active_val = _coerce_optional_float(active_max)
+    min_active_val, max_active_val = _normalize_active_bounds(
+        min_active_val, max_active_val
+    )
+    constraint_manifest: Dict[str, Any] = {
+        "active_bounds": {
+            "min": _manifest_bound(min_active_val),
+            "max": _manifest_bound(max_active_val),
+        }
+    }
 
     returns = _frame_to_numpy(df)
     if returns.size == 0:
@@ -971,13 +1368,46 @@ def backtest(
     if returns.shape[1] == 0:
         raise ValueError("No assets remain after aligning factors with returns")
 
+    bench_vector, bench_mask, bench_manifest = _prepare_benchmark_weights(
+        benchmark_weights, asset_names
+    )
+    constraint_manifest["benchmark_weights"] = bench_manifest
+    group_map, group_bounds, group_manifest = _prepare_active_groups(
+        active_group_caps, asset_names
+    )
+    constraint_manifest["active_group_caps"] = group_manifest
+    factor_lower_arr, factor_upper_arr, factor_bounds_manifest = _prepare_factor_bounds(
+        factor_bounds, factor_names
+    )
+    constraint_manifest["factor_bounds"] = factor_bounds_manifest
+
     optimizer = _build_optimizer(returns.shape[1], seed)
     constraints = _build_constraints(returns.shape[1])
     constraints.factor_tolerance = factor_tolerance
+    constraints.min_active_weight = float("-inf") if min_active_val is None else float(min_active_val)
+    constraints.max_active_weight = float("inf") if max_active_val is None else float(max_active_val)
+    if bench_vector is not None:
+        constraints.benchmark_weights = bench_vector
+        constraints.benchmark_mask = bench_mask
+    else:
+        constraints.benchmark_weights = None
+        constraints.benchmark_mask = None
+    if group_map is not None and group_bounds is not None:
+        constraints.active_group_map = group_map
+        constraints.active_group_bounds = group_bounds
+    else:
+        constraints.active_group_map = None
+        constraints.active_group_bounds = None
+    if factor_lower_arr is not None:
+        constraints.factor_lower_bounds = factor_lower_arr
+    if factor_upper_arr is not None:
+        constraints.factor_upper_bounds = factor_upper_arr
 
     weights: List[np.ndarray] = []
     rebalance_dates: List[Any] = []
     realized_dates: List[Any] = []
+    feasible_flags: List[bool] = []
+    projection_iters: List[int] = []
     prev_weights: Optional[np.ndarray] = None
     tc = float(tx_cost_bps) / 1e4
     missing_factor_logged: Set[Any] = set()
@@ -1094,6 +1524,7 @@ def backtest(
                         f"Missing factor data for rebalance date {rebalance_date}"
                     )
 
+        constraints.prev_weights = prev_weights
         should_refine = (len(weights) % refine_every) == 0
         result = optimizer.optimize(
             mu,
@@ -1103,6 +1534,8 @@ def backtest(
             refine=should_refine,
             benchmark=bench_stats,
         )
+        feasible_flags.append(bool(getattr(result, "feasible", True)))
+        projection_iters.append(int(getattr(result, "projection_iterations", 0)))
         w = result.weights
         weights.append(w)
         rebalance_dates.append(rebalance_date)
@@ -1115,6 +1548,10 @@ def backtest(
 
         turn = turnover(prev_weights, w)
         turnovers_arr[window_idx] = float(turn)
+        turnover_violation = False
+        if np.isfinite(constraints.max_turnover):
+            if float(turn) > float(constraints.max_turnover) + 1e-9:
+                turnover_violation = True
         tx_cost_value = tc * turn if (tc > 0.0 and tx_cost_mode != "none") else 0.0
         tx_block_returns = gross_block_returns.copy()
         block_returns_metrics = gross_block_returns.copy()
@@ -1182,37 +1619,67 @@ def backtest(
                 cap = float(constraints.max_sector_concentration)
                 sector_breaches = int(np.count_nonzero(exposures_values > cap + 1e-9))
         active_breaches = 0
+        group_breaches = 0
+        factor_bound_breaches = 0
+        asset_active_violation = False
+        group_violation = False
+        factor_violation = False
         bench_weights = constraints.benchmark_weights
+        bench_mask_arr = None
+        bench_arr = np.zeros_like(w)
+        active = w.copy()
+        tol_active = 1e-9
         if bench_weights is not None:
             bench_arr = np.asarray(bench_weights, dtype=float).ravel()
             if bench_arr.shape != w.shape:
                 raise ValueError("benchmark_weights dimension mismatch with weights")
+            if constraints.benchmark_mask is not None:
+                bench_mask_arr = np.asarray(constraints.benchmark_mask, dtype=bool).ravel()
+                if bench_mask_arr.shape != bench_arr.shape:
+                    raise ValueError("benchmark_mask dimension mismatch with weights")
+            else:
+                bench_mask_arr = np.ones_like(bench_arr, dtype=bool)
             active = w - bench_arr
             if np.isfinite(constraints.min_active_weight):
-                active_breaches += int(
-                    np.count_nonzero(active < float(constraints.min_active_weight) - 1e-9)
+                violations = np.logical_and(
+                    bench_mask_arr,
+                    active < float(constraints.min_active_weight) - tol_active,
                 )
+                if np.any(violations):
+                    active_breaches += int(np.count_nonzero(violations))
+                    asset_active_violation = True
             if np.isfinite(constraints.max_active_weight):
-                active_breaches += int(
-                    np.count_nonzero(active > float(constraints.max_active_weight) + 1e-9)
+                violations = np.logical_and(
+                    bench_mask_arr,
+                    active > float(constraints.max_active_weight) + tol_active,
                 )
-            if (
-                constraints.active_group_map is not None
-                and constraints.active_group_bounds
-            ):
-                groups = np.asarray(constraints.active_group_map, dtype=int)
-                if groups.shape[0] != w.shape[0]:
-                    raise ValueError("active_group_map dimension mismatch with weights")
-                for gid, bound in constraints.active_group_bounds.items():
-                    mask = groups == gid
-                    if not np.any(mask):
-                        continue
-                    active_sum = float(active[mask].sum())
-                    lower_b, upper_b = bound
-                    if np.isfinite(upper_b) and active_sum > float(upper_b) + 1e-9:
-                        active_breaches += 1
-                    if np.isfinite(lower_b) and active_sum < float(lower_b) - 1e-9:
-                        active_breaches += 1
+                if np.any(violations):
+                    active_breaches += int(np.count_nonzero(violations))
+                    asset_active_violation = True
+        if (
+            constraints.active_group_map is not None
+            and constraints.active_group_bounds
+        ):
+            groups = np.asarray(constraints.active_group_map, dtype=int)
+            if groups.shape[0] != w.shape[0]:
+                raise ValueError("active_group_map dimension mismatch with weights")
+            if bench_mask_arr is None:
+                bench_mask_arr = np.ones_like(w, dtype=bool)
+            for gid, bound in constraints.active_group_bounds.items():
+                mask = np.logical_and(groups == gid, bench_mask_arr)
+                if not np.any(mask):
+                    continue
+                active_sum = float(active[mask].sum())
+                lower_b, upper_b = bound
+                violated = False
+                if np.isfinite(upper_b) and active_sum > float(upper_b) + tol_active:
+                    group_breaches += 1
+                    violated = True
+                if np.isfinite(lower_b) and active_sum < float(lower_b) - tol_active:
+                    group_breaches += 1
+                    violated = True
+                if violated:
+                    group_violation = True
         factor_inf_norm = 0.0
         if factor_panel is not None:
             if factors_missing:
@@ -1230,6 +1697,21 @@ def backtest(
                 exposures = current_factor_snapshot.T @ w
                 targets = factor_target_vec
                 factor_inf_norm = float(np.linalg.norm(exposures - targets, ord=np.inf))
+                tol_bounds = max(1e-9, float(constraints.factor_tolerance))
+                if factor_lower_arr is not None:
+                    lower_mask = np.isfinite(factor_lower_arr)
+                    below = exposures < factor_lower_arr - tol_bounds
+                    if np.any(np.logical_and(lower_mask, below)):
+                        count = int(np.count_nonzero(np.logical_and(lower_mask, below)))
+                        factor_bound_breaches += count
+                        factor_violation = True
+                if factor_upper_arr is not None:
+                    upper_mask = np.isfinite(factor_upper_arr)
+                    above = exposures > factor_upper_arr + tol_bounds
+                    if np.any(np.logical_and(upper_mask, above)):
+                        count = int(np.count_nonzero(np.logical_and(upper_mask, above)))
+                        factor_bound_breaches += count
+                        factor_violation = True
                 factor_records.append(
                     {
                         "date": rebalance_date,
@@ -1240,6 +1722,18 @@ def backtest(
                         "missing": False,
                     }
                 )
+
+        first_violation: Optional[str] = None
+        if asset_active_violation:
+            first_violation = "ACTIVE_BOX"
+        elif group_violation:
+            first_violation = "GROUP_CAP"
+        elif factor_violation:
+            first_violation = "FACTOR_BOUND"
+        elif sector_breaches > 0:
+            first_violation = "SECTOR_CAP"
+        elif turnover_violation:
+            first_violation = "TURNOVER"
 
         rebalance_records.append(
             {
@@ -1252,8 +1746,13 @@ def backtest(
                 "slippage_cost": float(slip_cost),
                 "sector_breaches": int(sector_breaches),
                 "active_breaches": int(active_breaches),
+                "group_breaches": int(group_breaches),
+                "factor_bound_breaches": int(factor_bound_breaches),
                 "factor_inf_norm": float(factor_inf_norm),
                 "factor_missing": bool(factors_missing),
+                "first_violation": first_violation,
+                "feasible": bool(feasible_flags[-1]),
+                "projection_iterations": int(projection_iters[-1]),
             }
         )
         cursor += block_len
@@ -1332,7 +1831,10 @@ def backtest(
         "slippage_costs": slippage_costs_arr,
         "slippage_net_returns": slippage_net_returns,
         "rebalance_records": rebalance_records,
+        "rebalance_feasible": feasible_flags,
+        "projection_iterations": projection_iters,
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
+        "constraint_manifest": constraint_manifest,
     }
 
 
@@ -1470,8 +1972,13 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "slippage_cost",
         "sector_breaches",
         "active_breaches",
+        "group_breaches",
+        "factor_bound_breaches",
         "factor_inf_norm",
         "factor_missing",
+        "first_violation",
+        "feasible",
+        "projection_iterations",
     ]
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=header)
@@ -1591,6 +2098,30 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         default=None,
         help="Optional CSV of benchmark returns (single column)",
     )
+    parser.add_argument(
+        "--active-min",
+        type=float,
+        default=None,
+        help="Minimum per-asset active weight relative to the benchmark",
+    )
+    parser.add_argument(
+        "--active-max",
+        type=float,
+        default=None,
+        help="Maximum per-asset active weight relative to the benchmark",
+    )
+    parser.add_argument(
+        "--active-group-caps",
+        type=str,
+        default=None,
+        help="YAML/JSON file describing active group caps",
+    )
+    parser.add_argument(
+        "--factor-bounds",
+        type=str,
+        default=None,
+        help="YAML/JSON file describing factor exposure bounds",
+    )
     parser.add_argument("--lookback", type=int, default=252)
     parser.add_argument("--step", type=int, default=21)
     parser.add_argument(
@@ -1704,6 +2235,10 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             raise ValueError("Factor targets provided without factor loadings")
         factor_target_vec = load_factor_targets(Path(parsed.factor_targets), factor_panel.factor_names)
 
+    benchmark_weights_spec = getattr(parsed, "benchmark_weights", None)
+    active_group_spec = parsed.active_group_caps or None
+    factor_bounds_spec = parsed.factor_bounds or None
+
     tx_cost_bps = float(parsed.tx_cost_bps) if parsed.tx_cost_mode != "none" else 0.0
     results = backtest(
         df,
@@ -1724,6 +2259,11 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         refine_every=parsed.refine_every,
         cov_model=parsed.cov_model,
         benchmark=benchmark_df,
+        benchmark_weights=benchmark_weights_spec,
+        active_min=parsed.active_min,
+        active_max=parsed.active_max,
+        active_group_caps=active_group_spec,
+        factor_bounds=factor_bounds_spec,
     )
 
     out_dir = Path(parsed.out)
@@ -1755,7 +2295,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             json.dumps(diagnostics, indent=2, sort_keys=True), encoding="utf-8"
         )
 
-    _write_run_manifest(out_dir, parsed, config_path)
+    _write_run_manifest(out_dir, parsed, config_path, extras=results.get("constraint_manifest"))
 
     if not parsed.skip_plot:
         try:

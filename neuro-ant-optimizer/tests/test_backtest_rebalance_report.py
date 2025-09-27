@@ -40,6 +40,8 @@ class _StubOptimizer:
         class _Result:
             def __init__(self, w: np.ndarray):
                 self.weights = w
+                self.feasible = True
+                self.projection_iterations = 0
 
         return _Result(weights)
 
@@ -107,8 +109,13 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         assert record["net_slip_ret"] == pytest.approx(expected_net_tx)
         assert record["sector_breaches"] == 0
         assert record["active_breaches"] == 0
+        assert record["group_breaches"] == 0
+        assert record["factor_bound_breaches"] == 0
         assert record["factor_inf_norm"] == pytest.approx(0.0)
         assert record["factor_missing"] is False
+        assert record["first_violation"] is None
+        assert record["feasible"] is True
+        assert record["projection_iterations"] == 0
 
     # Ensure per-period net returns align with report calculations
     np.testing.assert_allclose(
@@ -121,6 +128,46 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     text = report_path.read_text().splitlines()
     assert text[0] == (
         "date,gross_ret,net_tx_ret,net_slip_ret,turnover,tx_cost,slippage_cost,"
-        "sector_breaches,active_breaches,factor_inf_norm,factor_missing"
+        "sector_breaches,active_breaches,group_breaches,factor_bound_breaches,"
+        "factor_inf_norm,factor_missing,first_violation,feasible,projection_iterations"
     )
+
+
+def test_active_bounds_fall_back_for_missing_benchmark(monkeypatch) -> None:
+    n_periods = 9
+    dates = np.array(
+        [np.datetime64("2020-01-01") + np.timedelta64(i, "D") for i in range(n_periods)]
+    )
+    returns = np.array(
+        [[0.01, 0.0, 0.02], [0.02, -0.01, 0.01], [0.0, 0.01, 0.0],
+         [0.03, 0.01, 0.02], [0.02, 0.0, 0.03], [0.01, 0.02, -0.01],
+         [0.0, -0.01, 0.04], [0.01, 0.03, 0.01], [0.0, 0.02, 0.02]],
+        dtype=float,
+    )
+    frame = _Frame(returns, dates, ["A", "B", "C"])
+
+    weights_seq = [
+        np.array([0.1, 0.1, 0.8], dtype=float),
+        np.array([0.1, 0.05, 0.85], dtype=float),
+    ]
+    stub = _StubOptimizer(weights_seq)
+    monkeypatch.setattr(bt, "_build_optimizer", lambda n_assets, seed: stub)
+
+    results = bt.backtest(
+        frame,
+        lookback=3,
+        step=3,
+        seed=0,
+        benchmark_weights={"A": 0.1, "B": 0.1},
+        active_min=-0.1,
+        active_max=0.1,
+    )
+
+    for record in results["rebalance_records"]:
+        assert record["active_breaches"] == 0
+        assert record["group_breaches"] == 0
+        assert record["first_violation"] is None
+
+    manifest = results["constraint_manifest"]
+    assert manifest["benchmark_weights"]["C"] is None
 
