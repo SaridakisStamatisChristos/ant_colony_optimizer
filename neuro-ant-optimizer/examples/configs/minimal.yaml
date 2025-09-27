@@ -1,5 +1,6 @@
 # Minimal run without factors
 csv: data/returns.csv
+benchmark_csv: data/benchmark.csv
 lookback: 126
 step: 21
 objective: max_return
