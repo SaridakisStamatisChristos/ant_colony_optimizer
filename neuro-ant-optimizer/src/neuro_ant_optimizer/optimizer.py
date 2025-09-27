@@ -1,24 +1,103 @@
 from __future__ import annotations
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+import logging
+import math
+from time import perf_counter
+from typing import Any, Dict, List, Optional, Sequence
+
 import numpy as np
 import torch
 import torch.nn as nn
-from enum import Enum
-import logging
+from torch.nn.utils import clip_grad_norm_
 
 from .models import RiskAssessmentNetwork, PheromoneNetwork
-from .colony import Ant, AntColony
+from .colony import AntColony
 from .constraints import PortfolioConstraints
-from .utils import nearest_psd, set_seed
 from .refine import refine_slsqp
-from torch.nn.utils import clip_grad_norm_
+from .utils import nearest_psd, safe_softmax, set_seed
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(h)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+
+@dataclass
+class OptimizerConfig:
+    """Configuration container for :class:`NeuroAntPortfolioOptimizer`."""
+
+    n_ants: int = 16
+    max_iter: int = 20
+    patience: int = 5
+    seed: int = 42
+    lr: float = 5e-4
+    risk_free: float = 0.02
+    evaporation: float = 0.45
+    Q: float = 75.0
+    topk_refine: int = 4
+    topk_train: int = 4
+    use_risk_head: bool = True
+    refine_maxiter: int = 30
+    grad_clip: float = 1.0
+    min_alloc: float = 0.01
+    base_alloc: float = 0.06
+    risk_weight: float = 0.4
+    device: str = "cpu"
+    dtype: torch.dtype = torch.float32
+    max_runtime: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.n_ants <= 0:
+            raise ValueError("n_ants must be positive")
+        if self.max_iter <= 0:
+            raise ValueError("max_iter must be positive")
+        if self.patience <= 0:
+            raise ValueError("patience must be positive")
+        if not (0.0 <= self.evaporation <= 1.0):
+            raise ValueError("evaporation must lie in [0, 1]")
+        if self.topk_refine <= 0:
+            raise ValueError("topk_refine must be positive")
+        if self.topk_train <= 0:
+            raise ValueError("topk_train must be positive")
+        if self.min_alloc < 0.0 or self.base_alloc <= 0.0:
+            raise ValueError("allocation hyper-parameters must be non-negative")
+        if self.grad_clip <= 0.0:
+            raise ValueError("grad_clip must be positive")
+        if not isinstance(self.dtype, torch.dtype):
+            raise TypeError("dtype must be a torch.dtype instance")
+        if self.max_runtime <= 0.0:
+            raise ValueError("max_runtime must be positive")
+
+    @classmethod
+    def from_overrides(cls, overrides: Optional[Dict[str, Any]] = None) -> "OptimizerConfig":
+        if overrides is None:
+            return cls()
+        base = asdict(cls())
+        base.update(overrides)
+        return cls(**base)
+
+
+@dataclass
+class OptimizationResult:
+    """Structured result returned by :meth:`NeuroAntPortfolioOptimizer.optimize`."""
+
+    weights: np.ndarray
+    expected_return: float
+    volatility: float
+    sharpe_ratio: float
+    optimization_time: float
+    convergence_status: bool
+    iteration_count: int
+    risk_contributions: np.ndarray
+    message: str
+
+    def __post_init__(self) -> None:
+        self.weights = np.asarray(self.weights, dtype=float)
+        self.risk_contributions = np.asarray(self.risk_contributions, dtype=float)
+
 
 class OptimizationObjective(Enum):
     SHARPE_RATIO = "sharpe_ratio"
@@ -26,40 +105,60 @@ class OptimizationObjective(Enum):
     MIN_VARIANCE = "min_variance"
     RISK_PARITY = "risk_parity"
 
-class NeuroAntPortfolioOptimizer:
-    def __init__(self, n_assets: int, config: Optional[Dict] = None):
-        self.n_assets = n_assets
-        self.cfg = config or self._default_cfg()
 
-        self.risk_net = RiskAssessmentNetwork(n_assets) if self.cfg["use_risk_head"] else None
-        self.phero_net = PheromoneNetwork(n_assets)
-        self.colony = AntColony(n_assets, self.cfg["n_ants"], self.cfg["evaporation"], self.cfg["Q"])
+class NeuroAntPortfolioOptimizer:
+    """Hybrid ant-colony optimizer with neural pheromone and risk models."""
+
+    def __init__(self, n_assets: int, config: Optional[Dict[str, Any] | OptimizerConfig] = None):
+        if n_assets <= 1:
+            raise ValueError("n_assets must be greater than one")
+
+        if isinstance(config, OptimizerConfig):
+            self.cfg = config
+        else:
+            self.cfg = OptimizerConfig.from_overrides(config)
+
+        self.n_assets = n_assets
+        self.device = torch.device(self.cfg.device)
+
+        self.risk_net = RiskAssessmentNetwork(n_assets).to(self.device, dtype=self.cfg.dtype) if self.cfg.use_risk_head else None
+        self.phero_net = PheromoneNetwork(n_assets).to(self.device, dtype=self.cfg.dtype)
+        self.colony = AntColony(n_assets, self.cfg.n_ants, self.cfg.evaporation, self.cfg.Q)
 
         if self.risk_net is not None:
-            self.risk_optim = torch.optim.Adam(self.risk_net.parameters(), lr=self.cfg["lr"])
-        self.phero_optim = torch.optim.Adam(self.phero_net.parameters(), lr=self.cfg["lr"])
+            self.risk_optim = torch.optim.Adam(self.risk_net.parameters(), lr=self.cfg.lr)
+        else:
+            self.risk_optim = None
+
+        self.phero_optim = torch.optim.Adam(self.phero_net.parameters(), lr=self.cfg.lr)
         self.mse = nn.MSELoss()
         self.bce = nn.BCELoss()
 
-        self.history: List[Dict] = []
+        self.history: List[Dict[str, float]] = []
         self.best_w: Optional[np.ndarray] = None
         self.best_score: float = -np.inf
 
-    def _default_cfg(self) -> Dict:
-        return dict(
-            n_ants=150, max_iter=200, patience=20, seed=42, lr=1e-3, risk_free=0.02,
-            evaporation=0.5, Q=100.0, topk_refine=12, topk_train=16,
-            use_risk_head=True, refine_maxiter=200
-        )
+    def optimize(
+        self,
+        returns: np.ndarray,
+        covariance: np.ndarray,
+        constraints: PortfolioConstraints,
+        objective: OptimizationObjective = OptimizationObjective.SHARPE_RATIO,
+    ) -> OptimizationResult:
+        """Run the optimization loop and return an :class:`OptimizationResult`."""
 
-    def optimize(self, returns: np.ndarray, covariance: np.ndarray, constraints: PortfolioConstraints,
-                 objective: OptimizationObjective=OptimizationObjective.SHARPE_RATIO):
-        set_seed(self.cfg["seed"])
+        set_seed(self.cfg.seed)
+        rng = np.random.default_rng(self.cfg.seed)
+        start_time = perf_counter()
+
         mu = np.asarray(returns, dtype=float).ravel()
         cov = nearest_psd(np.asarray(covariance, dtype=float))
         self._validate(mu, cov)
+
         sigma = np.sqrt(np.clip(np.diag(cov), 1e-18, None))
-        corr = cov / np.outer(sigma, sigma)
+        denom = np.outer(sigma, sigma)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            corr = np.divide(cov, denom, out=np.ones_like(cov), where=denom > 0)
 
         best_w = np.ones(self.n_assets) / self.n_assets
         best_score = -np.inf
@@ -67,180 +166,317 @@ class NeuroAntPortfolioOptimizer:
         converged = False
         message = "OK"
 
-        for it in range(self.cfg["max_iter"]):
+        risk_scores = self._risk_scores(mu, sigma, corr)
+        heuristic = safe_softmax(mu - self.cfg.risk_weight * risk_scores)
+
+        for iteration in range(self.cfg.max_iter):
             ants = self.colony.init_colony()
             portfolios: List[np.ndarray] = []
             scores: List[float] = []
 
             for ant in ants:
-                w = ant.build(self.phero_net, self.risk_net, mu, sigma, corr)
-                w = self._apply_constraints(w, constraints)
-                s = self._score(w, mu, cov, objective, constraints)
-                portfolios.append(w); scores.append(s)
+                weights = ant.build(
+                    self.phero_net,
+                    self.risk_net,
+                    mu,
+                    sigma,
+                    corr,
+                    min_alloc=self.cfg.min_alloc,
+                    base_alloc=self.cfg.base_alloc,
+                    risk_weight=self.cfg.risk_weight,
+                    risk_scores=risk_scores,
+                    heuristic=heuristic,
+                    rng=rng,
+                )
+                weights = self._apply_constraints(weights, constraints)
+                score = self._score(weights, mu, cov, objective, constraints)
+                portfolios.append(weights)
+                scores.append(score)
 
-            topk = min(self.cfg["topk_refine"], len(portfolios))
-            idx = np.argsort(scores)[-topk:]
-            for j in idx:
-                w0 = portfolios[j]
-                score_fn = lambda w: self._score(w, mu, cov, objective, constraints)
-                w_ref, s_ref, ok = refine_slsqp(w0, score_fn, self.n_assets, constraints, self.cfg["refine_maxiter"])
-                if ok:
-                    portfolios[j] = w_ref; scores[j] = s_ref
+            if portfolios:
+                self._refine_topk(portfolios, scores, mu, cov, objective, constraints)
 
             self.colony.update(ants, scores)
 
             if self.risk_net is not None:
-                self._train_risk(mu, sigma, corr)
+                risk_scores = self._train_risk(mu, sigma, corr)  # returns np.ndarray
+                heuristic = safe_softmax(mu - self.cfg.risk_weight * risk_scores)
             self._train_pheromone(portfolios, scores)
 
-            jbest = int(np.argmax(scores))
-            if scores[jbest] > best_score + 1e-12:
-                best_score = float(scores[jbest]); best_w = portfolios[jbest].copy(); no_improve = 0
-            else:
-                no_improve += 1
+            if scores:
+                best_idx = int(np.argmax(scores))
+                current_best = float(scores[best_idx])
+                if current_best > best_score + 1e-12:
+                    best_score = current_best
+                    best_w = portfolios[best_idx].copy()
+                    no_improve = 0
+                else:
+                    no_improve += 1
 
-            self.history.append(dict(iter=it, best=best_score, avg=float(np.mean(scores))))
-            if it % 10 == 0:
-                logger.info(f"Iter {it:03d} | best={best_score:.6f} avg={np.mean(scores):.6f}")
-            if no_improve >= self.cfg["patience"]:
-                converged = True; message = f"Early stop at iter {it}"
+                self.history.append({
+                    "iter": float(iteration),
+                    "best": float(best_score),
+                    "avg": float(np.mean(scores)),
+                })
+
+                if iteration % 10 == 0:
+                    logger.info(
+                        "Iter %03d | best=%.6f avg=%.6f",
+                        iteration,
+                        best_score,
+                        float(np.mean(scores)),
+                    )
+
+                if no_improve >= self.cfg.patience:
+                    converged = True
+                    message = f"Early stop at iter {iteration}"
+                    break
+                if perf_counter() - start_time >= self.cfg.max_runtime:
+                    message = f"Runtime budget reached at iter {iteration}"
+                    break
+            else:
+                message = "No portfolios generated"
                 break
 
-        w_final = self._apply_constraints(best_w, constraints)
-        return type("OptimizationResult", (), dict(
-            weights=w_final,
-            expected_return=float(w_final @ mu),
-            volatility=float(np.sqrt(max(w_final @ cov @ w_final, 0.0))),
-            sharpe_ratio=self._sharpe(w_final, mu, cov),
-            optimization_time=0.0,
+        final_weights = self._apply_constraints(best_w, constraints)
+        elapsed = perf_counter() - start_time
+
+        return OptimizationResult(
+            weights=final_weights,
+            expected_return=float(final_weights @ mu),
+            volatility=float(math.sqrt(max(final_weights @ cov @ final_weights, 0.0))),
+            sharpe_ratio=self._sharpe(final_weights, mu, cov),
+            optimization_time=elapsed,
             convergence_status=converged,
             iteration_count=len(self.history),
-            risk_contributions=self._risk_contrib(w_final, cov),
+            risk_contributions=self._risk_contrib(final_weights, cov),
             message=message,
-        ))
+        )
 
     # ---- internals ----
-    def _score(self, w, mu, cov, obj, c):
-        if not self._feasible(w, c): return -1e9
-        r = float(w @ mu); v = float(np.sqrt(max(w @ cov @ w, 0.0)))
-        if obj.name == "SHARPE_RATIO":
-            return (r - self.cfg["risk_free"]) / v if v > 1e-12 else -1e6
-        if obj.name == "MAX_RETURN": return r
-        if obj.name == "MIN_VARIANCE": return -v
-        if obj.name == "RISK_PARITY":
-            rc = self._risk_contrib(w, cov); s = rc.sum()
-            if s <= 0: return -1e6
-            rc /= s; eq = np.ones_like(rc)/len(rc)
-            return -float(np.linalg.norm(rc - eq))
+    def _score(
+        self,
+        weights: np.ndarray,
+        mu: np.ndarray,
+        cov: np.ndarray,
+        objective: OptimizationObjective,
+        constraints: PortfolioConstraints,
+    ) -> float:
+        if not self._feasible(weights, constraints):
+            return -1e9
+
+        portfolio_return = float(weights @ mu)
+        volatility = float(math.sqrt(max(weights @ cov @ weights, 0.0)))
+
+        if objective is OptimizationObjective.SHARPE_RATIO:
+            return (
+                (portfolio_return - self.cfg.risk_free) / volatility
+                if volatility > 1e-12
+                else -1e6
+            )
+        if objective is OptimizationObjective.MAX_RETURN:
+            return portfolio_return
+        if objective is OptimizationObjective.MIN_VARIANCE:
+            return -volatility
+        if objective is OptimizationObjective.RISK_PARITY:
+            contributions = self._risk_contrib(weights, cov)
+            total = contributions.sum()
+            if total <= 0:
+                return -1e6
+            contributions /= total
+            equal = np.ones_like(contributions) / len(contributions)
+            return -float(np.linalg.norm(contributions - equal))
         return -1e9
 
-    def _apply_constraints(self, w, c):
-        w = np.clip(w, c.min_weight, c.max_weight)
-        if c.equality_enforce and abs(c.leverage_limit - 1.0) < 1e-12:
-            s = w.sum(); w = (w / s) if s>0 else np.ones_like(w)/len(w)
-            w = np.clip(w, c.min_weight, c.max_weight); w = w / w.sum()
-        else:
-            if w.sum() > c.leverage_limit:
-                w *= c.leverage_limit / (w.sum() + 1e-12)
-        if c.sector_map is not None:
-            w = self._enforce_sector_caps(w, c)
-        if c.prev_weights is not None:
-            w = self._enforce_turnover(w, c)
-        return w
+    def _apply_constraints(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
+        clipped = np.clip(weights, constraints.min_weight, constraints.max_weight)
 
-    def _feasible(self, w, c, tol=1e-8):
-        if np.any(w < c.min_weight - tol) or np.any(w > c.max_weight + tol): return False
-        if w.sum() > c.leverage_limit + tol: return False
-        if c.equality_enforce and abs(c.leverage_limit - 1.0) < 1e-12 and abs(w.sum()-1.0) > 1e-6: return False
-        if c.sector_map is not None:
-            sects = np.array(c.sector_map, dtype=int)
-            for s in np.unique(sects):
-                if w[sects==s].sum() > c.max_sector_concentration + tol: return False
-        if c.prev_weights is not None:
-            if np.abs(w - c.prev_weights).sum() > c.max_turnover + tol: return False
+        if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+            total = clipped.sum()
+            if total <= 0:
+                clipped = np.ones_like(clipped) / len(clipped)
+            else:
+                clipped = clipped / total
+            clipped = np.clip(clipped, constraints.min_weight, constraints.max_weight)
+            clipped = clipped / max(clipped.sum(), 1e-12)
+        elif clipped.sum() > constraints.leverage_limit:
+            clipped *= constraints.leverage_limit / (clipped.sum() + 1e-12)
+
+        if constraints.sector_map is not None:
+            clipped = self._enforce_sector_caps(clipped, constraints)
+        if constraints.prev_weights is not None:
+            clipped = self._enforce_turnover(clipped, constraints)
+
+        return clipped
+
+    def _feasible(self, weights: np.ndarray, constraints: PortfolioConstraints, tol: float = 1e-8) -> bool:
+        if np.any(weights < constraints.min_weight - tol) or np.any(weights > constraints.max_weight + tol):
+            return False
+        if weights.sum() > constraints.leverage_limit + tol:
+            return False
+        if (
+            constraints.equality_enforce
+            and abs(constraints.leverage_limit - 1.0) < 1e-12
+            and abs(weights.sum() - 1.0) > 1e-6
+        ):
+            return False
+        if constraints.sector_map is not None:
+            sectors = np.array(constraints.sector_map, dtype=int)
+            for sector in np.unique(sectors):
+                if weights[sectors == sector].sum() > constraints.max_sector_concentration + tol:
+                    return False
+        if constraints.prev_weights is not None:
+            if np.abs(weights - constraints.prev_weights).sum() > constraints.max_turnover + tol:
+                return False
         return True
 
-    def _enforce_sector_caps(self, w, c):
-        sects = np.array(c.sector_map, dtype=int); w = w.copy()
-        for s in np.unique(sects):
-            idx = (sects==s); tot = w[idx].sum(); cap = c.max_sector_concentration
-            if tot > cap: w[idx] *= cap / (tot + 1e-12)
-        if c.equality_enforce and abs(c.leverage_limit - 1.0) < 1e-12:
-            s = w.sum(); w = (w / s) if s>0 else w
+    def _enforce_sector_caps(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
+        sectors = np.array(constraints.sector_map, dtype=int)
+        adjusted = weights.copy()
+        for sector in np.unique(sectors):
+            mask = sectors == sector
+            total = adjusted[mask].sum()
+            cap = constraints.max_sector_concentration
+            if total > cap:
+                adjusted[mask] *= cap / (total + 1e-12)
+        if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+            total = adjusted.sum()
+            if total > 0:
+                adjusted = adjusted / total
         else:
-            w = np.minimum(w, c.max_weight)
-        return w
+            adjusted = np.minimum(adjusted, constraints.max_weight)
+        return adjusted
 
-    def _enforce_turnover(self, w, c):
-        prev = np.asarray(c.prev_weights, dtype=float); diff = w - prev
-        l1 = np.abs(diff).sum()
-        if l1 <= c.max_turnover + 1e-12: return w
-        if l1 > 0:
-            alpha = c.max_turnover / l1; w = prev + alpha * diff
-        w = np.clip(w, c.min_weight, c.max_weight)
-        if c.equality_enforce and abs(c.leverage_limit - 1.0) < 1e-12:
-            s = w.sum(); w = (w / s) if s>0 else w
+    def _enforce_turnover(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
+        previous = np.asarray(constraints.prev_weights, dtype=float)
+        diff = weights - previous
+        l1_norm = np.abs(diff).sum()
+        if l1_norm <= constraints.max_turnover + 1e-12:
+            adjusted = weights
         else:
-            if w.sum() > c.leverage_limit:
-                w *= c.leverage_limit / (w.sum() + 1e-12)
-        return w
+            alpha = constraints.max_turnover / (l1_norm + 1e-12)
+            adjusted = previous + alpha * diff
 
-    def _risk_contrib(self, w, cov):
-        var = float(w @ cov @ w)
-        if var <= 1e-18: return np.zeros_like(w)
-        mc = cov @ w; return w * mc / var
+        adjusted = np.clip(adjusted, constraints.min_weight, constraints.max_weight)
 
-    def _sharpe(self, w, mu, cov):
-        v = float(np.sqrt(max(w @ cov @ w, 0.0)))
-        return 0.0 if v <= 1e-12 else (float(w @ mu) - self.cfg["risk_free"]) / v
+        if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+            total = adjusted.sum()
+            if total > 0:
+                adjusted = adjusted / total
+        elif adjusted.sum() > constraints.leverage_limit:
+            adjusted *= constraints.leverage_limit / (adjusted.sum() + 1e-12)
+        return adjusted
 
-    def _validate(self, mu, cov):
+    def _risk_contrib(self, weights: np.ndarray, cov: np.ndarray) -> np.ndarray:
+        variance = float(weights @ cov @ weights)
+        if variance <= 1e-18:
+            return np.zeros_like(weights)
+        marginal = cov @ weights
+        return weights * marginal / variance
+
+    def _sharpe(self, weights: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> float:
+        volatility = float(math.sqrt(max(weights @ cov @ weights, 0.0)))
+        if volatility <= 1e-12:
+            return 0.0
+        return (float(weights @ mu) - self.cfg.risk_free) / volatility
+
+    def _validate(self, mu: np.ndarray, cov: np.ndarray) -> None:
         n = mu.shape[0]
-        if cov.shape != (n, n): raise ValueError("covariance must be (n,n)")
-        if not np.allclose(cov, cov.T, atol=1e-10): raise ValueError("covariance must be symmetric")
+        if cov.shape != (n, n):
+            raise ValueError("covariance must be (n,n)")
+        if not np.allclose(cov, cov.T, atol=1e-10):
+            raise ValueError("covariance must be symmetric")
 
-    # ---- learning routines ----
-    def _train_risk(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> None:
+    def _risk_scores(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> np.ndarray:
+        """Predict per-asset normalized risk scores in [0,1]."""
         if self.risk_net is None:
+            return np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
+
+        avg_corr = (corr.sum(axis=1) - 1.0) / max(self.n_assets - 1, 1)
+        feats = np.stack([mu, sigma, avg_corr], axis=1).reshape(-1).astype(np.float32)
+        tensor = torch.from_numpy(feats).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
+        with torch.no_grad():
+            pred = self.risk_net(tensor).detach().cpu().numpy().ravel()
+        return np.clip(pred, 0.0, 1.0)
+
+    def _refine_topk(
+        self,
+        portfolios: List[np.ndarray],
+        scores: List[float],
+        mu: np.ndarray,
+        cov: np.ndarray,
+        objective: OptimizationObjective,
+        constraints: PortfolioConstraints,
+    ) -> None:
+        if not portfolios:
             return
 
-        # Features mirror the predict() pathway to keep inference consistent.
+        topk = min(self.cfg.topk_refine, len(portfolios))
+        if topk <= 0:
+            return
+
+        indices = np.argsort(scores)[-topk:]
+        for idx in indices:
+            initial = portfolios[idx]
+
+            def score_fn(weights: Sequence[float]) -> float:
+                return self._score(np.asarray(weights, dtype=float), mu, cov, objective, constraints)
+
+            refined, refined_score, ok = refine_slsqp(
+                initial,
+                score_fn,
+                self.n_assets,
+                constraints,
+                self.cfg.refine_maxiter,
+            )
+            if ok:
+                portfolios[idx] = refined
+                scores[idx] = refined_score
+
+    # ---- learning routines ----
+    def _train_risk(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> np.ndarray:
+        """One-step self-supervised update of risk_net and return fresh scores."""
+        if self.risk_net is None or self.risk_optim is None:
+            return np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
+
         avg_corr = (corr.sum(axis=1) - 1.0) / max(self.n_assets - 1, 1)
         feats = np.stack([mu, sigma, avg_corr], axis=1).reshape(-1).astype(np.float32)
         target = (sigma / (sigma.max() + 1e-12)).astype(np.float32)
 
-        x = torch.from_numpy(feats).unsqueeze(0)
-        y = torch.from_numpy(target).unsqueeze(0)
+        x = torch.from_numpy(feats).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
+        y = torch.from_numpy(target).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
 
         self.risk_net.train()
         self.risk_optim.zero_grad()
-
         pred = self.risk_net(x)
         loss = self.mse(pred, y)
         loss.backward()
-        clip_grad_norm_(self.risk_net.parameters(), 1.0)
+        clip_grad_norm_(self.risk_net.parameters(), self.cfg.grad_clip)
         self.risk_optim.step()
         self.risk_net.eval()
 
+        with torch.no_grad():
+            out = self.risk_net(x).detach().cpu().numpy().ravel()
+        return np.clip(out, 0.0, 1.0)
+
     def _train_pheromone(self, portfolios: List[np.ndarray], scores: List[float]) -> None:
-        if len(portfolios) == 0:
+        if not portfolios:
             return
 
-        k = min(self.cfg["topk_train"], len(portfolios))
+        k = min(self.cfg.topk_train, len(portfolios))
         idx = np.argsort(scores)[-k:]
         targets = [np.tile(np.clip(portfolios[i], 0.0, 1.0), (self.n_assets, 1)) for i in idx]
         target_mat = np.mean(targets, axis=0)
         target_mat = np.clip(target_mat, 1e-6, 1 - 1e-6).astype(np.float32)
 
-        asset_idx = torch.arange(self.n_assets, dtype=torch.long)
-        target_tensor = torch.from_numpy(target_mat)
+        asset_idx = torch.arange(self.n_assets, dtype=torch.long, device=self.device)
+        target_tensor = torch.from_numpy(target_mat).to(self.device, dtype=self.cfg.dtype)
 
         self.phero_net.train()
         self.phero_optim.zero_grad()
-
         pred = torch.clamp(self.phero_net(asset_idx), 1e-6, 1 - 1e-6)
         loss = self.bce(pred, target_tensor)
         loss.backward()
-        clip_grad_norm_(self.phero_net.parameters(), 1.0)
+        clip_grad_norm_(self.phero_net.parameters(), self.cfg.grad_clip)
         self.phero_optim.step()
         self.phero_net.eval()

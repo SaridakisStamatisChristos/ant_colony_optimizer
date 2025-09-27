@@ -10,20 +10,39 @@ class Ant:
         self.visited: List[int] = []
         self.w: np.ndarray = np.zeros(n_assets, dtype=float)
 
-    def build(self, pheromone_net: PheromoneNetwork, risk_net: RiskAssessmentNetwork|None,
-              mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray,
-              min_alloc: float=0.01, base_alloc: float=0.10, risk_weight: float=0.5) -> np.ndarray:
-        current = np.random.randint(self.n_assets)
+    def build(
+        self,
+        pheromone_net: PheromoneNetwork,
+        risk_net: RiskAssessmentNetwork | None,
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        corr: np.ndarray,
+        min_alloc: float = 0.01,
+        base_alloc: float = 0.10,
+        risk_weight: float = 0.5,
+        risk_scores: np.ndarray | None = None,
+        heuristic: np.ndarray | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        rng = rng or np.random.default_rng()
+        current = int(rng.integers(self.n_assets))
         self.visited = [current]
         self.w[:] = 0.0
 
-        risks = (risk_net.predict(mu, sigma, corr) if risk_net is not None
-                 else np.clip(sigma / (sigma.max() + 1e-12), 0, 1))
+        risks = (
+            risk_scores
+            if risk_scores is not None
+            else (
+                risk_net.predict(mu, sigma, corr)
+                if risk_net is not None
+                else np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
+            )
+        )
 
         self.w[current] = max(min_alloc, base_alloc * (1 - risks[current]))
+        heuristic = heuristic if heuristic is not None else safe_softmax(mu - risk_weight * risks)
         while len(self.visited) < self.n_assets and self.w.sum() < 0.95:
             probs = pheromone_net.transition_probs(current, self.visited)
-            heuristic = safe_softmax(mu - risk_weight * risks)
             blend = 0.6 * probs + 0.4 * heuristic
             blend = blend / blend.sum()
             unvisited = [i for i in range(self.n_assets) if i not in self.visited]
@@ -31,10 +50,10 @@ class Ant:
                 break
             p = blend[unvisited]
             if p.sum() <= 0:
-                nxt = np.random.choice(unvisited)
+                nxt = int(rng.choice(unvisited))
             else:
                 p = p / p.sum()
-                nxt = np.random.choice(unvisited, p=p)
+                nxt = int(rng.choice(unvisited, p=p))
             alloc = max(min_alloc, base_alloc * (1 - risks[nxt]))
             if self.w.sum() + alloc <= 1.0:
                 self.w[nxt] = alloc
