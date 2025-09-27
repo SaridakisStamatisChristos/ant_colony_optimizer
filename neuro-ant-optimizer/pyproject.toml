@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuro-ant-optimizer"
-version = "2.0.0"
+version = "0.3.0"
 description = "Neural-guided Ant Colony Portfolio Optimizer with robust constraints"
 readme = "README.md"
 license = {text = "MIT"}
