@@ -98,7 +98,6 @@ class PheromoneNetwork(BaseNeuralNetwork):
             nn.Linear(48, n_assets),
         )
 
-    @torch.no_grad()
     def transition_matrix(self) -> torch.Tensor:
         idx = torch.arange(self.n_assets, device=self.param_device)
         x = self.emb(idx).unsqueeze(0)
