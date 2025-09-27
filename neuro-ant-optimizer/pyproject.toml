@@ -18,6 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5.0", "mypy>=1.10"]
+backtest = ["pandas>=2.0", "matplotlib>=3.7"]
+
+[project.scripts]
+neuro-ant-backtest = "neuro_ant_optimizer.backtest.backtest:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"
