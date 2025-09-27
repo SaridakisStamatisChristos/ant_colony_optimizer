@@ -83,11 +83,12 @@ to `sys.path`, so no manual `PYTHONPATH` configuration or editable install is re
 ## Offline usage (no install)
 If your environment blocks package downloads:
 ```bash
-# Run the CLI module directly via PYTHONPATH
-PYTHONPATH=neuro-ant-optimizer/src \
+# Run the CLI module directly from the repo checkout
 python -m neuro_ant_optimizer.backtest \
   --csv neuro-ant-optimizer/backtest/sample_returns.csv \
   --lookback 5 --step 2 --ewma_span 3 --objective sharpe --out neuro-ant-optimizer/backtest/out_local
+# The repo includes a lightweight shim (neuro_ant_optimizer/__init__.py) that
+# delegates to src/neuro_ant_optimizer so no PYTHONPATH edits are needed.
 ```
 
 ## Offline wheel build & install
