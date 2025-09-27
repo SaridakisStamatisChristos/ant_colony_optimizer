@@ -98,11 +98,13 @@ class OptimizationResult:
         self.weights = np.asarray(self.weights, dtype=float)
         self.risk_contributions = np.asarray(self.risk_contributions, dtype=float)
 
+
 class OptimizationObjective(Enum):
     SHARPE_RATIO = "sharpe_ratio"
     MAX_RETURN = "max_return"
     MIN_VARIANCE = "min_variance"
     RISK_PARITY = "risk_parity"
+
 
 class NeuroAntPortfolioOptimizer:
     """Hybrid ant-colony optimizer with neural pheromone and risk models."""
@@ -119,8 +121,8 @@ class NeuroAntPortfolioOptimizer:
         self.n_assets = n_assets
         self.device = torch.device(self.cfg.device)
 
-        self.risk_net = RiskAssessmentNetwork(n_assets).to(self.device) if self.cfg.use_risk_head else None
-        self.phero_net = PheromoneNetwork(n_assets).to(self.device)
+        self.risk_net = RiskAssessmentNetwork(n_assets).to(self.device, dtype=self.cfg.dtype) if self.cfg.use_risk_head else None
+        self.phero_net = PheromoneNetwork(n_assets).to(self.device, dtype=self.cfg.dtype)
         self.colony = AntColony(n_assets, self.cfg.n_ants, self.cfg.evaporation, self.cfg.Q)
 
         if self.risk_net is not None:
@@ -197,7 +199,7 @@ class NeuroAntPortfolioOptimizer:
             self.colony.update(ants, scores)
 
             if self.risk_net is not None:
-                risk_scores = self._train_risk(mu, sigma, corr)
+                risk_scores = self._train_risk(mu, sigma, corr)  # returns np.ndarray
                 heuristic = safe_softmax(mu - self.cfg.risk_weight * risk_scores)
             self._train_pheromone(portfolios, scores)
 
@@ -386,6 +388,7 @@ class NeuroAntPortfolioOptimizer:
             raise ValueError("covariance must be symmetric")
 
     def _risk_scores(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> np.ndarray:
+        """Predict per-asset normalized risk scores in [0,1]."""
         if self.risk_net is None:
             return np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
 
@@ -393,7 +396,7 @@ class NeuroAntPortfolioOptimizer:
         feats = np.stack([mu, sigma, avg_corr], axis=1).reshape(-1).astype(np.float32)
         tensor = torch.from_numpy(feats).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
         with torch.no_grad():
-            pred = self.risk_net(tensor).cpu().numpy().ravel()
+            pred = self.risk_net(tensor).detach().cpu().numpy().ravel()
         return np.clip(pred, 0.0, 1.0)
 
     def _refine_topk(
@@ -432,6 +435,7 @@ class NeuroAntPortfolioOptimizer:
 
     # ---- learning routines ----
     def _train_risk(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> np.ndarray:
+        """One-step self-supervised update of risk_net and return fresh scores."""
         if self.risk_net is None or self.risk_optim is None:
             return np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
 
@@ -439,28 +443,29 @@ class NeuroAntPortfolioOptimizer:
         feats = np.stack([mu, sigma, avg_corr], axis=1).reshape(-1).astype(np.float32)
         target = (sigma / (sigma.max() + 1e-12)).astype(np.float32)
 
-        features_tensor = torch.from_numpy(feats).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
-        target_tensor = torch.from_numpy(target).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
+        x = torch.from_numpy(feats).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
+        y = torch.from_numpy(target).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
 
         self.risk_net.train()
         self.risk_optim.zero_grad()
-
-        prediction = self.risk_net(features_tensor)
-        loss = self.mse(prediction, target_tensor)
+        pred = self.risk_net(x)
+        loss = self.mse(pred, y)
         loss.backward()
         clip_grad_norm_(self.risk_net.parameters(), self.cfg.grad_clip)
         self.risk_optim.step()
         self.risk_net.eval()
 
-        return prediction.detach().cpu().numpy().ravel()
+        with torch.no_grad():
+            out = self.risk_net(x).detach().cpu().numpy().ravel()
+        return np.clip(out, 0.0, 1.0)
 
     def _train_pheromone(self, portfolios: List[np.ndarray], scores: List[float]) -> None:
         if not portfolios:
             return
 
         k = min(self.cfg.topk_train, len(portfolios))
-        indices = np.argsort(scores)[-k:]
-        targets = [np.tile(np.clip(portfolios[i], 0.0, 1.0), (self.n_assets, 1)) for i in indices]
+        idx = np.argsort(scores)[-k:]
+        targets = [np.tile(np.clip(portfolios[i], 0.0, 1.0), (self.n_assets, 1)) for i in idx]
         target_mat = np.mean(targets, axis=0)
         target_mat = np.clip(target_mat, 1e-6, 1 - 1e-6).astype(np.float32)
 
@@ -469,9 +474,8 @@ class NeuroAntPortfolioOptimizer:
 
         self.phero_net.train()
         self.phero_optim.zero_grad()
-
-        predicted = torch.clamp(self.phero_net(asset_idx), 1e-6, 1 - 1e-6)
-        loss = self.bce(predicted, target_tensor)
+        pred = torch.clamp(self.phero_net(asset_idx), 1e-6, 1 - 1e-6)
+        loss = self.bce(pred, target_tensor)
         loss.backward()
         clip_grad_norm_(self.phero_net.parameters(), self.cfg.grad_clip)
         self.phero_optim.step()
