@@ -124,6 +124,37 @@ Common validation errors and fixes:
 `factor_diagnostics.json` reports counts of dropped assets/dates and any missing windows so
 automated pipelines can decide whether to proceed.
 
+## Active constraints
+
+Active weights are measured relative to the benchmark: `w_active = w - w_bench`. Provide a
+benchmark via `benchmark_csv` (CLI) or `benchmark_weights` (API) to unlock the projection logic.
+
+**Flags and keys**
+
+* `active_min` / `active_max` clamp per-asset active weights around the benchmark exposure.
+* `active_group_caps` accepts maps or lists describing sector/cluster totals and symmetric caps or
+  explicit `[lower, upper]` bounds.
+* `factor_bounds` supplies lower/upper limits for factor exposures; `factor_tolerance` controls how
+  strict the projection is (tighten to `~1e-8` for hard caps, relax to `1e-4+` for soft bounds).
+* `factors_required` forces the run to fail when factor windows are missing, avoiding silent skips
+  that would otherwise relax active group projections on those dates.
+
+See the new templates in `examples/configs/` for end-to-end wiring:
+
+* `active_box.yaml` — symmetric active bounds around the benchmark weights.
+* `active_groups.yaml` — sector-level caps mixing explicit bounds and symmetric group caps.
+* `factor_bounds.yaml` — demonstrates soft vs. hard factor bounds via `factor_tolerance`.
+
+**Common failure modes**
+
+* Benchmark weight vectors must align with the return universe; mismatches raise an error before
+  training begins.
+* Active groups referencing unknown tickers are reported and ignored; duplicated assignments throw
+  immediately.
+* Factor bounds require the factor loader to emit the named factors; unknown entries are logged and
+  skipped. Tighten `factor_tolerance` when hard bounds are desired—the default leaves a small slack
+  so SLSQP and the projection stay consistent.
+
 ## End-to-end config
 
 The CLI accepts YAML/JSON configs. The following snippet wires up returns, benchmark,
