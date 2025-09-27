@@ -1,0 +1,10 @@
+# Minimal run without factors
+csv: data/returns.csv
+lookback: 126
+step: 21
+objective: max_return
+cov_model: sample
+refine_every: 1
+seed: 3
+skip_plot: true
+out: runs/minimal

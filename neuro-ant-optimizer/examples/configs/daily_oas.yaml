@@ -1,0 +1,17 @@
+# Daily factor-neutral run with strict alignment
+csv: data/returns_daily.csv
+benchmark_csv: data/benchmark_sp500.csv
+factors: data/factors_style.csv
+lookback: 252
+step: 21
+cov_model: oas
+objective: sharpe
+refine_every: 1
+seed: 7
+factor_align: strict
+factors_required: true
+factor_tolerance: 1e-6
+tx_cost_bps: 3
+tx_cost_mode: amortized
+slippage: proportional:5
+out: runs/daily_oas

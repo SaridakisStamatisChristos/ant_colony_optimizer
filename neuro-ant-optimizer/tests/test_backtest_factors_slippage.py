@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
 import numpy as np
 import numpy.typing as npt
 import pytest
@@ -76,6 +77,7 @@ def test_backtest_factor_neutrality(tmp_path: Path) -> None:
     )
 
     assert results["factor_records"], "expected factor neutrality records"
+    assert results["factor_diagnostics"]["missing_window_count"] == 0
     tol = results["factor_tolerance"] + 1e-4
     for record in results["factor_records"]:
         exposures = record["exposures"]
@@ -84,6 +86,7 @@ def test_backtest_factor_neutrality(tmp_path: Path) -> None:
             targets = np.zeros_like(exposures)
         diff = exposures - targets
         assert np.linalg.norm(diff, ord=np.inf) <= tol
+        assert record["missing"] is False
 
     exposures_path = tmp_path / "exposures.csv"
     bt._write_exposures(exposures_path, results)
@@ -136,8 +139,12 @@ def test_backtest_cli_with_factors_and_slippage(tmp_path: Path) -> None:
     metrics_path = out_dir / "metrics.csv"
     factor_csv = out_dir / "factor_constraints.csv"
     slippage_equity = out_dir / "equity_net_of_slippage.csv"
+    diag_path = out_dir / "factor_diagnostics.json"
     assert metrics_path.exists()
     assert factor_csv.exists()
     assert slippage_equity.exists()
+    assert diag_path.exists()
+    diag = json.loads(diag_path.read_text())
+    assert diag["align_mode"] == "strict"
     metrics_text = metrics_path.read_text()
     assert "avg_slippage_bps" in metrics_text

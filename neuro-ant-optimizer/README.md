@@ -59,10 +59,15 @@ Install optional deps then run:
 python -m pip install "neuro-ant-optimizer[backtest]"
 neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 \
   --objective sharpe --cov-model lw --out bt_out \
-  --save-weights --tx-cost-bps 5 --tx-cost-mode upfront
+  --save-weights --tx-cost-bps 5 --tx-cost-mode upfront \
+  --factor-align strict --factors path/to/factors.csv
 # --cov-model: sample | ewma (use --ewma_span) | lw | oas
 # tx-cost-mode: upfront | amortized | posthoc | none
-# writes metrics.csv (incl. sortino, cvar), equity.csv, equity_net_of_tc.csv (if posthoc), and weights.csv
+# factor-align: strict (require coverage) | subset (allow missing windows)
+# use --factors-required with subset mode to treat missing windows as fatal
+# pass --skip-plot to avoid importing matplotlib when running headless
+# writes metrics.csv (incl. sortino, cvar), equity.csv, equity_net_of_tc.csv (if posthoc),
+# factor_diagnostics.json, factor_constraints.csv (when factors are provided) and weights.csv
 Behavior summary
 
 --tx-cost-mode upfront → costs applied inside the loop on the first day of each block.
@@ -73,7 +78,84 @@ Behavior summary
 
 --tx-cost-mode none → no costs at all.
 
-Outputs metrics.csv, equity.csv, and (if matplotlib is present) equity.png.
+Outputs metrics.csv, equity.csv, factor_diagnostics.json and (if matplotlib is present) equity.png.
+
+## Factor inputs
+
+Factor panels can be supplied as CSV (wide or multi-index), parquet, or YAML. The loader
+normalizes them into a `(T, N, K)` cube and validates:
+
+* Factor names are unique and free of NaNs/inf values.
+* Assets overlap with the return universe; missing assets are dropped with a summary in
+  `factor_diagnostics.json`.
+* Dates align with the rebalance grid. `--factor-align strict` requires every rebalance
+  to have factor data; `subset` keeps the overlapping windows and records the gaps so
+  factor neutrality can be skipped for those dates.
+* Use `--factors-required` to force a hard failure when any window is missing, even in
+  subset mode.
+
+Example CSV (multi-index columns):
+
+```
+date,A,A,B,B
+,F0,F1,F0,F1
+2020-01-01,0.1,0.0,-0.2,0.4
+2020-01-02,0.2,0.1,-0.1,0.3
+```
+
+Equivalent YAML:
+
+```
+2020-01-01:
+  A: [0.1, 0.0]
+  B: [-0.2, 0.4]
+2020-01-02:
+  A: [0.2, 0.1]
+  B: [-0.1, 0.3]
+```
+
+Common validation errors and fixes:
+
+* `Factor names must be unique` → rename duplicate column headers.
+* `Factor loadings must not contain NaNs or infs` → fill or drop blank cells.
+* `Factor panel is missing required rebalance dates` → switch to `--factor-align subset`
+  or extend the panel to cover the rebalance date.
+
+`factor_diagnostics.json` reports counts of dropped assets/dates and any missing windows so
+automated pipelines can decide whether to proceed.
+
+## End-to-end config
+
+The CLI accepts YAML/JSON configs. The following snippet wires up returns, benchmark,
+and factors with OAS covariance and moderate refinement cadence:
+
+```
+csv: data/returns.csv
+benchmark_csv: data/benchmark.csv
+factors: data/factors.csv
+lookback: 252
+step: 21
+cov_model: oas
+refine_every: 2
+factor_align: subset
+factors_required: false
+factor_tolerance: 1e-5
+tx_cost_bps: 5
+tx_cost_mode: amortized
+slippage: proportional:10
+out: runs/oas_subset
+```
+
+See `examples/configs/` for runnable templates (weekly, monthly, and factor-neutral runs).
+
+## Deterministic runs
+
+The optimizer seeds NumPy and PyTorch separately; provide a fixed `--seed` and `--refine-every`
+to obtain repeatable runs. The covariance cache now keys off the model, span, lookback, and dtype,
+so repeated executions with the same inputs produce identical rebalance records.
+
+`plot_equity.py --overlay` can overlay multiple equity curves from different runs for quick
+comparison.
 
 Testing
 From the repository root:

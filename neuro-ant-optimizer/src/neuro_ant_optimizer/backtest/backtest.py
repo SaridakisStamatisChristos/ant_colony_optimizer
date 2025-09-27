@@ -6,12 +6,12 @@ import argparse
 import csv
 import json
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -56,6 +56,73 @@ class FactorPanel:
         if not hasattr(self, "_index_cache"):
             self._index_cache = {date: idx for idx, date in enumerate(self.dates)}
         return self._index_cache  # type: ignore[attr-defined]
+
+
+def _sort_key(value: Any) -> Tuple[int, Any]:
+    if isinstance(value, (np.datetime64,)):
+        return (0, value)
+    if pd is not None and isinstance(value, pd.Timestamp):  # pragma: no branch - optional
+        return (0, value.to_datetime64())
+    return (1, str(value))
+
+
+def _stringify(value: Any) -> str:
+    if isinstance(value, (np.datetime64,)):
+        return str(np.datetime_as_string(value, unit="s"))
+    if pd is not None and isinstance(value, pd.Timestamp):  # pragma: no branch - optional
+        return value.isoformat()
+    return str(value)
+
+
+@dataclass
+class FactorDiagnostics:
+    align_mode: str
+    total_assets: int
+    total_dates: int
+    dropped_assets: List[str]
+    dropped_dates: List[Any]
+    missing_rebalance_dates: List[Any] = field(default_factory=list)
+
+    _missing_set: Set[Any] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.align_mode = str(self.align_mode)
+        self.dropped_assets = sorted(dict.fromkeys(self.dropped_assets))
+        self.dropped_dates = list(self.dropped_dates)
+        self._missing_set.update(self.missing_rebalance_dates)
+        self.missing_rebalance_dates = list(self._missing_set)
+
+    @property
+    def dropped_asset_count(self) -> int:
+        return len(self.dropped_assets)
+
+    @property
+    def dropped_date_count(self) -> int:
+        return len(self.dropped_dates)
+
+    @property
+    def missing_window_count(self) -> int:
+        return len(self._missing_set)
+
+    def record_missing(self, date: Any) -> None:
+        if date not in self._missing_set:
+            self._missing_set.add(date)
+            self.missing_rebalance_dates.append(date)
+
+    def to_dict(self) -> Dict[str, Any]:
+        dropped_dates = sorted(self.dropped_dates, key=_sort_key)
+        missing_dates = sorted(self._missing_set, key=_sort_key)
+        return {
+            "align_mode": self.align_mode,
+            "total_assets": self.total_assets,
+            "total_dates": self.total_dates,
+            "dropped_asset_count": self.dropped_asset_count,
+            "dropped_assets": sorted(self.dropped_assets),
+            "dropped_date_count": self.dropped_date_count,
+            "dropped_dates": [_stringify(val) for val in dropped_dates],
+            "missing_window_count": self.missing_window_count,
+            "missing_rebalance_dates": [_stringify(val) for val in missing_dates],
+        }
 
 
 @dataclass
@@ -496,20 +563,21 @@ def _compute_factor_snapshot(
     dates: Sequence[Any],
     start_idx: int,
     lookback: int,
+    index_map: Optional[Dict[Any, int]] = None,
 ) -> Optional[np.ndarray]:
     if lookback <= 0:
         return None
-    index_map = panel.index_map()
+    mapping = index_map or panel.index_map()
     rebalance_date = dates[start_idx]
     history_indices: List[int] = []
     for offset in range(max(0, start_idx - lookback), start_idx + 1):
-        mapped = index_map.get(dates[offset])
+        mapped = mapping.get(dates[offset])
         if mapped is not None:
             history_indices.append(mapped)
     if not history_indices:
         return None
     history = panel.loadings[history_indices]
-    current_idx = index_map.get(rebalance_date)
+    current_idx = mapping.get(rebalance_date)
     snapshot: Optional[np.ndarray]
     if current_idx is not None:
         snapshot = np.array(panel.loadings[current_idx], dtype=float)
@@ -672,6 +740,99 @@ def _frame_index(frame: Any, length: int) -> List[Any]:
     return list(range(length))
 
 
+def validate_factor_panel(
+    panel: FactorPanel,
+    returns_frame: Any,
+    *,
+    align: str = "strict",
+) -> Tuple[FactorPanel, FactorDiagnostics]:
+    mode = str(align).lower()
+    if mode not in {"strict", "subset"}:
+        raise ValueError("align must be either 'strict' or 'subset'")
+
+    loadings = np.asarray(panel.loadings, dtype=float)
+    if loadings.ndim != 3:
+        raise ValueError("Factor loadings must be a 3D array (T, N, K)")
+    if len(panel.dates) != loadings.shape[0]:
+        raise ValueError("Factor date axis mismatch")
+    if len(panel.assets) != loadings.shape[1]:
+        raise ValueError("Factor asset axis mismatch")
+    if len(panel.factor_names) != loadings.shape[2]:
+        raise ValueError("Factor name axis mismatch")
+    if len(panel.factor_names) == 0:
+        raise ValueError("Factor panel must contain at least one factor")
+    if len(set(panel.factor_names)) != len(panel.factor_names):
+        raise ValueError("Factor names must be unique")
+    if loadings.size and not np.isfinite(loadings).all():
+        raise ValueError("Factor loadings must not contain NaNs or infs")
+
+    returns_arr = _frame_to_numpy(returns_frame)
+    returns_arr = np.atleast_2d(returns_arr)
+    if returns_arr.ndim != 2:
+        raise ValueError("Returns frame must coerce to a 2D array")
+
+    if hasattr(returns_frame, "columns") and getattr(returns_frame, "columns") is not None:
+        raw_assets = [str(col) for col in returns_frame.columns]
+    else:
+        raw_assets = [f"A{i}" for i in range(returns_arr.shape[1])]
+
+    asset_map = {asset: idx for idx, asset in enumerate(panel.assets)}
+    keep_asset_indices: List[int] = []
+    aligned_assets: List[str] = []
+    dropped_assets: List[str] = []
+    for asset in raw_assets:
+        idx = asset_map.get(asset)
+        if idx is None:
+            dropped_assets.append(asset)
+            continue
+        keep_asset_indices.append(idx)
+        aligned_assets.append(asset)
+
+    if not keep_asset_indices:
+        raise ValueError("No overlapping assets between returns and factor panel")
+
+    aligned_loadings = loadings[:, keep_asset_indices, :]
+
+    return_dates = _frame_index(returns_frame, returns_arr.shape[0])
+    return_date_set = set(return_dates)
+    keep_date_indices = [idx for idx, date in enumerate(panel.dates) if date in return_date_set]
+    if not keep_date_indices:
+        raise ValueError("Factor panel does not overlap with returns dates")
+
+    aligned_dates = [panel.dates[idx] for idx in keep_date_indices]
+    aligned_loadings = aligned_loadings[keep_date_indices, :, :]
+
+    dropped_dates = [panel.dates[idx] for idx in range(len(panel.dates)) if idx not in keep_date_indices]
+    panel_date_set = set(panel.dates)
+    missing_rebalance_dates = [date for date in return_dates if date not in panel_date_set]
+    if mode == "strict" and missing_rebalance_dates:
+        raise ValueError("Factor panel is missing required rebalance dates")
+
+    diagnostics = FactorDiagnostics(
+        align_mode=mode,
+        total_assets=len(raw_assets),
+        total_dates=len(return_dates),
+        dropped_assets=dropped_assets,
+        dropped_dates=dropped_dates,
+        missing_rebalance_dates=missing_rebalance_dates if mode == "subset" else [],
+    )
+
+    aligned_panel = FactorPanel(aligned_dates, aligned_assets, aligned_loadings, list(panel.factor_names))
+    return aligned_panel, diagnostics
+
+
+def validate_factor_targets(targets: np.ndarray, factor_names: Sequence[str]) -> np.ndarray:
+    arr = np.asarray(targets, dtype=float)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    arr = arr.reshape(-1)
+    if arr.size != len(factor_names):
+        raise ValueError("Factor target length does not match factor names")
+    if not np.isfinite(arr).all():
+        raise ValueError("Factor targets must not contain NaNs or infs")
+    return arr
+
+
 _OBJECTIVE_MAP: Dict[str, OptimizationObjective] = {
     "sharpe": OptimizationObjective.SHARPE_RATIO,
     "max_return": OptimizationObjective.MAX_RETURN,
@@ -699,6 +860,8 @@ def backtest(
     factors: Optional[FactorPanel] = None,
     factor_targets: Optional[np.ndarray] = None,
     factor_tolerance: float = 1e-6,
+    factor_align: str = "strict",
+    factors_required: bool = False,
     slippage: Optional[SlippageConfig] = None,
     refine_every: int = 1,
     cov_model: str = "sample",
@@ -772,35 +935,38 @@ def backtest(
     factor_panel: Optional[FactorPanel] = None
     factor_target_vec: Optional[np.ndarray] = None
     factor_names: List[str] = []
+    factor_diagnostics: Optional[FactorDiagnostics] = None
+    factor_missing_dates: Set[Any] = set()
     if factors is not None:
-        try:
-            aligned = factors.align_assets(asset_names)
-        except ValueError as exc:
-            raise ValueError("No overlapping assets between returns and factor panel") from exc
-        if len(aligned.assets) != len(asset_names):
-            missing = [asset for asset in asset_names if asset not in aligned.assets]
-            if missing:
-                print(
-                    "Warning: dropping assets without factor data: "
-                    + ", ".join(missing)
-                )
-            keep_mask = [asset in aligned.assets for asset in asset_names]
-            returns = returns[:, keep_mask]
-            asset_names = [asset for asset, keep in zip(asset_names, keep_mask) if keep]
-            n_periods, n_assets = returns.shape
-            aligned = factors.align_assets(asset_names)
-        factor_panel = aligned
+        factor_panel, factor_diagnostics = validate_factor_panel(
+            factors, df, align=factor_align
+        )
+        factor_missing_dates = set(factor_diagnostics.missing_rebalance_dates)
+        if factor_diagnostics.dropped_assets:
+            print(
+                "Warning: dropping assets without factor data: "
+                + ", ".join(sorted(factor_diagnostics.dropped_assets))
+            )
+        asset_lookup = {name: idx for idx, name in enumerate(asset_names)}
+        reorder_indices = [asset_lookup[name] for name in factor_panel.assets if name in asset_lookup]
+        if len(reorder_indices) != len(factor_panel.assets):
+            raise ValueError("Factor assets failed to align with returns columns")
+        returns = returns[:, reorder_indices]
+        asset_names = list(factor_panel.assets)
+        n_periods, n_assets = returns.shape
+        if factor_panel.loadings.shape[1] != n_assets:
+            raise ValueError("Factor panel asset dimension mismatch after alignment")
         factor_names = list(factor_panel.factor_names)
-        n_factors = factor_panel.loadings.shape[2]
-        if n_factors == 0:
-            factor_panel = None
+        if factor_targets is not None:
+            factor_target_vec = validate_factor_targets(factor_targets, factor_names)
         else:
-            if factor_targets is not None:
-                if factor_targets.shape[0] != n_factors:
-                    raise ValueError("Factor targets dimension does not match factor loadings")
-                factor_target_vec = factor_targets.astype(float)
-            else:
-                factor_target_vec = np.zeros(n_factors, dtype=float)
+            factor_target_vec = np.zeros(len(factor_names), dtype=float)
+        if factors_required and factor_missing_dates:
+            sorted_missing = sorted(
+                factor_diagnostics.missing_rebalance_dates, key=_sort_key
+            )
+            missing_str = ", ".join(_stringify(val) for val in sorted_missing)
+            raise ValueError(f"Missing factor data for rebalance dates: {missing_str}")
 
     if returns.shape[1] == 0:
         raise ValueError("No assets remain after aligning factors with returns")
@@ -811,23 +977,35 @@ def backtest(
 
     weights: List[np.ndarray] = []
     rebalance_dates: List[Any] = []
-    realized_returns: List[float] = []
     realized_dates: List[Any] = []
-    turnovers: List[float] = []
     prev_weights: Optional[np.ndarray] = None
     tc = float(tx_cost_bps) / 1e4
-    slippage_costs: List[float] = []
-    missing_factor_logged: set = set()
+    missing_factor_logged: Set[Any] = set()
     factor_records: List[Dict[str, Any]] = []
-    gross_returns: List[float] = []
-    net_tx_returns: List[float] = []
-    net_slip_returns: List[float] = []
     rebalance_records: List[Dict[str, Any]] = []
-    benchmark_realized: List[float] = []
+
+    rebalance_points = list(range(lookback, n_periods, step))
+    n_windows = len(rebalance_points)
+    total_test_periods = max(n_periods - lookback, 0)
+    gross_returns_arr = np.empty(total_test_periods, dtype=float)
+    realized_returns_arr = np.empty(total_test_periods, dtype=float)
+    net_tx_returns_arr = np.empty(total_test_periods, dtype=float)
+    net_slip_returns_arr = np.empty(total_test_periods, dtype=float)
+    benchmark_realized_arr = (
+        np.empty(total_test_periods, dtype=float) if benchmark_series is not None else None
+    )
+    slippage_costs = np.zeros(n_windows, dtype=float)
+    turnovers_arr = np.zeros(n_windows, dtype=float)
+    cursor = 0
+
+    factor_index_map: Optional[Dict[Any, int]] = None
+    if factor_panel is not None:
+        factor_index_map = factor_panel.index_map()
+
     # include model + params in the cache key to avoid collisions across models/spans
     cov_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 
-    for start in range(lookback, n_periods, step):
+    for window_idx, start in enumerate(rebalance_points):
         end = min(start + step, n_periods)
         train = returns[start - lookback : start]
         test = returns[start:end]
@@ -849,22 +1027,22 @@ def backtest(
                 cov_vector=cov_vector,
             )
         mean_signature = float(np.mean(train).round(12))
+        dtype_marker = str(train.dtype)
         span = ewma_span if cov_model == "ewma" and ewma_span is not None else None
         cov_key: Optional[Tuple[Any, ...]] = None
         cov: Optional[np.ndarray] = None
         if cov_model == "ewma":
             assert span is not None  # validated above
-            cov_key = ("ewma", span, train.shape, mean_signature)
+            cov_key = ("ewma", span, lookback, train.shape, mean_signature, dtype_marker)
         elif cov_model == "lw":
-            cov_key = ("lw", train.shape, mean_signature)
+            cov_key = ("lw", None, lookback, train.shape, mean_signature, dtype_marker)
         elif cov_model == "oas":
-            cov_key = ("oas", train.shape, mean_signature)
+            cov_key = ("oas", None, lookback, train.shape, mean_signature, dtype_marker)
         else:
-            cov_key = ("sample", train.shape, mean_signature)
-        if cov_key is not None:
-            cached_cov = cov_cache.get(cov_key)
-            if cached_cov is not None:
-                cov = cached_cov
+            cov_key = ("sample", None, lookback, train.shape, mean_signature, dtype_marker)
+        cached_cov = cov_cache.get(cov_key) if cov_key is not None else None
+        if cached_cov is not None:
+            cov = cached_cov
         if cov is None:
             if cov_model == "ewma":
                 assert span is not None
@@ -879,32 +1057,44 @@ def backtest(
                 cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
             cov = nearest_psd(cov_raw)
             if cov_key is not None:
-                # keep a small LRU; 8 is plenty for rolling windows
                 cov_cache[cov_key] = cov.copy()
                 while len(cov_cache) > 8:
                     cov_cache.popitem(last=False)
-        active_factors = False
+
+        rebalance_date = dates[start]
+        factors_missing = False
         current_factor_snapshot: Optional[np.ndarray] = None
         if factor_panel is not None:
-            snapshot = _compute_factor_snapshot(factor_panel, dates, start, lookback)
-            if snapshot is None:
-                rebalance_date = dates[start]
-                if rebalance_date not in missing_factor_logged:
-                    print(f"Skipping factor neutrality on {rebalance_date} (missing factor data)")
-                    missing_factor_logged.add(rebalance_date)
-                constraints.factor_loadings = None
-                constraints.factor_targets = None
+            if rebalance_date in factor_missing_dates:
+                factors_missing = True
             else:
-                constraints.factor_loadings = snapshot
-                constraints.factor_targets = factor_target_vec
-                active_factors = True
-                current_factor_snapshot = snapshot
-        else:
+                snapshot = _compute_factor_snapshot(
+                    factor_panel, dates, start, lookback, index_map=factor_index_map
+                )
+                if snapshot is None:
+                    factors_missing = True
+                else:
+                    constraints.factor_loadings = snapshot
+                    constraints.factor_targets = factor_target_vec
+                    current_factor_snapshot = snapshot
+        if factor_panel is None or factors_missing:
             constraints.factor_loadings = None
             constraints.factor_targets = None
+            if factor_panel is not None:
+                if rebalance_date not in missing_factor_logged:
+                    print(
+                        f"Skipping factor neutrality on {rebalance_date} (missing factor data)"
+                    )
+                    missing_factor_logged.add(rebalance_date)
+                if factor_diagnostics is not None:
+                    factor_diagnostics.record_missing(rebalance_date)
+                factor_missing_dates.add(rebalance_date)
+                if factors_required:
+                    raise ValueError(
+                        f"Missing factor data for rebalance date {rebalance_date}"
+                    )
 
-        rebalance_idx = len(weights)
-        should_refine = (rebalance_idx % refine_every) == 0
+        should_refine = (len(weights) % refine_every) == 0
         result = optimizer.optimize(
             mu,
             cov,
@@ -915,13 +1105,16 @@ def backtest(
         )
         w = result.weights
         weights.append(w)
-        rebalance_date = dates[start]
         rebalance_dates.append(rebalance_date)
-        gross_block_returns = test @ w
-        gross_returns.extend(gross_block_returns.tolist())
-        length = max(1, gross_block_returns.size)
+
+        gross_block_returns = np.asarray(test @ w, dtype=float).reshape(-1)
+        block_len = gross_block_returns.size
+        idx_slice = slice(cursor, cursor + block_len)
+        gross_returns_arr[idx_slice] = gross_block_returns
+        length = max(1, block_len)
 
         turn = turnover(prev_weights, w)
+        turnovers_arr[window_idx] = float(turn)
         tx_cost_value = tc * turn if (tc > 0.0 and tx_cost_mode != "none") else 0.0
         tx_block_returns = gross_block_returns.copy()
         block_returns_metrics = gross_block_returns.copy()
@@ -939,7 +1132,7 @@ def backtest(
                 tx_block_returns = tx_block_returns - (tx_cost_value / length)
 
         slip_cost = _compute_slippage_cost(slippage, turn, test)
-        slippage_costs.append(slip_cost)
+        slippage_costs[window_idx] = float(slip_cost)
         slip_block_returns = tx_block_returns.copy()
         if slippage is not None and slip_cost > 0.0:
             if tx_cost_mode in ("upfront", "amortized"):
@@ -954,47 +1147,67 @@ def backtest(
             else:
                 slip_block_returns = slip_block_returns - (slip_cost / length)
 
-        net_tx_returns.extend(tx_block_returns.tolist())
-        net_slip_returns.extend(slip_block_returns.tolist())
+        net_tx_returns_arr[idx_slice] = tx_block_returns
+        net_slip_returns_arr[idx_slice] = slip_block_returns
 
         block_returns = block_returns_metrics
-        realized_returns.extend(block_returns.tolist())
-        turnovers.append(turn)
-        prev_weights = w
+        realized_returns_arr[idx_slice] = block_returns
         realized_dates.extend(dates[start:end])
-        if benchmark_series is not None:
-            benchmark_realized.extend(benchmark_series[start:end].tolist())
+        if benchmark_series is not None and benchmark_realized_arr is not None:
+            benchmark_realized_arr[idx_slice] = benchmark_series[start:end]
+        prev_weights = w
 
         sector_breaches = 0
         sector_exposures: Dict[str, float] = {}
         if constraints.sector_map is not None:
             sectors = np.asarray(constraints.sector_map)
-            cap = float(constraints.max_sector_concentration)
-            for sector in np.unique(sectors):
-                mask = sectors == sector
-                total = float(w[mask].sum())
-                sector_exposures[f"sector_{sector}"] = total
-                if total > cap + 1e-9:
-                    sector_breaches += 1
-        factor_inf_norm = 0.0
-        exposures: Optional[np.ndarray] = None
-        if active_factors and current_factor_snapshot is not None:
-            exposures = current_factor_snapshot.T @ w
-            targets = factor_target_vec if factor_target_vec is not None else None
-            if targets is None:
-                targets = np.zeros_like(exposures)
-            factor_inf_norm = float(
-                np.linalg.norm(exposures - targets, ord=np.inf)
-            )
-            factor_records.append(
-                {
-                    "date": rebalance_date,
-                    "exposures": exposures,
-                    "targets": factor_target_vec if factor_target_vec is not None else None,
-                    "tolerance": factor_tolerance,
-                    "sector_exposures": sector_exposures if sector_exposures else None,
+            if sectors.shape[0] != w.shape[0]:
+                raise ValueError("Sector map dimension mismatch with weights")
+            if sectors.size:
+                sectors_int = sectors.astype(int)
+                offset = int(sectors_int.min())
+                if offset < 0:
+                    shifted = sectors_int - offset
+                else:
+                    offset = 0
+                    shifted = sectors_int
+                counts = np.bincount(shifted, weights=w, minlength=int(shifted.max()) + 1)
+                unique_shifted = np.unique(shifted)
+                exposures_values = counts[unique_shifted]
+                labels = unique_shifted + offset
+                sector_exposures = {
+                    f"sector_{int(label)}": float(value)
+                    for label, value in zip(labels, exposures_values)
                 }
-            )
+                cap = float(constraints.max_sector_concentration)
+                sector_breaches = int(np.count_nonzero(exposures_values > cap + 1e-9))
+        factor_inf_norm = 0.0
+        if factor_panel is not None:
+            if factors_missing:
+                factor_records.append(
+                    {
+                        "date": rebalance_date,
+                        "exposures": None,
+                        "targets": None,
+                        "tolerance": factor_tolerance,
+                        "sector_exposures": sector_exposures if sector_exposures else None,
+                        "missing": True,
+                    }
+                )
+            elif current_factor_snapshot is not None and factor_target_vec is not None:
+                exposures = current_factor_snapshot.T @ w
+                targets = factor_target_vec
+                factor_inf_norm = float(np.linalg.norm(exposures - targets, ord=np.inf))
+                factor_records.append(
+                    {
+                        "date": rebalance_date,
+                        "exposures": exposures,
+                        "targets": targets,
+                        "tolerance": factor_tolerance,
+                        "sector_exposures": sector_exposures if sector_exposures else None,
+                        "missing": False,
+                    }
+                )
 
         rebalance_records.append(
             {
@@ -1007,23 +1220,25 @@ def backtest(
                 "slippage_cost": float(slip_cost),
                 "sector_breaches": int(sector_breaches),
                 "factor_inf_norm": float(factor_inf_norm),
+                "factor_missing": bool(factors_missing),
             }
         )
+        cursor += block_len
 
-    realized_returns_arr = np.asarray(realized_returns, dtype=float)
-    gross_returns_arr = np.asarray(gross_returns, dtype=float)
-    net_tx_returns_arr = np.asarray(net_tx_returns, dtype=float)
-    net_slip_returns_arr = np.asarray(net_slip_returns, dtype=float)
-    benchmark_returns_arr = (
-        np.asarray(benchmark_realized, dtype=float)
-        if benchmark_realized
-        else np.array([])
-    )
+    gross_returns_arr = gross_returns_arr[:cursor]
+    net_tx_returns_arr = net_tx_returns_arr[:cursor]
+    net_slip_returns_arr = net_slip_returns_arr[:cursor]
+    realized_returns_arr = realized_returns_arr[:cursor]
+    if benchmark_realized_arr is not None:
+        benchmark_returns_arr = benchmark_realized_arr[:cursor]
+    else:
+        benchmark_returns_arr = np.array([])
     equity = np.cumprod(1.0 + realized_returns_arr)
-    slippage_costs_arr = np.asarray(slippage_costs, dtype=float) if slippage_costs else np.array([])
+    slippage_costs_arr = slippage_costs[: len(weights)] if n_windows else np.array([])
     avg_slippage_bps = (
         float(slippage_costs_arr.mean() * 1e4) if slippage_costs_arr.size else 0.0
     )
+    turnovers_used = turnovers_arr[: len(weights)] if n_windows else np.array([])
     slippage_net_returns: Optional[np.ndarray] = None
     if slippage is not None:
         slippage_net_returns = net_slip_returns_arr.copy()
@@ -1042,7 +1257,7 @@ def backtest(
     else:
         realized_cvar = 0.0
     mdd = max_drawdown(equity)
-    avg_turn = float(np.mean(turnovers)) if turnovers else 0.0
+    avg_turn = float(turnovers_used.mean()) if turnovers_used.size else 0.0
 
     tracking_error = None
     info_ratio = None
@@ -1084,6 +1299,7 @@ def backtest(
         "slippage_costs": slippage_costs_arr,
         "slippage_net_returns": slippage_net_returns,
         "rebalance_records": rebalance_records,
+        "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
     }
 
 
@@ -1174,27 +1390,36 @@ def _write_factor_constraints(path: Path, results: Dict[str, Any]) -> None:
             f"{name}_target",
             f"{name}_diff",
         ])
-    header.append("tolerance")
+    header.extend(["tolerance", "missing"])
 
     with path.open("w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(header)
         for record in records:
             date = record.get("date")
-            exposures = np.asarray(record.get("exposures", []), dtype=float)
-            targets = record.get("targets")
-            if targets is None:
-                targets_arr = np.zeros_like(exposures)
-            else:
-                targets_arr = np.asarray(targets, dtype=float)
+            exposures_raw = record.get("exposures")
+            exposures_arr = np.zeros(len(factor_names), dtype=float)
+            if exposures_raw is not None:
+                exp_vals = np.asarray(exposures_raw, dtype=float)
+                limit = min(exp_vals.size, exposures_arr.size)
+                if limit:
+                    exposures_arr[:limit] = exp_vals[:limit]
+            targets_raw = record.get("targets")
+            targets_arr = np.zeros(len(factor_names), dtype=float)
+            if targets_raw is not None:
+                tgt_vals = np.asarray(targets_raw, dtype=float)
+                limit = min(tgt_vals.size, targets_arr.size)
+                if limit:
+                    targets_arr[:limit] = tgt_vals[:limit]
             tolerance = float(record.get("tolerance", 0.0))
+            missing_flag = 1 if record.get("missing") else 0
             row: List[Any] = [date]
-            for idx, name in enumerate(factor_names):
-                exp_val = float(exposures[idx]) if idx < exposures.size else 0.0
-                tgt_val = float(targets_arr[idx]) if idx < targets_arr.size else 0.0
+            for idx in range(len(factor_names)):
+                exp_val = float(exposures_arr[idx])
+                tgt_val = float(targets_arr[idx])
                 diff_val = exp_val - tgt_val
                 row.extend([exp_val, tgt_val, diff_val])
-            row.append(tolerance)
+            row.extend([tolerance, missing_flag])
             writer.writerow(row)
 
 
@@ -1212,6 +1437,7 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "slippage_cost",
         "sector_breaches",
         "factor_inf_norm",
+        "factor_missing",
     ]
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=header)
@@ -1239,11 +1465,17 @@ def _write_exposures(path: Path, results: Dict[str, Any]) -> None:
         writer = csv.writer(fh)
         writer.writerow(header)
         for record in records:
-            exposures = np.asarray(record.get("exposures", []), dtype=float)
+            if record.get("missing"):
+                continue
+            exposures_raw = record.get("exposures")
+            values = np.zeros(len(factor_names), dtype=float)
+            if exposures_raw is not None:
+                exp_vals = np.asarray(exposures_raw, dtype=float)
+                limit = min(exp_vals.size, values.size)
+                if limit:
+                    values[:limit] = exp_vals[:limit]
             row: List[Any] = [record.get("date")]
-            for idx in range(len(factor_names)):
-                value = float(exposures[idx]) if idx < exposures.size else 0.0
-                row.append(value)
+            row.extend(values.tolist())
             sectors = record.get("sector_exposures") or {}
             for name in sector_columns:
                 row.append(float(sectors.get(name, 0.0)))
@@ -1352,6 +1584,11 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         help="Write weights.csv with per-step allocations",
     )
     parser.add_argument(
+        "--skip-plot",
+        action="store_true",
+        help="Skip generating the equity plot",
+    )
+    parser.add_argument(
         "--tx-cost-bps",
         type=float,
         default=0.0,
@@ -1386,6 +1623,17 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         type=str,
         default=None,
         help="Optional factor target vector (csv/parquet/yaml)",
+    )
+    parser.add_argument(
+        "--factor-align",
+        choices=["strict", "subset"],
+        default="strict",
+        help="How to align factor panel dates with returns",
+    )
+    parser.add_argument(
+        "--factors-required",
+        action="store_true",
+        help="Fail if any rebalance window lacks factor data",
     )
     parser.add_argument(
         "--slippage",
@@ -1436,6 +1684,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         factors=factor_panel,
         factor_targets=factor_target_vec,
         factor_tolerance=parsed.factor_tolerance,
+        factor_align=parsed.factor_align,
+        factors_required=parsed.factors_required,
         slippage=slippage_cfg,
         refine_every=parsed.refine_every,
         cov_model=parsed.cov_model,
@@ -1465,33 +1715,40 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     if parsed.save_weights:
         _write_weights(out_dir / "weights.csv", results)
 
+    diagnostics = results.get("factor_diagnostics")
+    if diagnostics:
+        (out_dir / "factor_diagnostics.json").write_text(
+            json.dumps(diagnostics, indent=2, sort_keys=True), encoding="utf-8"
+        )
+
     _write_run_manifest(out_dir, parsed, config_path)
 
-    try:
-        import matplotlib.pyplot as plt  # type: ignore
+    if not parsed.skip_plot:
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
 
-        plt.figure()
-        dates = results["dates"]
-        gross_curve = np.cumprod(1.0 + np.asarray(results["gross_returns"], dtype=float))
-        plt.plot(dates, gross_curve, label="gross")
-        if isinstance(net_tx_returns, np.ndarray) and net_tx_returns.size:
-            net_curve = np.cumprod(1.0 + net_tx_returns)
-            if not np.allclose(net_curve, gross_curve):
-                plt.plot(dates, net_curve, label="net tx")
-        if isinstance(slip_returns, np.ndarray) and slip_returns.size:
-            slip_curve = np.cumprod(1.0 + slip_returns)
-            if not np.allclose(slip_curve, gross_curve):
-                plt.plot(dates, slip_curve, label="net slippage")
-        plt.title(f"Equity — {parsed.objective}")
-        plt.xlabel("Date")
-        plt.ylabel("Equity")
-        if plt.gca().has_data():
-            plt.legend()
-        plt.tight_layout()
-        plt.savefig(out_dir / "equity.png", dpi=160)
-        plt.close()
-    except Exception:
-        pass
+            plt.figure()
+            dates = results["dates"]
+            gross_curve = np.cumprod(1.0 + np.asarray(results["gross_returns"], dtype=float))
+            plt.plot(dates, gross_curve, label="gross")
+            if isinstance(net_tx_returns, np.ndarray) and net_tx_returns.size:
+                net_curve = np.cumprod(1.0 + net_tx_returns)
+                if not np.allclose(net_curve, gross_curve):
+                    plt.plot(dates, net_curve, label="net tx")
+            if isinstance(slip_returns, np.ndarray) and slip_returns.size:
+                slip_curve = np.cumprod(1.0 + slip_returns)
+                if not np.allclose(slip_curve, gross_curve):
+                    plt.plot(dates, slip_curve, label="net slippage")
+            plt.title(f"Equity — {parsed.objective}")
+            plt.xlabel("Date")
+            plt.ylabel("Equity")
+            if plt.gca().has_data():
+                plt.legend()
+            plt.tight_layout()
+            plt.savefig(out_dir / "equity.png", dpi=160)
+            plt.close()
+        except Exception:
+            pass
 
     print(f"Wrote {out_dir}")
 
