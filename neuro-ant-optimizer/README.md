@@ -48,3 +48,11 @@ print("Sharpe:", res.sharpe_ratio, "Vol:", res.volatility)
 - `risk_weight`: blend risk heuristic in ant decisions
 - `topk_refine`/`topk_train`: compute & learning budgets per iteration
 - `grad_clip`, `device`, `dtype`
+
+## CLI backtest
+Install optional deps then run:
+```bash
+python -m pip install "neuro-ant-optimizer[backtest]"
+neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 --objective sharpe --out bt_out
+```
+Outputs `metrics.csv`, `equity.csv`, and (if matplotlib is present) `equity.png`.
