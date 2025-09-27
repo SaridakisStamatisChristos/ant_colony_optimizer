@@ -51,6 +51,9 @@ class OptimizerConfig:
     use_shrinkage: bool = True
     shrinkage_delta: float = 0.15
     cvar_alpha: float = 0.05
+    te_target: float = 0.0
+    lambda_te: float = 0.0
+    gamma_turnover: float = 0.0
 
     def __post_init__(self) -> None:
         if self.n_ants <= 0:
@@ -77,6 +80,12 @@ class OptimizerConfig:
             raise ValueError("shrinkage_delta must lie in [0, 1]")
         if not (0.0 < self.cvar_alpha < 0.5):
             raise ValueError("cvar_alpha must lie in (0, 0.5)")
+        if self.te_target < 0.0:
+            raise ValueError("te_target must be non-negative")
+        if self.lambda_te < 0.0:
+            raise ValueError("lambda_te must be non-negative")
+        if self.gamma_turnover < 0.0:
+            raise ValueError("gamma_turnover must be non-negative")
 
     @classmethod
     def from_overrides(cls, overrides: Optional[Dict[str, Any]] = None) -> "OptimizerConfig":
@@ -134,6 +143,8 @@ class OptimizationObjective(Enum):
     MIN_CVAR = "min_cvar"
     TRACKING_ERROR_MIN = "tracking_error_min"
     INFO_RATIO_MAX = "info_ratio_max"
+    TRACKING_ERROR_TARGET = "tracking_error_target"
+    MULTI_TERM = "multi_term"
 
 
 class NeuroAntPortfolioOptimizer:
@@ -353,6 +364,27 @@ class NeuroAntPortfolioOptimizer:
             if benchmark is None:
                 raise ValueError("Benchmark statistics required for information ratio objective")
             return self._information_ratio(weights, mu, cov, benchmark)
+        if objective == OptimizationObjective.TRACKING_ERROR_TARGET:
+            if benchmark is None:
+                return -1e6
+            te = self._tracking_error(weights, mu, cov, benchmark)
+            target = float(self.cfg.te_target)
+            return -float((te - target) ** 2)
+        if objective == OptimizationObjective.MULTI_TERM:
+            if benchmark is None:
+                return -1e6
+            base = self._information_ratio(weights, mu, cov, benchmark)
+            if self.cfg.lambda_te > 0.0:
+                te = self._tracking_error(weights, mu, cov, benchmark)
+                base -= float(self.cfg.lambda_te) * te
+            if (
+                self.cfg.gamma_turnover > 0.0
+                and constraints.prev_weights is not None
+            ):
+                prev = np.asarray(constraints.prev_weights, dtype=float)
+                turnover = float(np.abs(weights - prev).sum())
+                base -= float(self.cfg.gamma_turnover) * turnover
+            return float(base)
         return self._sharpe(weights, mu, cov)
 
     def _apply_constraints(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:

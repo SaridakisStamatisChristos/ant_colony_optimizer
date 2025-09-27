@@ -128,8 +128,129 @@ def test_tracking_objectives_require_benchmark() -> None:
             seed=3,
         )
 
+    with pytest.raises(ValueError):
+        backtest(
+            returns,
+            lookback=32,
+            step=32,
+            objective="te_target",
+            seed=3,
+        )
+
+    with pytest.raises(ValueError):
+        backtest(
+            returns,
+            lookback=32,
+            step=32,
+            objective="multi_term",
+            seed=3,
+        )
+
 
 def test_objective_map_routes_new_objectives() -> None:
     assert _OBJECTIVE_MAP["tracking_error"] is OptimizationObjective.TRACKING_ERROR_MIN
     assert _OBJECTIVE_MAP["info_ratio"] is OptimizationObjective.INFO_RATIO_MAX
+    assert _OBJECTIVE_MAP["te_target"] is OptimizationObjective.TRACKING_ERROR_TARGET
+    assert _OBJECTIVE_MAP["multi_term"] is OptimizationObjective.MULTI_TERM
+
+
+def test_te_target_scoring_prefers_target_tracking_error() -> None:
+    rng = np.random.default_rng(456)
+    periods = 96
+    benchmark = rng.normal(0.0004, 0.008, size=periods)
+    noise = rng.normal(0.0, 0.002, size=periods)
+    returns = np.column_stack([benchmark, benchmark + noise])
+
+    mu = returns.mean(axis=0)
+    cov = np.cov(returns, rowvar=False)
+    bench_stats = _make_benchmark_stats(returns, benchmark)
+
+    optimizer = NeuroAntPortfolioOptimizer(
+        returns.shape[1],
+        OptimizerConfig(
+            n_ants=4,
+            max_iter=2,
+            patience=1,
+            topk_refine=2,
+            topk_train=2,
+            use_risk_head=False,
+            use_shrinkage=False,
+            max_runtime=0.1,
+            seed=11,
+            te_target=0.0,
+        ),
+    )
+    constraints = PortfolioConstraints()
+
+    w_target = np.array([1.0, 0.0])
+    w_alt = np.array([0.5, 0.5])
+
+    score_target = optimizer._score(
+        w_target,
+        mu,
+        cov,
+        OptimizationObjective.TRACKING_ERROR_TARGET,
+        constraints,
+        benchmark=bench_stats,
+    )
+    score_alt = optimizer._score(
+        w_alt,
+        mu,
+        cov,
+        OptimizationObjective.TRACKING_ERROR_TARGET,
+        constraints,
+        benchmark=bench_stats,
+    )
+
+    assert score_target == pytest.approx(0.0, abs=1e-10)
+    assert score_target > score_alt
+
+
+def test_multi_term_score_matches_components() -> None:
+    rng = np.random.default_rng(789)
+    periods = 120
+    benchmark = rng.normal(0.0005, 0.01, size=periods)
+    noise = rng.normal(0.0, 0.003, size=(periods, 2))
+    returns = benchmark[:, None] + noise
+
+    mu = returns.mean(axis=0)
+    cov = np.cov(returns, rowvar=False)
+    bench_stats = _make_benchmark_stats(returns, benchmark)
+
+    optimizer = NeuroAntPortfolioOptimizer(
+        returns.shape[1],
+        OptimizerConfig(
+            n_ants=4,
+            max_iter=2,
+            patience=1,
+            topk_refine=2,
+            topk_train=2,
+            use_risk_head=False,
+            use_shrinkage=False,
+            max_runtime=0.1,
+            seed=19,
+            lambda_te=1.7,
+            gamma_turnover=0.25,
+        ),
+    )
+    constraints = PortfolioConstraints()
+    constraints.prev_weights = np.array([0.4, 0.6])
+    constraints.max_turnover = 1.0
+    weights = np.array([0.7, 0.3])
+
+    score = optimizer._score(
+        weights,
+        mu,
+        cov,
+        OptimizationObjective.MULTI_TERM,
+        constraints,
+        benchmark=bench_stats,
+    )
+
+    ir = optimizer._information_ratio(weights, mu, cov, bench_stats)
+    te = optimizer._tracking_error(weights, mu, cov, bench_stats)
+    turnover = float(np.abs(weights - constraints.prev_weights).sum())
+    expected = ir - optimizer.cfg.lambda_te * te - optimizer.cfg.gamma_turnover * turnover
+
+    assert score == pytest.approx(expected, rel=1e-6)
 
