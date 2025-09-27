@@ -69,6 +69,17 @@ Behavior summary
 --tx-cost-mode none → no costs at all.
 
 Outputs `metrics.csv`, `equity.csv`, and (if matplotlib is present) `equity.png`.
+
+## Testing
+From the repository root:
+
+```bash
+pytest -q
+```
+
+The test harness in `tests/conftest.py` automatically adds `neuro-ant-optimizer/src`
+to `sys.path`, so no manual `PYTHONPATH` configuration or editable install is required.
+
 ## Offline usage (no install)
 If your environment blocks package downloads:
 ```bash
