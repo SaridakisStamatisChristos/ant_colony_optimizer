@@ -6,13 +6,13 @@ import math
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Sequence
 
-import numpy as np
-import torch
+import numpy as np, torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
 from .models import RiskAssessmentNetwork, PheromoneNetwork
-from .colony import AntColony
+from .colony import Ant, AntColony
 from .constraints import PortfolioConstraints
 from .refine import refine_slsqp
 from .utils import nearest_psd, safe_softmax, set_seed
@@ -123,7 +123,7 @@ class NeuroAntPortfolioOptimizer:
 
         self.risk_net = RiskAssessmentNetwork(n_assets).to(self.device, dtype=self.cfg.dtype) if self.cfg.use_risk_head else None
         self.phero_net = PheromoneNetwork(n_assets).to(self.device, dtype=self.cfg.dtype)
-        self.colony = AntColony(n_assets, self.cfg.n_ants, self.cfg.evaporation, self.cfg.Q)
+        self.colony = AntColony(n_assets, evap=self.cfg.evaporation, Q=self.cfg.Q)
 
         if self.risk_net is not None:
             self.risk_optim = torch.optim.Adam(self.risk_net.parameters(), lr=self.cfg.lr)
@@ -166,11 +166,8 @@ class NeuroAntPortfolioOptimizer:
         converged = False
         message = "OK"
 
-        risk_scores = self._risk_scores(mu, sigma, corr)
-        heuristic = safe_softmax(mu - self.cfg.risk_weight * risk_scores)
-
         for iteration in range(self.cfg.max_iter):
-            ants = self.colony.init_colony()
+            ants = [Ant(self.n_assets) for _ in range(self.cfg.n_ants)]
             portfolios: List[np.ndarray] = []
             scores: List[float] = []
 
@@ -178,15 +175,8 @@ class NeuroAntPortfolioOptimizer:
                 weights = ant.build(
                     self.phero_net,
                     self.risk_net,
-                    mu,
-                    sigma,
-                    corr,
-                    min_alloc=self.cfg.min_alloc,
-                    base_alloc=self.cfg.base_alloc,
-                    risk_weight=self.cfg.risk_weight,
-                    risk_scores=risk_scores,
-                    heuristic=heuristic,
-                    rng=rng,
+                    alpha=1.0,
+                    beta=self.cfg.risk_weight,
                 )
                 weights = self._apply_constraints(weights, constraints)
                 score = self._score(weights, mu, cov, objective, constraints)
@@ -196,11 +186,10 @@ class NeuroAntPortfolioOptimizer:
             if portfolios:
                 self._refine_topk(portfolios, scores, mu, cov, objective, constraints)
 
-            self.colony.update(ants, scores)
+            self.colony.update_pheromone(ants, scores)
 
             if self.risk_net is not None:
-                risk_scores = self._train_risk(mu, sigma, corr)  # returns np.ndarray
-                heuristic = safe_softmax(mu - self.cfg.risk_weight * risk_scores)
+                _ = self._train_risk(mu, sigma, corr)  # update risk model
             self._train_pheromone(portfolios, scores)
 
             if scores:
@@ -387,18 +376,6 @@ class NeuroAntPortfolioOptimizer:
         if not np.allclose(cov, cov.T, atol=1e-10):
             raise ValueError("covariance must be symmetric")
 
-    def _risk_scores(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> np.ndarray:
-        """Predict per-asset normalized risk scores in [0,1]."""
-        if self.risk_net is None:
-            return np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
-
-        avg_corr = (corr.sum(axis=1) - 1.0) / max(self.n_assets - 1, 1)
-        feats = np.stack([mu, sigma, avg_corr], axis=1).reshape(-1).astype(np.float32)
-        tensor = torch.from_numpy(feats).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
-        with torch.no_grad():
-            pred = self.risk_net(tensor).detach().cpu().numpy().ravel()
-        return np.clip(pred, 0.0, 1.0)
-
     def _refine_topk(
         self,
         portfolios: List[np.ndarray],
@@ -416,22 +393,45 @@ class NeuroAntPortfolioOptimizer:
             return
 
         indices = np.argsort(scores)[-topk:]
+        bounds = [(constraints.min_weight, constraints.max_weight)] * self.n_assets
+        Aeq = beq = None
+        if (
+            constraints.equality_enforce
+            and abs(constraints.leverage_limit - 1.0) < 1e-12
+        ):
+            Aeq = np.ones((1, self.n_assets), dtype=float)
+            beq = np.array([1.0], dtype=float)
+        prev = (
+            np.asarray(constraints.prev_weights, dtype=float)
+            if constraints.prev_weights is not None
+            else None
+        )
+        T = float(constraints.max_turnover) if prev is not None else 0.0
+
         for idx in indices:
             initial = portfolios[idx]
 
             def score_fn(weights: Sequence[float]) -> float:
-                return self._score(np.asarray(weights, dtype=float), mu, cov, objective, constraints)
+                return self._score(
+                    np.asarray(weights, dtype=float),
+                    mu,
+                    cov,
+                    objective,
+                    constraints,
+                )
 
-            refined, refined_score, ok = refine_slsqp(
-                initial,
+            refined, res = refine_slsqp(
                 score_fn,
-                self.n_assets,
-                constraints,
-                self.cfg.refine_maxiter,
+                initial,
+                bounds,
+                Aeq=Aeq,
+                beq=beq,
+                prev=prev,
+                T=T,
             )
-            if ok:
+            if res.success:
                 portfolios[idx] = refined
-                scores[idx] = refined_score
+                scores[idx] = score_fn(refined)
 
     # ---- learning routines ----
     def _train_risk(self, mu: np.ndarray, sigma: np.ndarray, corr: np.ndarray) -> np.ndarray:
@@ -439,25 +439,22 @@ class NeuroAntPortfolioOptimizer:
         if self.risk_net is None or self.risk_optim is None:
             return np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
 
-        avg_corr = (corr.sum(axis=1) - 1.0) / max(self.n_assets - 1, 1)
-        feats = np.stack([mu, sigma, avg_corr], axis=1).reshape(-1).astype(np.float32)
-        target = (sigma / (sigma.max() + 1e-12)).astype(np.float32)
-
-        x = torch.from_numpy(feats).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
-        y = torch.from_numpy(target).unsqueeze(0).to(self.device, dtype=self.cfg.dtype)
+        target_vec = (sigma / (sigma.max() + 1e-12)).astype(np.float32)
+        basis = torch.eye(self.n_assets, device=self.device, dtype=self.cfg.dtype)
+        target = torch.diag(torch.from_numpy(target_vec)).to(self.device, dtype=self.cfg.dtype)
 
         self.risk_net.train()
         self.risk_optim.zero_grad()
-        pred = self.risk_net(x)
-        loss = self.mse(pred, y)
+        pred = self.risk_net(basis)
+        loss = self.mse(pred, target)
         loss.backward()
         clip_grad_norm_(self.risk_net.parameters(), self.cfg.grad_clip)
         self.risk_optim.step()
         self.risk_net.eval()
 
         with torch.no_grad():
-            out = self.risk_net(x).detach().cpu().numpy().ravel()
-        return np.clip(out, 0.0, 1.0)
+            out = self.risk_net(basis).detach().cpu().numpy()
+        return np.clip(np.diag(out), 0.0, 1.0)
 
     def _train_pheromone(self, portfolios: List[np.ndarray], scores: List[float]) -> None:
         if not portfolios:
@@ -480,3 +477,56 @@ class NeuroAntPortfolioOptimizer:
         clip_grad_norm_(self.phero_net.parameters(), self.cfg.grad_clip)
         self.phero_optim.step()
         self.phero_net.eval()
+
+
+class PolicyTrainer:
+    """
+    Stable trainer for the pheromone policy: KL(pred || EMA(target)) + entropy bonus.
+    Keeps your net/API intact; call .step(batch_of_target_mats).
+    """
+
+    def __init__(
+        self,
+        phero_net,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+        temperature: float = 0.7,
+        entropy_coeff: float = 1e-3,
+        lr: float = 3e-4,
+    ) -> None:
+        self.net = phero_net
+        self.device = device or torch.device("cpu")
+        self.dtype = dtype
+        self.tau = float(temperature)
+        self.entropy_coeff = float(entropy_coeff)
+        self._target_ema: Optional[torch.Tensor] = None
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
+
+    def step(self, target_mats_np: np.ndarray) -> float:
+        """
+        target_mats_np: (B, N, N) stochastic matrices; we fit KL(pred || EMA(target)).
+        Returns scalar loss.
+        """
+
+        self.net.train()
+        with torch.no_grad():
+            tgt = torch.from_numpy(
+                np.clip(target_mats_np.mean(axis=0), 1e-6, 1 - 1e-6)
+            ).to(self.device, self.dtype)
+            tgt = tgt / tgt.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            if self._target_ema is None:
+                self._target_ema = tgt.clone()
+            else:
+                self._target_ema.mul_(0.9).add_(0.1 * tgt)
+
+        pred = torch.clamp(self.net.transition_matrix(), 1e-6, 1 - 1e-6)
+        pred = pred / pred.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        log_pred = torch.log(pred)
+        kl = F.kl_div(log_pred, self._target_ema, reduction="batchmean")
+        ent = -(pred * log_pred).sum() / pred.numel()
+        loss = kl - self.entropy_coeff * ent
+        self.opt.zero_grad()
+        loss.backward()
+        clip_grad_norm_(self.net.parameters(), 1.0)
+        self.opt.step()
+        return float(loss.detach().cpu().item())

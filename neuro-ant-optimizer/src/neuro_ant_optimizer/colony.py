@@ -1,95 +1,81 @@
 from __future__ import annotations
+
+from typing import Iterable, List
+
 import numpy as np
-from typing import List
-from .models import PheromoneNetwork, RiskAssessmentNetwork
+import torch
+
 from .utils import safe_softmax
+
 
 class Ant:
     def __init__(self, n_assets: int):
         self.n_assets = n_assets
         self.visited: List[int] = []
-        self.w: np.ndarray = np.zeros(n_assets, dtype=float)
+        self.w: np.ndarray | None = None
 
     def build(
         self,
-        pheromone_net: PheromoneNetwork,
-        risk_net: RiskAssessmentNetwork | None,
-        mu: np.ndarray,
-        sigma: np.ndarray,
-        corr: np.ndarray,
-        min_alloc: float = 0.01,
-        base_alloc: float = 0.10,
-        risk_weight: float = 0.5,
-        risk_scores: np.ndarray | None = None,
-        heuristic: np.ndarray | None = None,
-        rng: np.random.Generator | None = None,
+        pheromone_net,
+        risk_net,
+        alpha: float,
+        beta: float,
     ) -> np.ndarray:
-        rng = rng or np.random.default_rng()
-        current = int(rng.integers(self.n_assets))
-        self.visited = [current]
-        self.w[:] = 0.0
+        """
+        Build a tour using pheromone transitions and (optional) risk heuristics.
+        Returns equal-weight portfolio over visited set (size = n_assets).
+        """
 
-        risks = (
-            risk_scores
-            if risk_scores is not None
-            else (
-                risk_net.predict(mu, sigma, corr)
-                if risk_net is not None
-                else np.clip(sigma / (sigma.max() + 1e-12), 0, 1)
+        n = self.n_assets
+        trans = pheromone_net.transition_matrix().detach().cpu().numpy()
+        risk = np.ones(n, dtype=float)
+        if risk_net is not None:
+            I = torch.eye(
+                n,
+                device=getattr(risk_net, "_device", torch.device("cpu")),
+                dtype=getattr(risk_net, "_dtype", torch.float32),
             )
-        )
+            r = risk_net(I).detach().cpu().numpy()
+            risk = np.clip(np.diag(r), 1e-6, None)
+        self.visited = [int(np.random.randint(0, n))]
+        while len(self.visited) < n:
+            cur = self.visited[-1]
+            mask = np.ones(n, dtype=bool)
+            mask[self.visited] = False
+            logits = np.log(np.clip(trans[cur], 1e-12, None)) * float(alpha) + np.log(
+                risk
+            ) * float(beta)
+            p = safe_softmax(logits, axis=-1, mask=mask)
+            nxt = int(np.random.choice(n, p=p))
+            self.visited.append(nxt)
+        w = np.zeros(n, dtype=float)
+        w[self.visited] = 1.0 / n
+        self.w = w
+        return w
 
-        self.w[current] = max(min_alloc, base_alloc * (1 - risks[current]))
-        heuristic = heuristic if heuristic is not None else safe_softmax(mu - risk_weight * risks)
-        while len(self.visited) < self.n_assets and self.w.sum() < 0.95:
-            probs = pheromone_net.transition_probs(current, self.visited)
-            blend = 0.6 * probs + 0.4 * heuristic
-            blend = blend / blend.sum()
-            unvisited = [i for i in range(self.n_assets) if i not in self.visited]
-            if not unvisited:
-                break
-            p = blend[unvisited]
-            if p.sum() <= 0:
-                nxt = int(rng.choice(unvisited))
-            else:
-                p = p / p.sum()
-                nxt = int(rng.choice(unvisited, p=p))
-            alloc = max(min_alloc, base_alloc * (1 - risks[nxt]))
-            if self.w.sum() + alloc <= 1.0:
-                self.w[nxt] = alloc
-                self.visited.append(nxt)
-                current = nxt
-            else:
-                break
-
-        s = self.w.sum()
-        if s > 0:
-            self.w /= s
-        return self.w
 
 class AntColony:
-    def __init__(self, n_assets: int, n_ants: int=150, evaporation: float=0.5, Q: float=100.0):
+    def __init__(self, n_assets: int, evap: float = 0.1, Q: float = 1.0):
         self.n_assets = n_assets
-        self.n_ants = n_ants
-        self.evap = float(np.clip(evaporation, 0.0, 1.0))
-        self.Q = Q
-        self.pheromone = np.ones((n_assets, n_assets), dtype=float) * 0.1
+        self.evap = float(evap)
+        self.Q = float(Q)
+        self.pheromone = np.ones((n_assets, n_assets), dtype=float) / n_assets
 
-    def init_colony(self) -> List[Ant]:
-        return [Ant(self.n_assets) for _ in range(self.n_ants)]
+    def update_pheromone(self, ants: Iterable[Ant], scores: Iterable[float]) -> None:
+        """Evaporate then deposit proportional to normalized scores."""
 
-    def update(self, ants: List[Ant], scores: list[float]) -> None:
-        self.pheromone *= (1.0 - self.evap)
-        if not ants:
+        self.pheromone *= 1.0 - self.evap
+        s = np.asarray(list(scores), dtype=float)
+        if s.size == 0:
             return
-        s = np.array(scores, dtype=float)
-        if np.all(np.isfinite(s)) and s.max() > s.min():
-            s = (s - s.min()) / (s.max() - s.min() + 1e-12)
+        if np.isfinite(s).all() and np.ptp(s) > 1e-12:
+            s = (s - s.min()) / (np.ptp(s) + 1e-12)
         else:
             s = np.ones_like(s)
         for ant, sc in zip(ants, s):
             if sc <= 0 or len(ant.visited) < 2:
                 continue
-            deposit = float(sc) * self.Q
+            dep = float(sc) * self.Q / (len(ant.visited) - 1)
             for a, b in zip(ant.visited[:-1], ant.visited[1:]):
-                self.pheromone[a, b] += deposit
+                self.pheromone[a, b] += dep
+
