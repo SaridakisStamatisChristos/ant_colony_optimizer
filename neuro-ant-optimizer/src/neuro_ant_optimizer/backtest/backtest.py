@@ -1181,6 +1181,38 @@ def backtest(
                 }
                 cap = float(constraints.max_sector_concentration)
                 sector_breaches = int(np.count_nonzero(exposures_values > cap + 1e-9))
+        active_breaches = 0
+        bench_weights = constraints.benchmark_weights
+        if bench_weights is not None:
+            bench_arr = np.asarray(bench_weights, dtype=float).ravel()
+            if bench_arr.shape != w.shape:
+                raise ValueError("benchmark_weights dimension mismatch with weights")
+            active = w - bench_arr
+            if np.isfinite(constraints.min_active_weight):
+                active_breaches += int(
+                    np.count_nonzero(active < float(constraints.min_active_weight) - 1e-9)
+                )
+            if np.isfinite(constraints.max_active_weight):
+                active_breaches += int(
+                    np.count_nonzero(active > float(constraints.max_active_weight) + 1e-9)
+                )
+            if (
+                constraints.active_group_map is not None
+                and constraints.active_group_bounds
+            ):
+                groups = np.asarray(constraints.active_group_map, dtype=int)
+                if groups.shape[0] != w.shape[0]:
+                    raise ValueError("active_group_map dimension mismatch with weights")
+                for gid, bound in constraints.active_group_bounds.items():
+                    mask = groups == gid
+                    if not np.any(mask):
+                        continue
+                    active_sum = float(active[mask].sum())
+                    lower_b, upper_b = bound
+                    if np.isfinite(upper_b) and active_sum > float(upper_b) + 1e-9:
+                        active_breaches += 1
+                    if np.isfinite(lower_b) and active_sum < float(lower_b) - 1e-9:
+                        active_breaches += 1
         factor_inf_norm = 0.0
         if factor_panel is not None:
             if factors_missing:
@@ -1219,6 +1251,7 @@ def backtest(
                 "tx_cost": float(tx_cost_value),
                 "slippage_cost": float(slip_cost),
                 "sector_breaches": int(sector_breaches),
+                "active_breaches": int(active_breaches),
                 "factor_inf_norm": float(factor_inf_norm),
                 "factor_missing": bool(factors_missing),
             }
@@ -1436,6 +1469,7 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "tx_cost",
         "slippage_cost",
         "sector_breaches",
+        "active_breaches",
         "factor_inf_norm",
         "factor_missing",
     ]
