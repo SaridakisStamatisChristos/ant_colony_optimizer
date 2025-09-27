@@ -266,19 +266,24 @@ def _write_equity(equity_path: Path, results: Dict[str, Any]) -> None:
 
 def _write_weights(weights_path: Path, results: Dict[str, Any]) -> None:
     W = np.asarray(results["weights"], dtype=float)
+    if W.ndim == 1 and W.size:
+        W = W.reshape(1, -1)
+    n_assets = W.shape[1] if W.ndim > 1 else 0
     dates = results.get("rebalance_dates", [])
     cols = results.get("asset_names")
     if pd is not None:
-        header_cols = cols if cols else [f"w{i}" for i in range(W.shape[1])]
+        header_cols = cols if cols else [f"w{i}" for i in range(n_assets)]
         df = pd.DataFrame(W, columns=header_cols)
         if dates:
             df.insert(0, "date", dates)
         df.to_csv(weights_path, index=False)
         return
 
-    header_cols = [f"w{i}" for i in range(W.shape[1])] if W.size else []
+    header_cols = [f"w{i}" for i in range(n_assets)] if n_assets else []
     if cols:
         header_cols = list(cols)
+        if n_assets and len(header_cols) != n_assets:
+            header_cols = [f"w{i}" for i in range(n_assets)]
     if dates:
         header = ",".join(["date", *header_cols]) if header_cols else "date"
         if W.size:
@@ -295,6 +300,19 @@ def _read_csv(csv_path: Path):
     if pd is not None:
         return pd.read_csv(csv_path, index_col=0, parse_dates=True)
 
+    header_cols: Optional[List[str]] = None
+    with csv_path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            header_row = next(reader)
+        except StopIteration:
+            header_row = []
+    if header_row:
+        if header_row[0]:
+            header_row[0] = header_row[0].lstrip("\ufeff")
+        extracted = [col.strip() for col in header_row[1:]]
+        header_cols = extracted if any(name for name in extracted) else None
+
     raw = np.genfromtxt(csv_path, delimiter=",", skip_header=1, dtype=str)
     if raw.size == 0:
         values = np.empty((0, 0), dtype=float)
@@ -304,10 +322,19 @@ def _read_csv(csv_path: Path):
         dates = raw[:, 0]
         values = raw[:, 1:].astype(float)
 
+    if header_cols and values.size and values.shape[1] != len(header_cols):
+        header_cols = [f"w{i}" for i in range(values.shape[1])]
+
     class _Frame:
-        def __init__(self, arr: np.ndarray, idx: Sequence[str]):
+        def __init__(
+            self,
+            arr: np.ndarray,
+            idx: Sequence[str],
+            cols: Optional[Sequence[str]] = None,
+        ):
             self._arr = arr
             self._idx = [np.datetime64(d) for d in idx]
+            self._cols = list(cols) if cols is not None else []
 
         def to_numpy(self, dtype=float):
             return self._arr.astype(dtype)
@@ -316,7 +343,11 @@ def _read_csv(csv_path: Path):
         def index(self):
             return self._idx
 
-    return _Frame(values, dates)
+        @property
+        def columns(self):
+            return self._cols
+
+    return _Frame(values, dates, header_cols)
 
 
 def main(args: Optional[Iterable[str]] = None) -> None:
