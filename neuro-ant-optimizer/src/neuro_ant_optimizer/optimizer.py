@@ -347,76 +347,61 @@ class NeuroAntPortfolioOptimizer:
         return self._sharpe(weights, mu, cov)
 
     def _apply_constraints(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
-        clipped = np.clip(weights, constraints.min_weight, constraints.max_weight)
+        lower, upper, bench = self._compute_weight_bounds(constraints)
+        clipped = np.clip(weights, lower, upper)
 
         if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
-            total = clipped.sum()
-            if total <= 0:
-                clipped = np.ones_like(clipped) / len(clipped)
-            else:
-                clipped = clipped / total
-            clipped = np.clip(clipped, constraints.min_weight, constraints.max_weight)
-            clipped = clipped / max(clipped.sum(), 1e-12)
-        elif clipped.sum() > constraints.leverage_limit:
-            clipped *= constraints.leverage_limit / (clipped.sum() + 1e-12)
+            clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
+        else:
+            limit = float(constraints.leverage_limit)
+            if clipped.sum() > limit:
+                clipped = self._project_sum_with_bounds(clipped, lower, upper, limit)
+        clipped = np.clip(clipped, lower, upper)
 
         if constraints.sector_map is not None:
             clipped = self._enforce_sector_caps(clipped, constraints)
-        if constraints.factors_enabled():
-            F = np.asarray(constraints.factor_loadings, dtype=float)
-            target = np.asarray(constraints.factor_targets, dtype=float)
-            A = F.T  # shape (K, N)
-            residual = target - A @ clipped
-            if np.linalg.norm(residual, ord=np.inf) > constraints.factor_tolerance:
-                lam = 1e-6
-                identity = np.eye(self.n_assets, dtype=float)
-                if (
-                    constraints.equality_enforce
-                    and abs(constraints.leverage_limit - 1.0) < 1e-12
-                ):
-                    u = np.ones((self.n_assets, 1), dtype=float)
-                    denom = float((u.T @ u).item())
-                    if denom > 0:
-                        projector = identity - (u @ u.T) / denom
-                    else:
-                        projector = identity
-                    At = A @ projector
-                    rhs = At.T @ residual
-                    system = At.T @ At + lam * identity
-                    try:
-                        delta = projector @ np.linalg.solve(system, rhs)
-                    except np.linalg.LinAlgError:
-                        delta = projector @ np.linalg.lstsq(system, rhs, rcond=None)[0]
-                else:
-                    rhs = A.T @ residual
-                    system = A.T @ A + lam * identity
-                    try:
-                        delta = np.linalg.solve(system, rhs)
-                    except np.linalg.LinAlgError:
-                        delta = np.linalg.lstsq(system, rhs, rcond=None)[0]
-                clipped = np.clip(
-                    clipped + delta,
-                    constraints.min_weight,
-                    constraints.max_weight,
+            clipped = np.clip(clipped, lower, upper)
+            if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+                clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
+            elif clipped.sum() > constraints.leverage_limit:
+                clipped = self._project_sum_with_bounds(
+                    clipped, lower, upper, constraints.leverage_limit
                 )
-                total = clipped.sum()
-                if (
-                    constraints.equality_enforce
-                    and abs(constraints.leverage_limit - 1.0) < 1e-12
-                ):
-                    if total > 0:
-                        clipped = clipped / total
-                elif total > constraints.leverage_limit:
-                    clipped *= constraints.leverage_limit / (total + 1e-12)
-                if constraints.sector_map is not None:
-                    clipped = self._enforce_sector_caps(clipped, constraints)
+
+        if (
+            bench is not None
+            and constraints.active_group_map is not None
+            and constraints.active_group_bounds
+        ):
+            for _ in range(5):
+                clipped = self._enforce_active_groups(clipped, bench, constraints, lower, upper)
+                if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+                    clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
+                elif clipped.sum() > constraints.leverage_limit:
+                    clipped = self._project_sum_with_bounds(
+                        clipped, lower, upper, constraints.leverage_limit
+                    )
+                clipped = np.clip(clipped, lower, upper)
+                if self._active_groups_feasible(clipped, bench, constraints):
+                    break
+
+        if constraints.factors_enabled() or constraints.factor_bounds_enabled():
+            for _ in range(12):
+                clipped = self._enforce_factor_constraints(clipped, constraints, lower, upper)
+                clipped = np.clip(clipped, lower, upper)
+                if self._factor_constraints_satisfied(clipped, constraints, tol=0.0):
+                    break
+
         if constraints.prev_weights is not None:
-            clipped = self._enforce_turnover(clipped, constraints)
+            clipped = self._enforce_turnover(clipped, constraints, lower, upper)
 
-        return clipped
+        return np.clip(clipped, lower, upper)
 
-    def _feasible(self, weights: np.ndarray, constraints: PortfolioConstraints, tol: float = 1e-8) -> bool:
-        if np.any(weights < constraints.min_weight - tol) or np.any(weights > constraints.max_weight + tol):
+    def _feasible(
+        self, weights: np.ndarray, constraints: PortfolioConstraints, tol: float = 1e-8
+    ) -> bool:
+        lower, upper, bench = self._compute_weight_bounds(constraints)
+        if np.any(weights < lower - tol) or np.any(weights > upper + tol):
             return False
         if weights.sum() > constraints.leverage_limit + tol:
             return False
@@ -431,12 +416,10 @@ class NeuroAntPortfolioOptimizer:
             for sector in np.unique(sectors):
                 if weights[sectors == sector].sum() > constraints.max_sector_concentration + tol:
                     return False
-        if constraints.factors_enabled():
-            F = np.asarray(constraints.factor_loadings, dtype=float)
-            target = np.asarray(constraints.factor_targets, dtype=float)
-            diff = F.T @ weights - target
-            if np.linalg.norm(diff, ord=np.inf) > constraints.factor_tolerance + tol:
-                return False
+        if bench is not None and not self._active_groups_feasible(weights, bench, constraints, tol=tol):
+            return False
+        if not self._factor_constraints_satisfied(weights, constraints, tol=tol):
+            return False
         if constraints.prev_weights is not None:
             if np.abs(weights - constraints.prev_weights).sum() > constraints.max_turnover + tol:
                 return False
@@ -459,7 +442,13 @@ class NeuroAntPortfolioOptimizer:
             adjusted = np.minimum(adjusted, constraints.max_weight)
         return adjusted
 
-    def _enforce_turnover(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
+    def _enforce_turnover(
+        self,
+        weights: np.ndarray,
+        constraints: PortfolioConstraints,
+        lower: Optional[np.ndarray] = None,
+        upper: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         previous = np.asarray(constraints.prev_weights, dtype=float)
         diff = weights - previous
         l1_norm = np.abs(diff).sum()
@@ -469,7 +458,9 @@ class NeuroAntPortfolioOptimizer:
             alpha = constraints.max_turnover / (l1_norm + 1e-12)
             adjusted = previous + alpha * diff
 
-        adjusted = np.clip(adjusted, constraints.min_weight, constraints.max_weight)
+        lb = lower if lower is not None else np.full(self.n_assets, constraints.min_weight)
+        ub = upper if upper is not None else np.full(self.n_assets, constraints.max_weight)
+        adjusted = np.clip(adjusted, lb, ub)
 
         if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
             total = adjusted.sum()
@@ -478,6 +469,275 @@ class NeuroAntPortfolioOptimizer:
         elif adjusted.sum() > constraints.leverage_limit:
             adjusted *= constraints.leverage_limit / (adjusted.sum() + 1e-12)
         return adjusted
+
+    def _compute_weight_bounds(
+        self, constraints: PortfolioConstraints
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        lower = np.full(self.n_assets, constraints.min_weight, dtype=float)
+        upper = np.full(self.n_assets, constraints.max_weight, dtype=float)
+        bench_vec: Optional[np.ndarray]
+        if constraints.benchmark_weights is not None:
+            bench = np.asarray(constraints.benchmark_weights, dtype=float).ravel()
+            if bench.shape[0] != self.n_assets:
+                raise ValueError("benchmark_weights dimension mismatch")
+            bench_vec = bench
+            if np.isfinite(constraints.min_active_weight):
+                lower = np.maximum(lower, bench + float(constraints.min_active_weight))
+            if np.isfinite(constraints.max_active_weight):
+                upper = np.minimum(upper, bench + float(constraints.max_active_weight))
+        else:
+            bench_vec = None
+        lower = np.minimum(lower, upper)
+        return lower, upper, bench_vec
+
+    def _project_sum_with_bounds(
+        self,
+        weights: np.ndarray,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        target: float,
+        tol: float = 1e-10,
+    ) -> np.ndarray:
+        projected = np.clip(weights, lower, upper)
+        if not np.isfinite(target):
+            return projected
+        for _ in range(5 * self.n_assets):
+            diff = target - projected.sum()
+            if abs(diff) <= tol:
+                break
+            if diff > 0:
+                slack = np.clip(upper - projected, 0.0, None)
+                total_slack = slack.sum()
+                if total_slack <= tol:
+                    break
+                step = np.minimum(slack, diff * slack / max(total_slack, 1e-12))
+                projected = np.clip(projected + step, lower, upper)
+            else:
+                slack = np.clip(projected - lower, 0.0, None)
+                total_slack = slack.sum()
+                if total_slack <= tol:
+                    break
+                step = np.minimum(slack, (-diff) * slack / max(total_slack, 1e-12))
+                projected = np.clip(projected - step, lower, upper)
+        return np.clip(projected, lower, upper)
+
+    def _enforce_active_groups(
+        self,
+        weights: np.ndarray,
+        benchmark: np.ndarray,
+        constraints: PortfolioConstraints,
+        lower: np.ndarray,
+        upper: np.ndarray,
+    ) -> np.ndarray:
+        groups = np.asarray(constraints.active_group_map, dtype=int)
+        bounds = constraints.active_group_bounds or {}
+        adjusted = weights.copy()
+        for gid, bound in bounds.items():
+            mask = groups == gid
+            if not np.any(mask):
+                continue
+            lower_b, upper_b = bound
+            bench_sum = float(benchmark[mask].sum())
+            current = float(adjusted[mask].sum())
+            if np.isfinite(upper_b):
+                target = max(bench_sum + float(upper_b), 0.0)
+                if current > target + 1e-12:
+                    adjusted = self._set_group_sum(adjusted, mask, target, lower, upper, benchmark)
+                    current = float(adjusted[mask].sum())
+            if np.isfinite(lower_b):
+                target = max(bench_sum + float(lower_b), 0.0)
+                current = float(adjusted[mask].sum())
+                if current < target - 1e-12:
+                    adjusted = self._set_group_sum(adjusted, mask, target, lower, upper, benchmark)
+            if (
+                constraints.equality_enforce
+                and abs(constraints.leverage_limit - 1.0) < 1e-12
+            ):
+                adjusted = self._redistribute_outside_group(
+                    adjusted,
+                    mask,
+                    target_total=1.0,
+                    lower=lower,
+                    upper=upper,
+                )
+        return np.clip(adjusted, lower, upper)
+
+    def _active_groups_feasible(
+        self,
+        weights: np.ndarray,
+        benchmark: np.ndarray,
+        constraints: PortfolioConstraints,
+        tol: float = 1e-8,
+    ) -> bool:
+        if constraints.active_group_map is None or not constraints.active_group_bounds:
+            return True
+        groups = np.asarray(constraints.active_group_map, dtype=int)
+        bounds = constraints.active_group_bounds or {}
+        for gid, bound in bounds.items():
+            mask = groups == gid
+            if not np.any(mask):
+                continue
+            active_sum = float(weights[mask].sum() - benchmark[mask].sum())
+            lower_b, upper_b = bound
+            if np.isfinite(upper_b) and active_sum > float(upper_b) + tol:
+                return False
+            if np.isfinite(lower_b) and active_sum < float(lower_b) - tol:
+                return False
+        return True
+
+    def _set_group_sum(
+        self,
+        weights: np.ndarray,
+        mask: np.ndarray,
+        target: float,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        benchmark: np.ndarray,
+    ) -> np.ndarray:
+        adjusted = weights.copy()
+        current = float(adjusted[mask].sum())
+        if current <= 0.0:
+            base = benchmark[mask]
+            if base.sum() <= 0:
+                base = np.ones(np.count_nonzero(mask), dtype=float)
+            weights_slice = np.clip(base, 1e-12, None)
+            weights_slice = target * weights_slice / max(weights_slice.sum(), 1e-12)
+            adjusted[mask] = weights_slice
+        else:
+            if target <= 0.0:
+                adjusted[mask] = 0.0
+            else:
+                ratio = target / max(current, 1e-12)
+                adjusted[mask] = adjusted[mask] * ratio
+        return np.clip(adjusted, lower, upper)
+
+    def _redistribute_outside_group(
+        self,
+        weights: np.ndarray,
+        mask: np.ndarray,
+        target_total: float,
+        lower: np.ndarray,
+        upper: np.ndarray,
+    ) -> np.ndarray:
+        adjusted = weights.copy()
+        diff = adjusted.sum() - target_total
+        if abs(diff) <= 1e-12:
+            return adjusted
+        comp = ~mask
+        if not np.any(comp):
+            return adjusted
+        if diff > 0:
+            slack = np.clip(adjusted[comp] - lower[comp], 0.0, None)
+            total_slack = slack.sum()
+            if total_slack > 0:
+                step = np.minimum(slack, diff * slack / max(total_slack, 1e-12))
+                adjusted[comp] = adjusted[comp] - step
+        else:
+            slack = np.clip(upper[comp] - adjusted[comp], 0.0, None)
+            total_slack = slack.sum()
+            if total_slack > 0:
+                step = np.minimum(slack, (-diff) * slack / max(total_slack, 1e-12))
+                adjusted[comp] = adjusted[comp] + step
+        return np.clip(adjusted, lower, upper)
+
+    def _enforce_factor_constraints(
+        self,
+        weights: np.ndarray,
+        constraints: PortfolioConstraints,
+        lower: np.ndarray,
+        upper: np.ndarray,
+    ) -> np.ndarray:
+        if constraints.factor_loadings is None:
+            return weights
+        F = np.asarray(constraints.factor_loadings, dtype=float)
+        if F.ndim != 2 or F.shape[0] != self.n_assets:
+            return weights
+        A = F.T
+        exposures = A @ weights
+        if constraints.factors_enabled():
+            desired = np.asarray(constraints.factor_targets, dtype=float)
+        else:
+            desired = exposures.copy()
+        lower_bounds = (
+            np.asarray(constraints.factor_lower_bounds, dtype=float)
+            if constraints.factor_lower_bounds is not None
+            else None
+        )
+        upper_bounds = (
+            np.asarray(constraints.factor_upper_bounds, dtype=float)
+            if constraints.factor_upper_bounds is not None
+            else None
+        )
+        if lower_bounds is not None:
+            desired = np.maximum(desired, lower_bounds)
+        if upper_bounds is not None:
+            desired = np.minimum(desired, upper_bounds)
+        if not constraints.factors_enabled() and (
+            lower_bounds is not None or upper_bounds is not None
+        ):
+            lower_clip = lower_bounds if lower_bounds is not None else -np.inf
+            upper_clip = upper_bounds if upper_bounds is not None else np.inf
+            desired = np.clip(desired, lower_clip, upper_clip)
+        residual = desired - exposures
+        tol = float(constraints.factor_tolerance)
+        if np.linalg.norm(residual, ord=np.inf) <= tol:
+            return weights
+        try:
+            if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+                u = np.ones((self.n_assets, 1), dtype=float)
+                denom = float((u.T @ u).item())
+                projector = np.eye(self.n_assets, dtype=float) - (u @ u.T) / denom if denom > 0 else np.eye(self.n_assets, dtype=float)
+                At = A @ projector
+                delta = projector @ np.linalg.lstsq(At, residual, rcond=None)[0]
+            else:
+                delta = np.linalg.lstsq(A, residual, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+                delta = projector @ np.linalg.lstsq(At, residual, rcond=None)[0]
+            else:
+                delta = np.linalg.lstsq(A, residual, rcond=None)[0]
+        adjusted = np.clip(weights + delta, lower, upper)
+        if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
+            adjusted = self._project_sum_with_bounds(adjusted, lower, upper, 1.0)
+        elif adjusted.sum() > constraints.leverage_limit:
+            adjusted = self._project_sum_with_bounds(
+                adjusted, lower, upper, constraints.leverage_limit
+            )
+        return adjusted
+
+    def _factor_constraints_satisfied(
+        self, weights: np.ndarray, constraints: PortfolioConstraints, tol: float = 1e-8
+    ) -> bool:
+        if not (constraints.factors_enabled() or constraints.factor_bounds_enabled()):
+            return True
+        if constraints.factor_loadings is None:
+            return True
+        F = np.asarray(constraints.factor_loadings, dtype=float)
+        if F.ndim != 2 or F.shape[0] != self.n_assets:
+            return True
+        exposures = F.T @ weights
+        if constraints.factors_enabled():
+            target = np.asarray(constraints.factor_targets, dtype=float)
+            if np.linalg.norm(exposures - target, ord=np.inf) > constraints.factor_tolerance + tol:
+                return False
+        if constraints.factor_bounds_enabled():
+            lower_bounds = (
+                np.asarray(constraints.factor_lower_bounds, dtype=float)
+                if constraints.factor_lower_bounds is not None
+                else None
+            )
+            upper_bounds = (
+                np.asarray(constraints.factor_upper_bounds, dtype=float)
+                if constraints.factor_upper_bounds is not None
+                else None
+            )
+            if lower_bounds is not None:
+                if np.any(exposures < lower_bounds - (constraints.factor_tolerance + tol)):
+                    return False
+            if upper_bounds is not None:
+                if np.any(exposures > upper_bounds + (constraints.factor_tolerance + tol)):
+                    return False
+        return True
 
     def _risk_contrib(self, weights: np.ndarray, cov: np.ndarray) -> np.ndarray:
         variance = float(weights @ cov @ weights)
@@ -569,7 +829,8 @@ class NeuroAntPortfolioOptimizer:
             return
 
         indices = np.argsort(scores)[-topk:]
-        bounds = [(constraints.min_weight, constraints.max_weight)] * self.n_assets
+        lower, upper, bench = self._compute_weight_bounds(constraints)
+        bounds = list(zip(lower.tolist(), upper.tolist()))
         Aeq_rows: List[np.ndarray] = []
         beq_vals: List[np.ndarray] = []
         Aineq_rows: List[np.ndarray] = []
@@ -585,6 +846,34 @@ class NeuroAntPortfolioOptimizer:
             b = np.asarray(constraints.factor_targets, dtype=float)
             Aeq_rows.append(F.T.astype(float))
             beq_vals.append(b.astype(float))
+        factor_bounds_active = constraints.factor_bounds_enabled()
+        if factor_bounds_active:
+            F = np.asarray(constraints.factor_loadings, dtype=float)
+            lower_bounds = (
+                np.asarray(constraints.factor_lower_bounds, dtype=float)
+                if constraints.factor_lower_bounds is not None
+                else None
+            )
+            upper_bounds = (
+                np.asarray(constraints.factor_upper_bounds, dtype=float)
+                if constraints.factor_upper_bounds is not None
+                else None
+            )
+            tol = float(constraints.factor_tolerance)
+            if upper_bounds is not None:
+                for idx, ub in enumerate(upper_bounds):
+                    if not np.isfinite(ub):
+                        continue
+                    row = F[:, idx].astype(float)
+                    Aineq_rows.append(row)
+                    bineq_vals.append(float(ub) + tol)
+            if lower_bounds is not None:
+                for idx, lb in enumerate(lower_bounds):
+                    if not np.isfinite(lb):
+                        continue
+                    row = -F[:, idx].astype(float)
+                    Aineq_rows.append(row)
+                    bineq_vals.append(-(float(lb) - tol))
         if constraints.sector_map is not None:
             sectors = np.asarray(constraints.sector_map, dtype=int)
             cap = float(constraints.max_sector_concentration)
@@ -593,6 +882,28 @@ class NeuroAntPortfolioOptimizer:
                 row[sectors == sector] = 1.0
                 Aineq_rows.append(row)
                 bineq_vals.append(cap)
+        if (
+            bench is not None
+            and constraints.active_group_map is not None
+            and constraints.active_group_bounds
+        ):
+            groups = np.asarray(constraints.active_group_map, dtype=int)
+            for gid, bound in constraints.active_group_bounds.items():
+                mask = groups == gid
+                if not np.any(mask):
+                    continue
+                bench_sum = float(bench[mask].sum())
+                lower_b, upper_b = bound
+                if np.isfinite(upper_b):
+                    row = np.zeros(self.n_assets, dtype=float)
+                    row[mask] = 1.0
+                    Aineq_rows.append(row)
+                    bineq_vals.append(bench_sum + float(upper_b))
+                if np.isfinite(lower_b):
+                    row = np.zeros(self.n_assets, dtype=float)
+                    row[mask] = -1.0
+                    Aineq_rows.append(row)
+                    bineq_vals.append(-(bench_sum + float(lower_b)))
         Aeq = (
             np.vstack(Aeq_rows) if Aeq_rows else None
         )
@@ -632,6 +943,37 @@ class NeuroAntPortfolioOptimizer:
                 prev=prev,
                 T=T,
             )
+            active_breaches = 0
+            if bench is not None:
+                active = refined - bench
+                if np.isfinite(constraints.min_active_weight):
+                    active_breaches += int(
+                        np.count_nonzero(
+                            active < float(constraints.min_active_weight) - 1e-8
+                        )
+                    )
+                if np.isfinite(constraints.max_active_weight):
+                    active_breaches += int(
+                        np.count_nonzero(
+                            active > float(constraints.max_active_weight) + 1e-8
+                        )
+                    )
+                if (
+                    constraints.active_group_map is not None
+                    and constraints.active_group_bounds
+                ):
+                    groups = np.asarray(constraints.active_group_map, dtype=int)
+                    for gid, bound in constraints.active_group_bounds.items():
+                        mask = groups == gid
+                        if not np.any(mask):
+                            continue
+                        active_sum = float(active[mask].sum())
+                        lower_b, upper_b = bound
+                        if np.isfinite(upper_b) and active_sum > float(upper_b) + 1e-8:
+                            active_breaches += 1
+                        if np.isfinite(lower_b) and active_sum < float(lower_b) - 1e-8:
+                            active_breaches += 1
+            setattr(res, "active_breaches", active_breaches)
             if res.success:
                 portfolios[idx] = refined
                 scores[idx] = score_fn(refined)

@@ -106,6 +106,7 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         assert record["net_tx_ret"] == pytest.approx(expected_net_tx)
         assert record["net_slip_ret"] == pytest.approx(expected_net_tx)
         assert record["sector_breaches"] == 0
+        assert record["active_breaches"] == 0
         assert record["factor_inf_norm"] == pytest.approx(0.0)
         assert record["factor_missing"] is False
 
@@ -120,6 +121,6 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     text = report_path.read_text().splitlines()
     assert text[0] == (
         "date,gross_ret,net_tx_ret,net_slip_ret,turnover,tx_cost,slippage_cost,"
-        "sector_breaches,factor_inf_norm,factor_missing"
+        "sector_breaches,active_breaches,factor_inf_norm,factor_missing"
     )
 
