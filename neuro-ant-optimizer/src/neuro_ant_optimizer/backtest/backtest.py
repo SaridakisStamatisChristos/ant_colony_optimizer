@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -72,6 +73,12 @@ def _stringify(value: Any) -> str:
     if pd is not None and isinstance(value, pd.Timestamp):  # pragma: no branch - optional
         return value.isoformat()
     return str(value)
+
+
+def _hash_returns_window(window: np.ndarray) -> str:
+    arr = np.ascontiguousarray(window, dtype=np.float64)
+    digest = hashlib.blake2b(arr.view(np.uint8), digest_size=16)
+    return digest.hexdigest()
 
 
 @dataclass
@@ -1474,23 +1481,13 @@ def backtest(
                 variance=max(variance, 0.0),
                 cov_vector=cov_vector,
             )
-        mean_signature = float(np.mean(train).round(12))
-        dtype_marker = str(train.dtype)
         span = ewma_span if cov_model == "ewma" and ewma_span is not None else None
-        cov_key: Optional[Tuple[Any, ...]] = None
+        window_hash = _hash_returns_window(train)
+        cov_key: Optional[Tuple[Any, ...]] = (cov_model, span, window_hash)
         cov: Optional[np.ndarray] = None
-        if cov_model == "ewma":
-            assert span is not None  # validated above
-            cov_key = ("ewma", span, lookback, train.shape, mean_signature, dtype_marker)
-        elif cov_model == "lw":
-            cov_key = ("lw", None, lookback, train.shape, mean_signature, dtype_marker)
-        elif cov_model == "oas":
-            cov_key = ("oas", None, lookback, train.shape, mean_signature, dtype_marker)
-        else:
-            cov_key = ("sample", None, lookback, train.shape, mean_signature, dtype_marker)
         cached_cov = cov_cache.get(cov_key) if cov_key is not None else None
         if cached_cov is not None:
-            cov = cached_cov
+            cov = cached_cov.copy()
         if cov is None:
             if cov_model == "ewma":
                 assert span is not None
