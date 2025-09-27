@@ -1227,6 +1227,7 @@ _OBJECTIVE_MAP: Dict[str, OptimizationObjective] = {
     "risk_parity": OptimizationObjective.RISK_PARITY,
     "min_cvar": OptimizationObjective.MIN_CVAR,
     "tracking_error": OptimizationObjective.TRACKING_ERROR_MIN,
+    "min_tracking_error": OptimizationObjective.TRACKING_ERROR_MIN,
     "info_ratio": OptimizationObjective.INFO_RATIO_MAX,
     "te_target": OptimizationObjective.TRACKING_ERROR_TARGET,
     "multi_term": OptimizationObjective.MULTI_TERM,

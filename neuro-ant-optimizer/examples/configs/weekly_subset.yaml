@@ -1,7 +1,7 @@
 # Weekly rebalance allowing factor gaps (logged in factor_diagnostics.json)
 csv: data/returns_weekly.csv
 factors: data/factors_weekly.csv
-lookback: 260
+lookback: 52
 step: 5
 cov_model: lw
 objective: sharpe
