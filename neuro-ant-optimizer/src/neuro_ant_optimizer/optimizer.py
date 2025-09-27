@@ -314,6 +314,54 @@ class NeuroAntPortfolioOptimizer:
 
         if constraints.sector_map is not None:
             clipped = self._enforce_sector_caps(clipped, constraints)
+        if constraints.factors_enabled():
+            F = np.asarray(constraints.factor_loadings, dtype=float)
+            target = np.asarray(constraints.factor_targets, dtype=float)
+            A = F.T  # shape (K, N)
+            residual = target - A @ clipped
+            if np.linalg.norm(residual, ord=np.inf) > constraints.factor_tolerance:
+                lam = 1e-6
+                identity = np.eye(self.n_assets, dtype=float)
+                if (
+                    constraints.equality_enforce
+                    and abs(constraints.leverage_limit - 1.0) < 1e-12
+                ):
+                    u = np.ones((self.n_assets, 1), dtype=float)
+                    denom = float((u.T @ u).item())
+                    if denom > 0:
+                        projector = identity - (u @ u.T) / denom
+                    else:
+                        projector = identity
+                    At = A @ projector
+                    rhs = At.T @ residual
+                    system = At.T @ At + lam * identity
+                    try:
+                        delta = projector @ np.linalg.solve(system, rhs)
+                    except np.linalg.LinAlgError:
+                        delta = projector @ np.linalg.lstsq(system, rhs, rcond=None)[0]
+                else:
+                    rhs = A.T @ residual
+                    system = A.T @ A + lam * identity
+                    try:
+                        delta = np.linalg.solve(system, rhs)
+                    except np.linalg.LinAlgError:
+                        delta = np.linalg.lstsq(system, rhs, rcond=None)[0]
+                clipped = np.clip(
+                    clipped + delta,
+                    constraints.min_weight,
+                    constraints.max_weight,
+                )
+                total = clipped.sum()
+                if (
+                    constraints.equality_enforce
+                    and abs(constraints.leverage_limit - 1.0) < 1e-12
+                ):
+                    if total > 0:
+                        clipped = clipped / total
+                elif total > constraints.leverage_limit:
+                    clipped *= constraints.leverage_limit / (total + 1e-12)
+                if constraints.sector_map is not None:
+                    clipped = self._enforce_sector_caps(clipped, constraints)
         if constraints.prev_weights is not None:
             clipped = self._enforce_turnover(clipped, constraints)
 
@@ -335,6 +383,12 @@ class NeuroAntPortfolioOptimizer:
             for sector in np.unique(sectors):
                 if weights[sectors == sector].sum() > constraints.max_sector_concentration + tol:
                     return False
+        if constraints.factors_enabled():
+            F = np.asarray(constraints.factor_loadings, dtype=float)
+            target = np.asarray(constraints.factor_targets, dtype=float)
+            diff = F.T @ weights - target
+            if np.linalg.norm(diff, ord=np.inf) > constraints.factor_tolerance + tol:
+                return False
         if constraints.prev_weights is not None:
             if np.abs(weights - constraints.prev_weights).sum() > constraints.max_turnover + tol:
                 return False
@@ -434,13 +488,37 @@ class NeuroAntPortfolioOptimizer:
 
         indices = np.argsort(scores)[-topk:]
         bounds = [(constraints.min_weight, constraints.max_weight)] * self.n_assets
-        Aeq = beq = None
+        Aeq_rows: List[np.ndarray] = []
+        beq_vals: List[np.ndarray] = []
+        Aineq_rows: List[np.ndarray] = []
+        bineq_vals: List[float] = []
         if (
             constraints.equality_enforce
             and abs(constraints.leverage_limit - 1.0) < 1e-12
         ):
-            Aeq = np.ones((1, self.n_assets), dtype=float)
-            beq = np.array([1.0], dtype=float)
+            Aeq_rows.append(np.ones((1, self.n_assets), dtype=float))
+            beq_vals.append(np.array([1.0], dtype=float))
+        if constraints.factors_enabled():
+            F = np.asarray(constraints.factor_loadings, dtype=float)
+            b = np.asarray(constraints.factor_targets, dtype=float)
+            Aeq_rows.append(F.T.astype(float))
+            beq_vals.append(b.astype(float))
+        if constraints.sector_map is not None:
+            sectors = np.asarray(constraints.sector_map, dtype=int)
+            cap = float(constraints.max_sector_concentration)
+            for sector in np.unique(sectors):
+                row = np.zeros(self.n_assets, dtype=float)
+                row[sectors == sector] = 1.0
+                Aineq_rows.append(row)
+                bineq_vals.append(cap)
+        Aeq = (
+            np.vstack(Aeq_rows) if Aeq_rows else None
+        )
+        beq = (
+            np.concatenate(beq_vals) if beq_vals else None
+        )
+        Aineq = np.vstack(Aineq_rows) if Aineq_rows else None
+        bineq = np.asarray(bineq_vals, dtype=float) if bineq_vals else None
         prev = (
             np.asarray(constraints.prev_weights, dtype=float)
             if constraints.prev_weights is not None
@@ -466,6 +544,8 @@ class NeuroAntPortfolioOptimizer:
                 bounds,
                 Aeq=Aeq,
                 beq=beq,
+                Aineq=Aineq,
+                bineq=bineq,
                 prev=prev,
                 T=T,
             )
