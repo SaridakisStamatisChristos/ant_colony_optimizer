@@ -3,7 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
+import pytest
+from importlib import import_module
 
+bt = import_module("neuro_ant_optimizer.backtest.backtest")
 from neuro_ant_optimizer.backtest.backtest import backtest, load_factor_panel, main
 
 
@@ -80,6 +84,17 @@ def test_backtest_factor_neutrality(tmp_path: Path) -> None:
             targets = np.zeros_like(exposures)
         diff = exposures - targets
         assert np.linalg.norm(diff, ord=np.inf) <= tol
+
+    exposures_path = tmp_path / "exposures.csv"
+    bt._write_exposures(exposures_path, results)
+    exposures_data: npt.NDArray[np.void] = np.genfromtxt(
+        exposures_path, delimiter=",", names=True, dtype=None, encoding="utf-8"
+    )
+    rows = exposures_data if exposures_data.ndim else [exposures_data]
+    assert len(rows) == len(results["factor_records"])
+    for row, record in zip(rows, results["factor_records"]):
+        for idx, name in enumerate(results["factor_names"]):
+            assert pytest.approx(record["exposures"][idx]) == row[name]
 
 
 def test_backtest_cli_with_factors_and_slippage(tmp_path: Path) -> None:

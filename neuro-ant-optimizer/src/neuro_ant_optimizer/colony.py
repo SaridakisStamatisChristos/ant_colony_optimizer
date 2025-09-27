@@ -21,6 +21,8 @@ class Ant:
         alpha: float,
         beta: float,
         trans_matrix: np.ndarray | None = None,
+        rng: np.random.Generator | None = None,
+        initial: int | None = None,
     ) -> np.ndarray:
         """
         Build a tour using pheromone transitions and (optional) risk heuristics.
@@ -28,6 +30,8 @@ class Ant:
         """
 
         n = self.n_assets
+        if rng is None:
+            rng = np.random.default_rng()
         if trans_matrix is None:
             # Inference path: avoid building a grad graph
             with torch.no_grad():
@@ -44,7 +48,8 @@ class Ant:
             I = torch.eye(n, device=risk_net.param_device, dtype=risk_net.param_dtype)
             r = risk_net(I).detach().cpu().numpy()
             risk = np.clip(np.diag(r), 1e-6, None)
-        self.visited = [int(np.random.randint(0, n))]
+        start = int(initial) if initial is not None else int(rng.integers(0, n))
+        self.visited = [start]
         while len(self.visited) < n:
             cur = self.visited[-1]
             mask = np.ones(n, dtype=bool)
@@ -53,7 +58,7 @@ class Ant:
                 risk
             ) * float(beta)
             p = safe_softmax(logits, axis=-1, mask=mask)
-            nxt = int(np.random.choice(n, p=p))
+            nxt = int(rng.choice(n, p=p))
             self.visited.append(nxt)
         w = np.zeros(n, dtype=float)
         w[self.visited] = 1.0 / n

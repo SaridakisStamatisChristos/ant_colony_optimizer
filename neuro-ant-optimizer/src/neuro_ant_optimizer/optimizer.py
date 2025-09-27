@@ -157,6 +157,7 @@ class NeuroAntPortfolioOptimizer:
         covariance: np.ndarray,
         constraints: PortfolioConstraints,
         objective: OptimizationObjective = OptimizationObjective.SHARPE_RATIO,
+        refine: bool = True,
     ) -> OptimizationResult:
         """Run the optimization loop and return an :class:`OptimizationResult`."""
 
@@ -195,20 +196,23 @@ class NeuroAntPortfolioOptimizer:
             portfolios: List[np.ndarray] = []
             scores: List[float] = []
 
-            for ant in ants:
+            initial_states = rng.integers(0, self.n_assets, size=len(ants))
+            for ant, start_node in zip(ants, initial_states):
                 weights = ant.build(
                     self.phero_net,
                     self.risk_net,
                     alpha=1.0,
                     beta=self.cfg.risk_weight,
                     trans_matrix=cached_T,
+                    rng=rng,
+                    initial=int(start_node),
                 )
                 weights = self._apply_constraints(weights, constraints)
                 score = self._score(weights, mu, cov, objective, constraints)
                 portfolios.append(weights)
                 scores.append(score)
 
-            if portfolios:
+            if portfolios and refine:
                 self._refine_topk(portfolios, scores, mu, cov, objective, constraints)
 
             self.colony.update_pheromone(ants, scores)

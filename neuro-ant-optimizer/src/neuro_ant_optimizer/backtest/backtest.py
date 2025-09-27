@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from collections import OrderedDict
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from neuro_ant_optimizer import __version__
 from neuro_ant_optimizer.constraints import PortfolioConstraints
 from neuro_ant_optimizer.optimizer import (
     NeuroAntPortfolioOptimizer,
@@ -57,6 +61,114 @@ class FactorPanel:
 class SlippageConfig:
     model: str
     param: float
+
+
+def _coerce_scalar(text: str) -> Any:
+    lowered = text.strip().lower()
+    if lowered in {"true", "yes", "on"}:
+        return True
+    if lowered in {"false", "no", "off"}:
+        return False
+    if lowered in {"null", "none", ""}:
+        return None
+    try:
+        if text.startswith("[") or text.startswith("{"):
+            return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def _parse_simple_mapping(text: str) -> Dict[str, Any]:
+    mapping: Dict[str, Any] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise ValueError("Unable to parse config line: missing ':' delimiter")
+        key, value = line.split(":", 1)
+        mapping[key.strip()] = _coerce_scalar(value.strip())
+    return mapping
+
+
+def _load_run_config(path: Path) -> Dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    suffix = path.suffix.lower()
+    data: Any
+    if suffix in {".yaml", ".yml"}:
+        if yaml is not None:
+            data = yaml.safe_load(text)
+        else:
+            data = _parse_simple_mapping(text)
+    elif suffix == ".json":
+        data = json.loads(text)
+    else:
+        data = _parse_simple_mapping(text)
+    if not isinstance(data, dict):
+        raise ValueError("Run config must evaluate to a mapping")
+    normalized: Dict[str, Any] = {}
+    for key, value in data.items():
+        norm_key = str(key).replace("-", "_")
+        normalized[norm_key] = value
+    return normalized
+
+
+def _serialize_args(args: argparse.Namespace) -> Dict[str, Any]:
+    blob: Dict[str, Any] = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            blob[key] = str(value)
+        elif isinstance(value, (list, tuple)):
+            blob[key] = [str(item) if isinstance(item, Path) else item for item in value]
+        else:
+            blob[key] = value
+    return blob
+
+
+def _resolve_git_sha() -> Optional[str]:
+    try:
+        sha = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+            .decode("utf-8")
+            .strip()
+        )
+        return sha or None
+    except Exception:
+        return None
+
+
+def _write_run_manifest(
+    out_dir: Path, args: argparse.Namespace, config_path: Optional[Path]
+) -> None:
+    manifest: Dict[str, Any] = {
+        "args": _serialize_args(args),
+        "package_version": __version__,
+        "python_version": sys.version,
+    }
+    if config_path is not None:
+        manifest["config_path"] = str(config_path)
+    try:  # optional torch dependency
+        import torch
+
+        manifest["torch_version"] = torch.__version__
+    except ModuleNotFoundError:  # pragma: no cover - environments without torch
+        manifest["torch_version"] = None
+
+    git_sha = _resolve_git_sha()
+    if git_sha:
+        manifest["git_sha"] = git_sha
+
+    (out_dir / "run_config.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def _coerce_date(value: Any) -> Any:
@@ -532,11 +644,14 @@ def backtest(
     factor_targets: Optional[np.ndarray] = None,
     factor_tolerance: float = 1e-6,
     slippage: Optional[SlippageConfig] = None,
+    refine_every: int = 1,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
     if lookback <= 0 or step <= 0:
         raise ValueError("lookback and step must be positive integers")
+    if refine_every <= 0:
+        raise ValueError("refine_every must be positive")
     if objective not in _OBJECTIVE_MAP:
         raise ValueError(f"Unknown objective '{objective}'")
 
@@ -603,6 +718,11 @@ def backtest(
     slippage_costs: List[float] = []
     missing_factor_logged: set = set()
     factor_records: List[Dict[str, Any]] = []
+    gross_returns: List[float] = []
+    net_tx_returns: List[float] = []
+    net_slip_returns: List[float] = []
+    rebalance_records: List[Dict[str, Any]] = []
+    cov_cache: "OrderedDict[bytes, np.ndarray]" = OrderedDict()
 
     for start in range(lookback, n_periods, step):
         end = min(start + step, n_periods)
@@ -615,7 +735,19 @@ def backtest(
             cov_raw = np.cov(train, rowvar=False)
         if optimizer.cfg.use_shrinkage:
             cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
-        cov = nearest_psd(cov_raw)
+        cov_key: Optional[bytes] = None
+        cov: Optional[np.ndarray] = None
+        if ewma_span is not None:
+            cov_key = cov_raw.tobytes()
+            cached_cov = cov_cache.get(cov_key)
+            if cached_cov is not None:
+                cov = cached_cov
+        if cov is None:
+            cov = nearest_psd(cov_raw)
+            if cov_key is not None:
+                cov_cache[cov_key] = cov.copy()
+                while len(cov_cache) > 4:
+                    cov_cache.popitem(last=False)
         active_factors = False
         current_factor_snapshot: Optional[np.ndarray] = None
         if factor_panel is not None:
@@ -636,54 +768,114 @@ def backtest(
             constraints.factor_loadings = None
             constraints.factor_targets = None
 
+        rebalance_idx = len(weights)
+        should_refine = (rebalance_idx % refine_every) == 0
         result = optimizer.optimize(
             mu,
             cov,
             constraints,
             objective=_OBJECTIVE_MAP[objective],
+            refine=should_refine,
         )
         w = result.weights
         weights.append(w)
-        rebalance_dates.append(dates[start])
-        block_returns = test @ w
+        rebalance_date = dates[start]
+        rebalance_dates.append(rebalance_date)
+        gross_block_returns = test @ w
+        gross_returns.extend(gross_block_returns.tolist())
+        length = max(1, gross_block_returns.size)
+
         turn = turnover(prev_weights, w)
+        tx_cost_value = tc * turn if (tc > 0.0 and tx_cost_mode != "none") else 0.0
+        tx_block_returns = gross_block_returns.copy()
+        block_returns_metrics = gross_block_returns.copy()
+        if tx_cost_value > 0.0:
+            if tx_cost_mode == "upfront":
+                if block_returns_metrics.size > 0:
+                    block_returns_metrics = block_returns_metrics.copy()
+                    block_returns_metrics[0] -= tx_cost_value
+                tx_block_returns = block_returns_metrics.copy()
+            elif tx_cost_mode == "amortized":
+                adjust = tx_cost_value / length
+                block_returns_metrics = block_returns_metrics - adjust
+                tx_block_returns = block_returns_metrics.copy()
+            elif tx_cost_mode == "posthoc":
+                tx_block_returns = tx_block_returns - (tx_cost_value / length)
+
         slip_cost = _compute_slippage_cost(slippage, turn, test)
         slippage_costs.append(slip_cost)
-        if tx_cost_mode in ("upfront", "amortized") and tc > 0.0:
-            if tx_cost_mode == "upfront":
-                if block_returns.size > 0:
-                    block_returns = block_returns.copy()
-                    block_returns[0] -= tc * turn
+        slip_block_returns = tx_block_returns.copy()
+        if slippage is not None and slip_cost > 0.0:
+            if tx_cost_mode in ("upfront", "amortized"):
+                if tx_cost_mode == "upfront" and block_returns_metrics.size > 0:
+                    block_returns_metrics = block_returns_metrics.copy()
+                    block_returns_metrics[0] -= slip_cost
+                else:
+                    block_returns_metrics = block_returns_metrics - (slip_cost / length)
+            if tx_cost_mode == "upfront" and slip_block_returns.size > 0:
+                slip_block_returns = slip_block_returns.copy()
+                slip_block_returns[0] -= slip_cost
             else:
-                length = max(1, block_returns.size)
-                block_returns = block_returns - (tc * turn / length)
-        if (
-            slippage is not None
-            and tx_cost_mode in ("upfront", "amortized")
-            and slip_cost > 0.0
-        ):
-            block_returns = block_returns.copy()
-            if tx_cost_mode == "upfront" and block_returns.size > 0:
-                block_returns[0] -= slip_cost
-            else:
-                length = max(1, block_returns.size)
-                block_returns = block_returns - (slip_cost / length)
+                slip_block_returns = slip_block_returns - (slip_cost / length)
+
+        net_tx_returns.extend(tx_block_returns.tolist())
+        net_slip_returns.extend(slip_block_returns.tolist())
+
+        block_returns = block_returns_metrics
         realized_returns.extend(block_returns.tolist())
         turnovers.append(turn)
         prev_weights = w
         realized_dates.extend(dates[start:end])
+
+        sector_breaches = 0
+        sector_exposures: Dict[str, float] = {}
+        if constraints.sector_map is not None:
+            sectors = np.asarray(constraints.sector_map)
+            cap = float(constraints.max_sector_concentration)
+            for sector in np.unique(sectors):
+                mask = sectors == sector
+                total = float(w[mask].sum())
+                sector_exposures[f"sector_{sector}"] = total
+                if total > cap + 1e-9:
+                    sector_breaches += 1
+        factor_inf_norm = 0.0
+        exposures: Optional[np.ndarray] = None
         if active_factors and current_factor_snapshot is not None:
             exposures = current_factor_snapshot.T @ w
+            targets = factor_target_vec if factor_target_vec is not None else None
+            if targets is None:
+                targets = np.zeros_like(exposures)
+            factor_inf_norm = float(
+                np.linalg.norm(exposures - targets, ord=np.inf)
+            )
             factor_records.append(
                 {
-                    "date": dates[start],
+                    "date": rebalance_date,
                     "exposures": exposures,
                     "targets": factor_target_vec if factor_target_vec is not None else None,
                     "tolerance": factor_tolerance,
+                    "sector_exposures": sector_exposures if sector_exposures else None,
                 }
             )
 
+        rebalance_records.append(
+            {
+                "date": rebalance_date,
+                "gross_ret": float(np.prod(1.0 + gross_block_returns) - 1.0),
+                "net_tx_ret": float(np.prod(1.0 + tx_block_returns) - 1.0),
+                "net_slip_ret": float(np.prod(1.0 + slip_block_returns) - 1.0),
+                "turnover": float(turn),
+                "tx_cost": float(tx_cost_value),
+                "slippage_cost": float(slip_cost),
+                "sector_breaches": int(sector_breaches),
+                "factor_inf_norm": float(factor_inf_norm),
+            }
+        )
+
     realized_returns_arr = np.asarray(realized_returns, dtype=float)
+    gross_returns_arr = np.asarray(gross_returns, dtype=float)
+    net_tx_returns_arr = np.asarray(net_tx_returns, dtype=float)
+    net_slip_returns_arr = np.asarray(net_slip_returns, dtype=float)
     equity = np.cumprod(1.0 + realized_returns_arr)
     slippage_costs_arr = np.asarray(slippage_costs, dtype=float) if slippage_costs else np.array([])
     avg_slippage_bps = (
@@ -691,21 +883,7 @@ def backtest(
     )
     slippage_net_returns: Optional[np.ndarray] = None
     if slippage is not None:
-        slippage_net_returns = realized_returns_arr.copy()
-        if (
-            tx_cost_mode == "posthoc"
-            and slippage_costs_arr.size
-            and len(rebalance_dates) == slippage_costs_arr.size
-        ):
-            index_map = {date: idx for idx, date in enumerate(realized_dates)}
-            starts = [index_map[date] for date in rebalance_dates if date in index_map]
-            starts.append(len(realized_dates))
-            for block_idx, cost in enumerate(slippage_costs_arr):
-                if block_idx >= len(starts) - 1:
-                    break
-                i0, i1 = starts[block_idx], starts[block_idx + 1]
-                length = max(1, i1 - i0)
-                slippage_net_returns[i0:i1] = slippage_net_returns[i0:i1] - (cost / length)
+        slippage_net_returns = net_slip_returns_arr.copy()
 
     ann_vol = float(np.std(realized_returns_arr) * math.sqrt(252)) if realized_returns_arr.size else 0.0
     ann_return = float(np.mean(realized_returns_arr) * 252) if realized_returns_arr.size else 0.0
@@ -726,6 +904,9 @@ def backtest(
     return {
         "dates": realized_dates,
         "returns": realized_returns_arr,
+        "gross_returns": gross_returns_arr,
+        "net_tx_returns": net_tx_returns_arr,
+        "net_slip_returns": net_slip_returns_arr,
         "equity": equity,
         "weights": np.asarray(weights),
         "rebalance_dates": rebalance_dates,
@@ -744,6 +925,7 @@ def backtest(
         "avg_slippage_bps": avg_slippage_bps,
         "slippage_costs": slippage_costs_arr,
         "slippage_net_returns": slippage_net_returns,
+        "rebalance_records": rebalance_records,
     }
 
 
@@ -856,6 +1038,58 @@ def _write_factor_constraints(path: Path, results: Dict[str, Any]) -> None:
             writer.writerow(row)
 
 
+def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
+    records: Sequence[Dict[str, Any]] = results.get("rebalance_records", [])  # type: ignore[assignment]
+    if not records:
+        return
+    header = [
+        "date",
+        "gross_ret",
+        "net_tx_ret",
+        "net_slip_ret",
+        "turnover",
+        "tx_cost",
+        "slippage_cost",
+        "sector_breaches",
+        "factor_inf_norm",
+    ]
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        for record in records:
+            row = {key: record.get(key) for key in header}
+            writer.writerow(row)
+
+
+def _write_exposures(path: Path, results: Dict[str, Any]) -> None:
+    records: Sequence[Dict[str, Any]] = results.get("factor_records", [])  # type: ignore[assignment]
+    factor_names: Sequence[str] = results.get("factor_names", [])  # type: ignore[assignment]
+    if not records or not factor_names:
+        return
+    sector_columns: List[str] = []
+    for record in records:
+        sectors = record.get("sector_exposures")
+        if isinstance(sectors, dict):
+            for name in sectors.keys():
+                if name not in sector_columns:
+                    sector_columns.append(name)
+    sector_columns.sort()
+    header = ["date", *factor_names, *sector_columns]
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        for record in records:
+            exposures = np.asarray(record.get("exposures", []), dtype=float)
+            row: List[Any] = [record.get("date")]
+            for idx in range(len(factor_names)):
+                value = float(exposures[idx]) if idx < exposures.size else 0.0
+                row.append(value)
+            sectors = record.get("sector_exposures") or {}
+            for name in sector_columns:
+                row.append(float(sectors.get(name, 0.0)))
+            writer.writerow(row)
+
+
 def _read_csv(csv_path: Path):
     if pd is not None:
         return pd.read_csv(csv_path, index_col=0, parse_dates=True)
@@ -918,7 +1152,13 @@ def _read_csv(csv_path: Path):
 
 def main(args: Optional[Iterable[str]] = None) -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", required=True, help="CSV of daily returns with date index")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML/JSON file containing run parameters",
+    )
+    parser.add_argument("--csv", type=str, default=None, help="CSV of daily returns with date index")
     parser.add_argument("--lookback", type=int, default=252)
     parser.add_argument("--step", type=int, default=21)
     parser.add_argument("--ewma_span", type=int, default=60)
@@ -976,7 +1216,24 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         default=None,
         help="Slippage model specification (e.g. proportional:5)",
     )
+    parser.add_argument(
+        "--refine-every",
+        type=int,
+        default=1,
+        help="Run SLSQP refinement every k rebalances",
+    )
+
+    preliminary, _ = parser.parse_known_args(args=args)
+    config_path: Optional[Path] = None
+    if preliminary.config:
+        config_path = Path(preliminary.config)
+        config_overrides = _load_run_config(config_path)
+        config_overrides.pop("config", None)
+        parser.set_defaults(**config_overrides)
+
     parsed = parser.parse_args(args=args)
+    if not parsed.csv:
+        raise ValueError("--csv must be provided via CLI or config")
 
     df = _read_csv(Path(parsed.csv))
     factor_panel = load_factor_panel(Path(parsed.factors)) if parsed.factors else None
@@ -987,6 +1244,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             raise ValueError("Factor targets provided without factor loadings")
         factor_target_vec = load_factor_targets(Path(parsed.factor_targets), factor_panel.factor_names)
 
+    tx_cost_bps = float(parsed.tx_cost_bps) if parsed.tx_cost_mode != "none" else 0.0
     results = backtest(
         df,
         lookback=parsed.lookback,
@@ -994,63 +1252,61 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         ewma_span=parsed.ewma_span,
         objective=parsed.objective,
         seed=parsed.seed,
-        tx_cost_bps=parsed.tx_cost_bps if parsed.tx_cost_mode in ("upfront", "amortized") else 0.0,
+        tx_cost_bps=tx_cost_bps,
         tx_cost_mode=parsed.tx_cost_mode,
         metric_alpha=parsed.metric_alpha,
         factors=factor_panel,
         factor_targets=factor_target_vec,
         factor_tolerance=parsed.factor_tolerance,
         slippage=slippage_cfg,
+        refine_every=parsed.refine_every,
     )
 
     out_dir = Path(parsed.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_metrics(out_dir / "metrics.csv", results)
-    if (
-        parsed.tx_cost_mode == "posthoc"
-        and parsed.tx_cost_bps
-        and results["weights"].shape[0] > 0
-    ):
-        tc = float(parsed.tx_cost_bps) / 1e4
-        rebalance_dates = results.get("rebalance_dates", [])
-        all_dates = results["dates"]
-        index_map = {date: idx for idx, date in enumerate(all_dates)}
-        starts = [index_map[date] for date in rebalance_dates if date in index_map]
-        starts.append(len(all_dates))
-        net = results["returns"].copy()
-        for block in range(len(starts) - 1):
-            i0, i1 = starts[block], starts[block + 1]
-            length = max(1, i1 - i0)
-            if block == 0:
-                turn = float(np.abs(results["weights"][block]).sum())
-            else:
-                turn = float(
-                    np.abs(results["weights"][block] - results["weights"][block - 1]).sum()
-                )
-            net[i0:i1] = net[i0:i1] - (tc * turn / length)
-        net_results = dict(results)
-        net_results["returns"] = net
-        net_results["equity"] = np.cumprod(1.0 + net)
-        _write_equity(out_dir / "equity_net_of_tc.csv", net_results)
+    _write_rebalance_report(out_dir / "rebalance_report.csv", results)
     _write_equity(out_dir / "equity.csv", results)
-    if results.get("slippage_net_returns") is not None:
+    net_tx_returns = results.get("net_tx_returns")
+    if isinstance(net_tx_returns, np.ndarray) and net_tx_returns.size:
+        net_results = dict(results)
+        net_results["returns"] = net_tx_returns
+        net_results["equity"] = np.cumprod(1.0 + net_tx_returns)
+        _write_equity(out_dir / "equity_net_of_tc.csv", net_results)
+    slip_returns = results.get("slippage_net_returns")
+    if isinstance(slip_returns, np.ndarray) and slip_returns.size:
         slip_results = dict(results)
-        slip_results["returns"] = results["slippage_net_returns"]
-        slip_results["equity"] = np.cumprod(1.0 + results["slippage_net_returns"])
+        slip_results["returns"] = slip_returns
+        slip_results["equity"] = np.cumprod(1.0 + slip_returns)
         _write_equity(out_dir / "equity_net_of_slippage.csv", slip_results)
     if parsed.factors:
         _write_factor_constraints(out_dir / "factor_constraints.csv", results)
+        _write_exposures(out_dir / "exposures.csv", results)
     if parsed.save_weights:
         _write_weights(out_dir / "weights.csv", results)
+
+    _write_run_manifest(out_dir, parsed, config_path)
 
     try:
         import matplotlib.pyplot as plt  # type: ignore
 
         plt.figure()
-        plt.plot(results["dates"], results["equity"])
+        dates = results["dates"]
+        gross_curve = np.cumprod(1.0 + np.asarray(results["gross_returns"], dtype=float))
+        plt.plot(dates, gross_curve, label="gross")
+        if isinstance(net_tx_returns, np.ndarray) and net_tx_returns.size:
+            net_curve = np.cumprod(1.0 + net_tx_returns)
+            if not np.allclose(net_curve, gross_curve):
+                plt.plot(dates, net_curve, label="net tx")
+        if isinstance(slip_returns, np.ndarray) and slip_returns.size:
+            slip_curve = np.cumprod(1.0 + slip_returns)
+            if not np.allclose(slip_curve, gross_curve):
+                plt.plot(dates, slip_curve, label="net slippage")
         plt.title(f"Equity — {parsed.objective}")
         plt.xlabel("Date")
         plt.ylabel("Equity")
+        if plt.gca().has_data():
+            plt.legend()
         plt.tight_layout()
         plt.savefig(out_dir / "equity.png", dpi=160)
         plt.close()
