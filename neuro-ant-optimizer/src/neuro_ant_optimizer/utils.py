@@ -38,6 +38,15 @@ def nearest_psd(cov: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     return 0.5 * (psd + psd.T)
 
 
+def shrink_covariance(cov: np.ndarray, delta: float = 0.1) -> np.ndarray:
+    """Simple Ledoit-Wolf-style diagonal shrinkage with optional clipping."""
+
+    delta = float(np.clip(delta, 0.0, 1.0))
+    d = np.diag(np.diag(cov))
+    shrunk = (1.0 - delta) * cov + delta * d
+    return 0.5 * (shrunk + shrunk.T)
+
+
 def safe_softmax(
     x: np.ndarray, axis: int = -1, mask: Optional[np.ndarray] = None
 ) -> np.ndarray:
