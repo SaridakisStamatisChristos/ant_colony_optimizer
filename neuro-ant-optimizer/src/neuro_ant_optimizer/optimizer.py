@@ -15,7 +15,7 @@ from .models import RiskAssessmentNetwork, PheromoneNetwork
 from .colony import Ant, AntColony
 from .constraints import PortfolioConstraints
 from .refine import refine_slsqp
-from .utils import nearest_psd, set_seed
+from .utils import nearest_psd, shrink_covariance, set_seed
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -48,6 +48,9 @@ class OptimizerConfig:
     device: str = "cpu"
     dtype: torch.dtype = torch.float32
     max_runtime: float = 2.0
+    use_shrinkage: bool = True
+    shrinkage_delta: float = 0.15
+    cvar_alpha: float = 0.05
 
     def __post_init__(self) -> None:
         if self.n_ants <= 0:
@@ -70,6 +73,10 @@ class OptimizerConfig:
             raise TypeError("dtype must be a torch.dtype instance")
         if self.max_runtime <= 0.0:
             raise ValueError("max_runtime must be positive")
+        if not (0.0 <= self.shrinkage_delta <= 1.0):
+            raise ValueError("shrinkage_delta must lie in [0, 1]")
+        if not (0.0 < self.cvar_alpha < 0.5):
+            raise ValueError("cvar_alpha must lie in (0, 0.5)")
 
     @classmethod
     def from_overrides(cls, overrides: Optional[Dict[str, Any]] = None) -> "OptimizerConfig":
@@ -104,6 +111,7 @@ class OptimizationObjective(Enum):
     MAX_RETURN = "max_return"
     MIN_VARIANCE = "min_variance"
     RISK_PARITY = "risk_parity"
+    MIN_CVAR = "min_cvar"
 
 
 class NeuroAntPortfolioOptimizer:
@@ -157,7 +165,10 @@ class NeuroAntPortfolioOptimizer:
         start_time = perf_counter()
 
         mu = np.asarray(returns, dtype=float).ravel()
-        cov = nearest_psd(np.asarray(covariance, dtype=float))
+        cov_raw = np.asarray(covariance, dtype=float)
+        if self.cfg.use_shrinkage:
+            cov_raw = shrink_covariance(cov_raw, delta=self.cfg.shrinkage_delta)
+        cov = nearest_psd(cov_raw)
         self._validate(mu, cov)
 
         sigma = np.sqrt(np.clip(np.diag(cov), 1e-18, None))
@@ -268,28 +279,24 @@ class NeuroAntPortfolioOptimizer:
         if not self._feasible(weights, constraints):
             return -1e9
 
-        portfolio_return = float(weights @ mu)
-        volatility = float(math.sqrt(max(weights @ cov @ weights, 0.0)))
-
-        if objective is OptimizationObjective.SHARPE_RATIO:
-            return (
-                (portfolio_return - self.cfg.risk_free) / volatility
-                if volatility > 1e-12
-                else -1e6
-            )
-        if objective is OptimizationObjective.MAX_RETURN:
-            return portfolio_return
-        if objective is OptimizationObjective.MIN_VARIANCE:
-            return -volatility
-        if objective is OptimizationObjective.RISK_PARITY:
-            contributions = self._risk_contrib(weights, cov)
-            total = contributions.sum()
+        if objective == OptimizationObjective.SHARPE_RATIO:
+            return self._sharpe(weights, mu, cov)
+        if objective == OptimizationObjective.MAX_RETURN:
+            return float(weights @ mu)
+        if objective == OptimizationObjective.MIN_VARIANCE:
+            return -float(math.sqrt(max(weights @ cov @ weights, 0.0)))
+        if objective == OptimizationObjective.RISK_PARITY:
+            rc = self._risk_contrib(weights, cov)
+            total = rc.sum()
             if total <= 0:
                 return -1e6
-            contributions /= total
-            equal = np.ones_like(contributions) / len(contributions)
-            return -float(np.linalg.norm(contributions - equal))
-        return -1e9
+            rc = rc / total
+            equal = np.ones_like(rc) / len(rc)
+            return -float(np.linalg.norm(rc - equal))
+        if objective == OptimizationObjective.MIN_CVAR:
+            cvar = self._cvar_normal(weights, mu, cov, self.cfg.cvar_alpha)
+            return -cvar
+        return self._sharpe(weights, mu, cov)
 
     def _apply_constraints(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
         clipped = np.clip(weights, constraints.min_weight, constraints.max_weight)
@@ -382,6 +389,25 @@ class NeuroAntPortfolioOptimizer:
         if volatility <= 1e-12:
             return 0.0
         return (float(weights @ mu) - self.cfg.risk_free) / volatility
+
+    def _cvar_normal(
+        self,
+        weights: np.ndarray,
+        mu: np.ndarray,
+        cov: np.ndarray,
+        alpha: float,
+    ) -> float:
+        from math import sqrt
+        from statistics import NormalDist
+
+        mean_loss = -float(weights @ mu)
+        variance = float(weights @ cov @ weights)
+        std_loss = sqrt(max(variance, 0.0))
+        alpha = float(np.clip(alpha, 1e-6, 0.5))
+        nd = NormalDist()
+        z = nd.inv_cdf(alpha)
+        phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+        return mean_loss + std_loss * (phi / alpha)
 
     def _validate(self, mu: np.ndarray, cov: np.ndarray) -> None:
         n = mu.shape[0]
