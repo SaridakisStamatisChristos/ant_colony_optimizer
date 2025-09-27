@@ -2,6 +2,13 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["neuro_ant_optimizer*"]
+
+[tool.setuptools.package-data]
+neuro_ant_optimizer = ["py.typed"]
+
 [project]
 name = "neuro-ant-optimizer"
 version = "0.3.0"
