@@ -18,6 +18,7 @@ class PortfolioConstraints:
     factor_targets: Optional[np.ndarray] = None
     factor_tolerance: float = 1e-6
     benchmark_weights: Optional[np.ndarray] = None
+    benchmark_mask: Optional[np.ndarray] = None
     min_active_weight: float = float("-inf")
     max_active_weight: float = float("inf")
     active_group_map: Optional[List[int]] = None

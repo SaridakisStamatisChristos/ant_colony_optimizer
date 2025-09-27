@@ -19,6 +19,8 @@ class _StubOptimizer:
         class _Result:
             def __init__(self, w: np.ndarray):
                 self.weights = w
+                self.feasible = True
+                self.projection_iterations = 0
 
         return _Result(self.weight)
 
@@ -66,3 +68,4 @@ def test_config_overrides_and_manifest(tmp_path: Path, monkeypatch) -> None:
     assert manifest["config_path"] == str(config_path)
     assert "package_version" in manifest
     assert "python_version" in manifest
+    assert "resolved_constraints" in manifest

@@ -100,10 +100,14 @@ class OptimizationResult:
     iteration_count: int
     risk_contributions: np.ndarray
     message: str
+    feasible: bool
+    projection_iterations: int
 
     def __post_init__(self) -> None:
         self.weights = np.asarray(self.weights, dtype=float)
         self.risk_contributions = np.asarray(self.risk_contributions, dtype=float)
+        self.feasible = bool(self.feasible)
+        self.projection_iterations = int(self.projection_iterations)
 
 
 @dataclass
@@ -168,6 +172,7 @@ class NeuroAntPortfolioOptimizer:
         self.history: List[Dict[str, float]] = []
         self.best_w: Optional[np.ndarray] = None
         self.best_score: float = -np.inf
+        self._last_projection_iterations: int = 0
 
     def optimize(
         self,
@@ -291,6 +296,8 @@ class NeuroAntPortfolioOptimizer:
                 break
 
         final_weights = self._apply_constraints(best_w, constraints)
+        feasible_flag = self._feasible(final_weights, constraints)
+        projection_steps = int(self._last_projection_iterations)
         elapsed = perf_counter() - start_time
 
         return OptimizationResult(
@@ -303,6 +310,8 @@ class NeuroAntPortfolioOptimizer:
             iteration_count=len(self.history),
             risk_contributions=self._risk_contrib(final_weights, cov),
             message=message,
+            feasible=feasible_flag,
+            projection_iterations=projection_steps,
         )
 
     # ---- internals ----
@@ -349,6 +358,7 @@ class NeuroAntPortfolioOptimizer:
     def _apply_constraints(self, weights: np.ndarray, constraints: PortfolioConstraints) -> np.ndarray:
         lower, upper, bench = self._compute_weight_bounds(constraints)
         clipped = np.clip(weights, lower, upper)
+        projection_iters = 0
 
         if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
             clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
@@ -374,6 +384,7 @@ class NeuroAntPortfolioOptimizer:
             and constraints.active_group_bounds
         ):
             for _ in range(5):
+                projection_iters += 1
                 clipped = self._enforce_active_groups(clipped, bench, constraints, lower, upper)
                 if constraints.equality_enforce and abs(constraints.leverage_limit - 1.0) < 1e-12:
                     clipped = self._project_sum_with_bounds(clipped, lower, upper, 1.0)
@@ -387,6 +398,7 @@ class NeuroAntPortfolioOptimizer:
 
         if constraints.factors_enabled() or constraints.factor_bounds_enabled():
             for _ in range(12):
+                projection_iters += 1
                 clipped = self._enforce_factor_constraints(clipped, constraints, lower, upper)
                 clipped = np.clip(clipped, lower, upper)
                 if self._factor_constraints_satisfied(clipped, constraints, tol=0.0):
@@ -395,7 +407,9 @@ class NeuroAntPortfolioOptimizer:
         if constraints.prev_weights is not None:
             clipped = self._enforce_turnover(clipped, constraints, lower, upper)
 
-        return np.clip(clipped, lower, upper)
+        adjusted = np.clip(clipped, lower, upper)
+        self._last_projection_iterations = projection_iters
+        return adjusted
 
     def _feasible(
         self, weights: np.ndarray, constraints: PortfolioConstraints, tol: float = 1e-8
@@ -480,11 +494,27 @@ class NeuroAntPortfolioOptimizer:
             bench = np.asarray(constraints.benchmark_weights, dtype=float).ravel()
             if bench.shape[0] != self.n_assets:
                 raise ValueError("benchmark_weights dimension mismatch")
-            bench_vec = bench
-            if np.isfinite(constraints.min_active_weight):
-                lower = np.maximum(lower, bench + float(constraints.min_active_weight))
-            if np.isfinite(constraints.max_active_weight):
-                upper = np.minimum(upper, bench + float(constraints.max_active_weight))
+            if constraints.benchmark_mask is not None:
+                mask = np.asarray(constraints.benchmark_mask, dtype=bool).ravel()
+                if mask.shape[0] != self.n_assets:
+                    raise ValueError("benchmark_mask dimension mismatch")
+            else:
+                mask = np.ones(self.n_assets, dtype=bool)
+            bench_vec = np.where(mask, bench, 0.0)
+            min_active = float(constraints.min_active_weight)
+            max_active = float(constraints.max_active_weight)
+            if np.isfinite(min_active):
+                lower = np.where(
+                    mask,
+                    np.maximum(lower, bench_vec + min_active),
+                    lower,
+                )
+            if np.isfinite(max_active):
+                upper = np.where(
+                    mask,
+                    np.minimum(upper, bench_vec + max_active),
+                    upper,
+                )
         else:
             bench_vec = None
         lower = np.minimum(lower, upper)
