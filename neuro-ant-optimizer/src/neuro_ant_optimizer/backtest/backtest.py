@@ -255,11 +255,13 @@ def _write_equity(equity_path: Path, results: Dict[str, Any]) -> None:
         frame.to_csv(equity_path, index=False)
         return
 
-    data = np.column_stack([
-        np.asarray(results["dates"], dtype=str),
-        np.asarray(results["equity"], dtype=float),
-        np.asarray(results["returns"], dtype=float),
-    ])
+    data = np.column_stack(
+        [
+            np.asarray(results["dates"], dtype=str),
+            np.asarray(results["equity"], dtype=float),
+            np.asarray(results["returns"], dtype=float),
+        ]
+    )
     header = "date,equity,ret"
     np.savetxt(equity_path, data, fmt="%s", delimiter=",", header=header, comments="")
 
@@ -301,18 +303,23 @@ def _read_csv(csv_path: Path):
         return pd.read_csv(csv_path, index_col=0, parse_dates=True)
 
     header_cols: Optional[List[str]] = None
+    # Peek the header row to capture asset names (and strip BOM/whitespace)
     with csv_path.open("r", encoding="utf-8", newline="") as fh:
         reader = csv.reader(fh)
         try:
             header_row = next(reader)
         except StopIteration:
             header_row = []
+
     if header_row:
         if header_row[0]:
-            header_row[0] = header_row[0].lstrip("\ufeff")
+            # strip UTF-8 BOM and whitespace from the first header cell (date column)
+            header_row[0] = header_row[0].lstrip("\ufeff").strip()
+        # collect asset column names (strip whitespace)
         extracted = [col.strip() for col in header_row[1:]]
-        header_cols = extracted if any(name for name in extracted) else None
+        header_cols = extracted if any(extracted) else None
 
+    # Load the data block (all rows except header)
     raw = np.genfromtxt(csv_path, delimiter=",", skip_header=1, dtype=str)
     if raw.size == 0:
         values = np.empty((0, 0), dtype=float)
@@ -322,6 +329,7 @@ def _read_csv(csv_path: Path):
         dates = raw[:, 0]
         values = raw[:, 1:].astype(float)
 
+    # If header count doesn't match parsed columns, synthesize names
     if header_cols and values.size and values.shape[1] != len(header_cols):
         header_cols = [f"w{i}" for i in range(values.shape[1])]
 
