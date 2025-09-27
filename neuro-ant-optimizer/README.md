@@ -57,8 +57,10 @@ CLI backtest
 Install optional deps then run:
 
 python -m pip install "neuro-ant-optimizer[backtest]"
-neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 \
-  --objective sharpe --out bt_out --save-weights --tx-cost-bps 5 --tx-cost-mode upfront
+neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 \
+  --objective sharpe --cov-model lw --out bt_out \
+  --save-weights --tx-cost-bps 5 --tx-cost-mode upfront
+# --cov-model: sample | ewma (use --ewma_span) | lw | oas
 # tx-cost-mode: upfront | amortized | posthoc | none
 # writes metrics.csv (incl. sortino, cvar), equity.csv, equity_net_of_tc.csv (if posthoc), and weights.csv
 Behavior summary

@@ -717,6 +717,17 @@ def backtest(
         raise ValueError(
             f"Unknown cov_model '{cov_model}' (choose from {sorted(_COV_MODELS)})"
         )
+    if cov_model != "ewma":
+        ewma_span = None
+    else:
+        if ewma_span is None:
+            ewma_span = 60
+        try:
+            ewma_span = int(ewma_span)
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+            raise ValueError("ewma_span must be an integer") from exc
+        if ewma_span < 2:
+            raise ValueError("ewma_span must be >= 2")
 
     returns = _frame_to_numpy(df)
     if returns.size == 0:
@@ -813,7 +824,8 @@ def backtest(
     net_slip_returns: List[float] = []
     rebalance_records: List[Dict[str, Any]] = []
     benchmark_realized: List[float] = []
-    cov_cache: "OrderedDict[bytes, np.ndarray]" = OrderedDict()
+    # include model + params in the cache key to avoid collisions across models/spans
+    cov_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 
     for start in range(lookback, n_periods, step):
         end = min(start + step, n_periods)
@@ -836,29 +848,40 @@ def backtest(
                 variance=max(variance, 0.0),
                 cov_vector=cov_vector,
             )
-        if cov_model == "ewma":
-            span = int(ewma_span if ewma_span is not None else 60)
-            cov_raw = ewma_cov(train, span=span)
-        elif cov_model == "lw":
-            cov_raw = _lw_cov(train)
-        elif cov_model == "oas":
-            cov_raw = _oas_cov(train)
-        else:
-            cov_raw = _sample_cov(train)
-        if optimizer.cfg.use_shrinkage:
-            cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
-        cov_key: Optional[bytes] = None
+        mean_signature = float(np.mean(train).round(12))
+        span = ewma_span if cov_model == "ewma" and ewma_span is not None else None
+        cov_key: Optional[Tuple[Any, ...]] = None
         cov: Optional[np.ndarray] = None
         if cov_model == "ewma":
-            cov_key = cov_raw.tobytes()
+            assert span is not None  # validated above
+            cov_key = ("ewma", span, train.shape, mean_signature)
+        elif cov_model == "lw":
+            cov_key = ("lw", train.shape, mean_signature)
+        elif cov_model == "oas":
+            cov_key = ("oas", train.shape, mean_signature)
+        else:
+            cov_key = ("sample", train.shape, mean_signature)
+        if cov_key is not None:
             cached_cov = cov_cache.get(cov_key)
             if cached_cov is not None:
                 cov = cached_cov
         if cov is None:
+            if cov_model == "ewma":
+                assert span is not None
+                cov_raw = ewma_cov(train, span=span)
+            elif cov_model == "lw":
+                cov_raw = _lw_cov(train)
+            elif cov_model == "oas":
+                cov_raw = _oas_cov(train)
+            else:
+                cov_raw = _sample_cov(train)
+            if optimizer.cfg.use_shrinkage:
+                cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
             cov = nearest_psd(cov_raw)
             if cov_key is not None:
+                # keep a small LRU; 8 is plenty for rolling windows
                 cov_cache[cov_key] = cov.copy()
-                while len(cov_cache) > 4:
+                while len(cov_cache) > 8:
                     cov_cache.popitem(last=False)
         active_factors = False
         current_factor_snapshot: Optional[np.ndarray] = None
