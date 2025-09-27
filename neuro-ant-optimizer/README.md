@@ -53,17 +53,43 @@ print("Sharpe:", res.sharpe_ratio, "Vol:", res.volatility)
 Install optional deps then run:
 ```bash
 python -m pip install "neuro-ant-optimizer[backtest]"
-neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 --objective sharpe --out bt_out --save-weights
+neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 --ewma_span 60 \
+  --objective sharpe --out bt_out --save-weights --tx-cost-bps 5 --tx-cost-mode upfront
+# tx-cost-mode: upfront | amortized | posthoc | none
+# writes metrics.csv (incl. sortino, cvar), equity.csv, equity_net_of_tc.csv (if posthoc), and weights.csv
 ```
+Behavior summary
+
+--tx-cost-mode upfront → costs applied inside the loop on the first day of each block.
+
+--tx-cost-mode amortized → costs applied inside the loop evenly across the block.
+
+--tx-cost-mode posthoc → no costs during loop; after the run, we create equity_net_of_tc.csv with amortized costs.
+
+--tx-cost-mode none → no costs at all.
+
 Outputs `metrics.csv`, `equity.csv`, and (if matplotlib is present) `equity.png`.
+
+## Testing
+From the repository root:
+
+```bash
+pytest -q
+```
+
+The test harness in `tests/conftest.py` automatically adds `neuro-ant-optimizer/src`
+to `sys.path`, so no manual `PYTHONPATH` configuration or editable install is required.
+
 ## Offline usage (no install)
 If your environment blocks package downloads:
 ```bash
-# Run the CLI module directly via PYTHONPATH
-PYTHONPATH=neuro-ant-optimizer/src \
+# Run the CLI module directly from the repo checkout
 python -m neuro_ant_optimizer.backtest \
   --csv neuro-ant-optimizer/backtest/sample_returns.csv \
   --lookback 5 --step 2 --ewma_span 3 --objective sharpe --out neuro-ant-optimizer/backtest/out_local
+# The repo includes a lightweight shim (neuro_ant_optimizer/__init__.py) that
+# delegates to src/neuro_ant_optimizer so no PYTHONPATH edits are needed.
+# This shim is dev-only; wheels/sdists still only include src/neuro_ant_optimizer.
 ```
 
 ## Offline wheel build & install

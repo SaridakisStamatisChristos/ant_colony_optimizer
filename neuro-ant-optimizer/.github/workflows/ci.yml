@@ -22,8 +22,6 @@ jobs:
           # optional extras for CLI smoke
           pip install pandas matplotlib
       - name: Run tests
-        env:
-          PYTHONPATH: neuro-ant-optimizer/src
         run: pytest -q
       - name: Ruff (lint)
         run: |
