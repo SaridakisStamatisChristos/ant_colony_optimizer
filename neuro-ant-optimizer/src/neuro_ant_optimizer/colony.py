@@ -30,11 +30,7 @@ class Ant:
         trans = pheromone_net.transition_matrix().detach().cpu().numpy()
         risk = np.ones(n, dtype=float)
         if risk_net is not None:
-            I = torch.eye(
-                n,
-                device=getattr(risk_net, "_device", torch.device("cpu")),
-                dtype=getattr(risk_net, "_dtype", torch.float32),
-            )
+            I = torch.eye(n, device=risk_net.param_device, dtype=risk_net.param_dtype)
             r = risk_net(I).detach().cpu().numpy()
             risk = np.clip(np.diag(r), 1e-6, None)
         self.visited = [int(np.random.randint(0, n))]
