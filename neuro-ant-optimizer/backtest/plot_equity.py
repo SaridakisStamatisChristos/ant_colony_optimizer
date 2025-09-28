@@ -42,12 +42,18 @@ def main(argv: Iterable[str] | None = None) -> None:
         "--out",
         type=str,
         default=None,
-        help="Destination PNG path (defaults to <dir>/equity_overlay.png)",
+        help="Destination PNG path (defaults based on plot type)",
     )
     parser.add_argument(
         "--overlay",
         action="store_true",
         help="Overlay gross, net-of-tx, and net-of-slippage curves when available",
+    )
+    parser.add_argument(
+        "--plot",
+        choices=["equity", "drawdown"],
+        default="equity",
+        help="Plot equity curves or drawdown",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -57,6 +63,36 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     base_path = out_dir / "equity.csv"
     dates, gross_curve = _load_equity(base_path)
+
+    if args.plot == "drawdown":
+        if gross_curve.size == 0:
+            raise ValueError("Equity series is empty; cannot plot drawdown")
+        running_peak = np.maximum.accumulate(gross_curve)
+        drawdown = 1.0 - np.divide(
+            gross_curve,
+            running_peak,
+            out=np.ones_like(gross_curve),
+            where=running_peak > 0,
+        )
+        try:  # pragma: no cover - plotting dependency
+            import matplotlib.pyplot as plt
+
+            plt.figure()
+            plt.plot(dates, drawdown, label="drawdown")
+            plt.xlabel("Date")
+            plt.ylabel("Drawdown")
+            plt.title("Equity Drawdown")
+            if plt.gca().has_data():
+                plt.legend()
+            plt.tight_layout()
+            out_path = Path(args.out) if args.out else out_dir / "drawdown.png"
+            plt.savefig(out_path, dpi=160)
+            plt.close()
+            print(f"Saved {out_path}")
+        except ModuleNotFoundError as exc:  # pragma: no cover - minimal envs
+            raise RuntimeError("matplotlib is required for plotting") from exc
+        return
+
     overlays: List[Tuple[str, np.ndarray]] = [("gross", gross_curve)]
 
     if args.overlay:

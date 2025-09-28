@@ -4,7 +4,7 @@ from enum import Enum
 import logging
 import math
 from time import perf_counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np, torch
 import torch.nn as nn
@@ -166,6 +166,13 @@ class OptimizationObjective(Enum):
     MULTI_TERM = "multi_term"
 
 
+ObjectiveFn = Callable[
+    [np.ndarray, np.ndarray, np.ndarray, PortfolioConstraints, Optional[BenchmarkStats]],
+    float,
+]
+ObjectiveSpec = Union[OptimizationObjective, ObjectiveFn]
+
+
 class NeuroAntPortfolioOptimizer:
     """Hybrid ant-colony optimizer with neural pheromone and risk models."""
 
@@ -209,7 +216,7 @@ class NeuroAntPortfolioOptimizer:
         returns: np.ndarray,
         covariance: np.ndarray,
         constraints: PortfolioConstraints,
-        objective: OptimizationObjective = OptimizationObjective.SHARPE_RATIO,
+        objective: ObjectiveSpec = OptimizationObjective.SHARPE_RATIO,
         refine: bool = True,
         benchmark: Optional[BenchmarkStats] = None,
     ) -> OptimizationResult:
@@ -354,13 +361,28 @@ class NeuroAntPortfolioOptimizer:
         weights: np.ndarray,
         mu: np.ndarray,
         cov: np.ndarray,
-        objective: OptimizationObjective,
+        objective: ObjectiveSpec,
         constraints: PortfolioConstraints,
         benchmark: Optional[BenchmarkStats] = None,
         workspace: Optional[ConstraintWorkspace] = None,
     ) -> float:
         if not self._feasible(weights, constraints, workspace=workspace):
             return -1e9
+
+        if callable(objective):
+            try:
+                return float(
+                    objective(
+                        weights,
+                        mu,
+                        cov,
+                        constraints,
+                        benchmark,
+                        workspace=workspace,
+                    )
+                )
+            except TypeError:
+                return float(objective(weights, mu, cov, constraints, benchmark))
 
         if objective == OptimizationObjective.SHARPE_RATIO:
             return self._sharpe(weights, mu, cov)
@@ -1008,7 +1030,7 @@ class NeuroAntPortfolioOptimizer:
         scores: List[float],
         mu: np.ndarray,
         cov: np.ndarray,
-        objective: OptimizationObjective,
+        objective: ObjectiveSpec,
         constraints: PortfolioConstraints,
         benchmark: Optional[BenchmarkStats] = None,
         workspace: Optional[ConstraintWorkspace] = None,

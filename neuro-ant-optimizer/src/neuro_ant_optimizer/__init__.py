@@ -16,7 +16,7 @@ from .optimizer import (
     OptimizationResult,
     OptimizerConfig,
 )
-from .backtest.backtest import ewma_cov
+from .backtest.backtest import ewma_cov, register_cov_model, register_objective
 
 __all__ = [
     "NeuroAntPortfolioOptimizer",
@@ -27,4 +27,6 @@ __all__ = [
     "BenchmarkStats",
     "__version__",
     "ewma_cov",
+    "register_objective",
+    "register_cov_model",
 ]
