@@ -6,14 +6,17 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 include = ["neuro_ant_optimizer*"]
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.package-data]
-neuro_ant_optimizer = ["py.typed"]
+neuro_ant_optimizer = ["py.typed", "examples/configs/*.yaml"]
 
 [project]
 name = "neuro-ant-optimizer"
-version = "0.3.0"
+version = "0.4.0"
 description = "Neural-guided Ant Colony Portfolio Optimizer with robust constraints"
-readme = "README.md"
+readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "MIT"}
 authors = [{name="Quantitative Research Team"}]
 requires-python = ">=3.9"
@@ -22,6 +25,23 @@ dependencies = [
   "torch>=2.0",
   "scipy>=1.10",
 ]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Financial and Insurance Industry",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.urls]
+Documentation = "https://github.com/quantresearch/neuro-ant-optimizer"
+Source = "https://github.com/quantresearch/neuro-ant-optimizer"
 
 [project.optional-dependencies]
 dev = [
@@ -30,8 +50,10 @@ dev = [
   "ruff>=0.5.0",
   "mypy>=1.10",
   "pre-commit>=3.7",
+  "mkdocs>=1.5",
 ]
 backtest = ["pandas>=2.0", "matplotlib>=3.7", "pydantic>=2.7"]
+docs = ["mkdocs>=1.5"]
 
 [project.scripts]
 neuro-ant-backtest = "neuro_ant_optimizer.backtest.backtest:main"

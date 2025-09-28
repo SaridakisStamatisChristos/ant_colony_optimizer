@@ -2,6 +2,7 @@ import argparse, time
 import numpy as np
 from pathlib import Path
 
+from neuro_ant_optimizer.constraints import PortfolioConstraints
 from neuro_ant_optimizer.optimizer import (
     NeuroAntPortfolioOptimizer,
     OptimizerConfig,
@@ -34,20 +35,16 @@ def run_once(mu, cov, obj, seed=42, alpha=0.05):
         cvar_alpha=alpha,
     )
     opt = NeuroAntPortfolioOptimizer(n, cfg)
-    constraints = type(
-        "C",
-        (),
-        dict(
-            min_weight=0.0,
-            max_weight=1.0,
-            equality_enforce=True,
-            leverage_limit=1.0,
-            sector_map=None,
-            max_sector_concentration=1.0,
-            prev_weights=None,
-            max_turnover=1.0,
-        ),
-    )()
+    constraints = PortfolioConstraints(
+        min_weight=0.0,
+        max_weight=1.0,
+        equality_enforce=True,
+        leverage_limit=1.0,
+        sector_map=None,
+        max_sector_concentration=1.0,
+        prev_weights=None,
+        max_turnover=1.0,
+    )
     t0 = time.perf_counter()
     res = opt.optimize(mu, cov, constraints, objective=obj)
     dt = time.perf_counter() - t0

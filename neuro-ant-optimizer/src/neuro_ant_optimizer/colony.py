@@ -13,6 +13,8 @@ class Ant:
         self.n_assets = n_assets
         self.visited: List[int] = []
         self.w: np.ndarray | None = None
+        self._mask = np.ones(n_assets, dtype=bool)
+        self._weights = np.zeros(n_assets, dtype=float)
 
     def build(
         self,
@@ -21,6 +23,8 @@ class Ant:
         alpha: float,
         beta: float,
         trans_matrix: np.ndarray | None = None,
+        trans_log: np.ndarray | None = None,
+        risk_bias: np.ndarray | None = None,
         rng: np.random.Generator | None = None,
         initial: int | None = None,
     ) -> np.ndarray:
@@ -43,26 +47,40 @@ class Ant:
                 )
         else:
             trans = trans_matrix
-        risk = np.ones(n, dtype=float)
-        if risk_net is not None:
-            I = torch.eye(n, device=risk_net.param_device, dtype=risk_net.param_dtype)
-            r = risk_net(I).detach().cpu().numpy()
-            risk = np.clip(np.diag(r), 1e-6, None)
+
+        if trans_log is None:
+            trans_log = np.log(np.clip(trans, 1e-12, None)) * float(alpha)
+        else:
+            trans_log = np.asarray(trans_log, dtype=float)
+
+        if risk_bias is None:
+            if risk_net is not None and beta:
+                I = torch.eye(
+                    n, device=risk_net.param_device, dtype=risk_net.param_dtype
+                )
+                r = risk_net(I).detach().cpu().numpy()
+                risk = np.clip(np.diag(r), 1e-6, None)
+                risk_bias = np.log(risk) * float(beta)
+            else:
+                risk_bias = np.zeros(n, dtype=float)
         start = int(initial) if initial is not None else int(rng.integers(0, n))
         self.visited = [start]
+        mask = self._mask
+        mask[:] = True
+        mask[start] = False
+        bias = np.asarray(risk_bias, dtype=float)
         while len(self.visited) < n:
             cur = self.visited[-1]
-            mask = np.ones(n, dtype=bool)
-            mask[self.visited] = False
-            logits = np.log(np.clip(trans[cur], 1e-12, None)) * float(alpha) + np.log(
-                risk
-            ) * float(beta)
+            logits = trans_log[cur] + bias
             p = safe_softmax(logits, axis=-1, mask=mask)
             nxt = int(rng.choice(n, p=p))
             self.visited.append(nxt)
-        w = np.zeros(n, dtype=float)
+            mask[nxt] = False
+        w = self._weights
+        w.fill(0.0)
         w[self.visited] = 1.0 / n
         self.w = w
+        mask[self.visited] = True
         return w
 
 

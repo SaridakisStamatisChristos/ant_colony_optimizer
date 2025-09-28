@@ -45,6 +45,31 @@ print("Sharpe:", res.sharpe_ratio, "Vol:", res.volatility)
 
 ---
 
+## Documentation
+
+Full documentation lives under `docs/` (served via [MkDocs](https://www.mkdocs.org/)). Build it locally with:
+
+```bash
+python -m pip install mkdocs
+mkdocs serve
+```
+
+The site covers a complete flag reference, artifact schemas, and reproducibility guidance. The published structure mirrors the packaged examples (see `neuro_ant_optimizer.examples.iter_configs()` for programmatic access).
+
+---
+
+## Performance benchmark
+
+To reproduce the internal performance spot-check, run the synthetic benchmark script against the optimized ant loop:
+
+```bash
+PYTHONPATH=src python bench/bench.py --n 60 --seed 7 --alpha 0.05
+```
+
+On the sample workload, the optimized loop (batched risk net + cached PSD repair) now completes in **1.92 s** for the Sharpe objective and **1.31 s** for the CVaR objective, down from the previous 2.19 s / 2.12 s runs (≈12% / 23% wall-clock reduction). The benchmark writes `bench/bench_results.csv` so you can diff the timings across revisions.
+
+---
+
 ## Objectives
 
 * **SHARPE_RATIO** (default)

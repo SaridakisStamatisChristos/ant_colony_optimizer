@@ -1,0 +1,21 @@
+# Factor exposure bounds with soft vs. hard enforcement via tolerance
+csv: data/returns.csv
+factors: data/factors.csv
+benchmark_csv: data/benchmark.csv
+lookback: 252
+step: 21
+objective: sharpe
+cov_model: lw
+factor_bounds:
+  value:
+    bounds: [-0.15, 0.15]
+  momentum:
+    lower: -0.05
+    upper: 0.05
+  quality:
+    bounds: [-0.1, 0.1]
+# factor_tolerance governs slack: tighten to ~1e-8 for hard caps, relax to 1e-4 for soft caps
+factor_tolerance: 1e-5
+refine_every: 2
+seed: 13
+out: runs/factor_bounds

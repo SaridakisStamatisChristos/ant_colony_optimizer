@@ -246,6 +246,9 @@ class NeuroAntPortfolioOptimizer:
         converged = False
         message = "OK"
 
+        alpha = 1.0
+        beta = float(self.cfg.risk_weight)
+
         for iteration in range(self.cfg.max_iter):
             ants = [Ant(self.n_assets) for _ in range(self.cfg.n_ants)]
             # Cache transition matrix once for this iteration
@@ -256,6 +259,23 @@ class NeuroAntPortfolioOptimizer:
                     .cpu()
                     .numpy()
                 )
+            trans_log = np.log(np.clip(cached_T, 1e-12, None)) * float(alpha)
+            if self.risk_net is not None and beta:
+                with torch.no_grad():
+                    identity = torch.eye(
+                        self.n_assets,
+                        device=self.risk_net.param_device,
+                        dtype=self.risk_net.param_dtype,
+                    )
+                    diag = (
+                        torch.diagonal(self.risk_net(identity), dim1=-2, dim2=-1)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                risk_bias = np.log(np.clip(diag, 1e-6, None)) * beta
+            else:
+                risk_bias = np.zeros(self.n_assets, dtype=float)
             portfolios: List[np.ndarray] = []
             scores: List[float] = []
 
@@ -264,9 +284,11 @@ class NeuroAntPortfolioOptimizer:
                 weights = ant.build(
                     self.phero_net,
                     self.risk_net,
-                    alpha=1.0,
-                    beta=self.cfg.risk_weight,
+                    alpha=alpha,
+                    beta=beta,
                     trans_matrix=cached_T,
+                    trans_log=trans_log,
+                    risk_bias=risk_bias,
                     rng=rng,
                     initial=int(start_node),
                 )

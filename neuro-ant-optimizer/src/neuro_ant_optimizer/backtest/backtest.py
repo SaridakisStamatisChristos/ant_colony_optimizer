@@ -8,7 +8,7 @@ import importlib
 import itertools
 import hashlib
 import json
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -695,6 +695,8 @@ if _PYDANTIC_AVAILABLE:
         save_weights: bool = False
         skip_plot: bool = False
         dry_run: bool = False
+        deterministic: bool = False
+        drop_duplicates: bool = False
         float32: bool = False
         cache_cov: int = Field(ge=0, default=8)
         max_workers: Optional[int] = Field(default=None, ge=1)
@@ -761,6 +763,8 @@ else:
             "save_weights": False,
             "skip_plot": False,
             "dry_run": False,
+            "deterministic": False,
+            "drop_duplicates": False,
             "float32": False,
             "cache_cov": 8,
             "max_workers": None,
@@ -1457,6 +1461,7 @@ def _write_run_manifest(
         "python_version": sys.version,
         "validated": bool(validated),
     }
+    manifest["deterministic_torch"] = bool(getattr(args, "deterministic", False))
     if config_path is not None:
         manifest["config_path"] = str(config_path)
     if extras:
@@ -2083,6 +2088,73 @@ def _frame_index(frame: Any, length: int) -> List[Any]:
     return list(range(length))
 
 
+def _normalize_index(
+    dates: Sequence[Any], *, drop_duplicates: bool, label: str
+) -> Tuple[List[Any], np.ndarray]:
+    values = list(dates)
+    keep_mask = np.ones(len(values), dtype=bool)
+    if not values:
+        return [], keep_mask
+
+    counts = Counter(values)
+    duplicates = [val for val, count in counts.items() if count > 1]
+    if duplicates:
+        if not drop_duplicates:
+            offenders = ", ".join(_stringify(val) for val in duplicates[:5])
+            suffix = "" if len(duplicates) <= 5 else ", ..."
+            raise ValueError(
+                f"{label} contains duplicate dates ({offenders}{suffix}). "
+                "Pass --drop-duplicates to keep the last occurrence."
+            )
+        last_seen: Dict[Any, int] = {}
+        for idx, val in enumerate(values):
+            prev = last_seen.get(val)
+            if prev is not None:
+                keep_mask[prev] = False
+            last_seen[val] = idx
+        values = [val for idx, val in enumerate(values) if keep_mask[idx]]
+
+    arr = np.asarray(values)
+    if arr.size > 1:
+        try:
+            non_increasing = np.asarray(arr[1:] <= arr[:-1], dtype=bool)
+        except TypeError:
+            non_increasing = np.array(
+                [values[i + 1] <= values[i] for i in range(len(values) - 1)],
+                dtype=bool,
+            )
+        if np.any(non_increasing):
+            bad_idx = int(np.where(non_increasing)[0][0])
+            before = _stringify(values[bad_idx])
+            after = _stringify(values[bad_idx + 1])
+            raise ValueError(
+                f"{label} must be strictly increasing (saw {after} <= {before})."
+            )
+
+    return values, keep_mask
+
+
+def _sanitize_frame(
+    frame: Any,
+    *,
+    drop_duplicates: bool,
+    label: str,
+) -> Tuple[Any, np.ndarray, List[Any]]:
+    arr = _frame_to_numpy(frame)
+    arr = np.atleast_2d(arr)
+    dates = _frame_index(frame, arr.shape[0])
+    normalized, keep_mask = _normalize_index(
+        dates, drop_duplicates=drop_duplicates, label=label
+    )
+    if keep_mask.size and not np.all(keep_mask):
+        if hasattr(frame, "iloc"):
+            frame = frame.iloc[np.nonzero(keep_mask)[0]]
+        elif hasattr(frame, "filter_rows"):
+            frame = frame.filter_rows(keep_mask)
+        arr = arr[keep_mask]
+    return frame, arr, normalized
+
+
 def validate_factor_panel(
     panel: FactorPanel,
     returns_frame: Any,
@@ -2289,6 +2361,8 @@ def backtest(
     warm_start: Optional[Any] = None,
     warm_align: str = "last_row",
     decay: float = 0.0,
+    drop_duplicates: bool = False,
+    deterministic: bool = False,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -2349,17 +2423,22 @@ def backtest(
     max_workers_value = None if max_workers is None else int(max_workers)
     if max_workers_value is not None and max_workers_value <= 0:
         raise ValueError("max_workers must be positive when provided")
-    returns = _frame_to_numpy(df, float_dtype)
+
+    df, returns_arr, dates = _sanitize_frame(
+        df, drop_duplicates=drop_duplicates, label="returns"
+    )
+    returns = returns_arr.astype(float_dtype)
     if returns.size == 0:
         raise ValueError("input dataframe must contain returns")
 
-    set_seed(seed)
+    set_seed(seed, deterministic_torch=True, strict=deterministic)
     n_periods, n_assets = returns.shape
-    dates = _frame_index(df, n_periods)
     benchmark_series: Optional[np.ndarray] = None
     if benchmark is not None:
-        bench_values = _frame_to_numpy(benchmark, float_dtype)
-        bench_values = np.asarray(bench_values, dtype=float_dtype)
+        benchmark, bench_values_raw, bench_dates = _sanitize_frame(
+            benchmark, drop_duplicates=drop_duplicates, label="benchmark"
+        )
+        bench_values = np.asarray(bench_values_raw, dtype=float_dtype)
         if bench_values.ndim > 2:
             raise ValueError("Benchmark series must be one or two dimensional")
         if bench_values.ndim == 2:
@@ -2371,6 +2450,10 @@ def backtest(
         benchmark_series = np.asarray(bench_values, dtype=float_dtype).reshape(-1)
         if benchmark_series.size != n_periods:
             raise ValueError("Benchmark length must match returns length")
+        if list(bench_dates) != list(dates):
+            raise ValueError(
+                "Benchmark index must match returns index after duplicate handling"
+            )
 
     objective_needs_benchmark = (
         isinstance(objective_spec, OptimizationObjective)
@@ -3508,6 +3591,11 @@ def _read_csv(csv_path: Path):
         def columns(self):
             return self._cols
 
+        def filter_rows(self, mask: np.ndarray) -> "_Frame":
+            mask = np.asarray(mask, dtype=bool)
+            indices = [self._idx[i] for i in np.nonzero(mask)[0]]
+            return _Frame(self._arr[mask], indices, self._cols)
+
     return _Frame(values, dates, header_cols)
 
 
@@ -3714,6 +3802,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use float32 for all numpy computations",
     )
     parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enforce torch deterministic algorithms (errors if unavailable)",
+    )
+    parser.add_argument(
         "--cache-cov",
         type=int,
         default=8,
@@ -3794,6 +3887,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate inputs and configuration without writing backtest artifacts",
+    )
+    parser.add_argument(
+        "--drop-duplicates",
+        action="store_true",
+        help="Drop duplicate dates from returns/benchmark instead of raising",
     )
     parser.add_argument(
         "--tx-cost-bps",
@@ -3893,6 +3991,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
 
     float_dtype = np.float32 if parsed.float32 else np.float64
     df = _read_csv(Path(parsed.csv))
+    df, returns_preview, date_index = _sanitize_frame(
+        df, drop_duplicates=parsed.drop_duplicates, label="returns"
+    )
     benchmark_df = _read_csv(Path(parsed.benchmark_csv)) if parsed.benchmark_csv else None
     factor_panel = load_factor_panel(Path(parsed.factors)) if parsed.factors else None
     slippage_cfg = parse_slippage(parsed.slippage)
@@ -3907,10 +4008,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     factor_bounds_spec = parsed.factor_bounds or None
 
     tx_cost_bps = float(parsed.tx_cost_bps) if parsed.tx_cost_mode != "none" else 0.0
-    returns_arr_for_baseline = _frame_to_numpy(df, float_dtype)
-    returns_arr_for_baseline = np.atleast_2d(returns_arr_for_baseline)
+    returns_arr_for_baseline = np.atleast_2d(returns_preview.astype(float_dtype))
     asset_names_for_baseline = _extract_asset_names(df, returns_arr_for_baseline.shape[1])
-    all_dates = _frame_index(df, returns_arr_for_baseline.shape[0])
+    all_dates = list(date_index)
 
     if parsed.baseline == "cap" and not parsed.cap_weights:
         raise ValueError("--cap-weights must be supplied when --baseline=cap")
@@ -3973,6 +4073,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             warm_start=parsed.warm_start,
             warm_align=parsed.warm_align,
             decay=parsed.decay,
+            drop_duplicates=parsed.drop_duplicates,
+            deterministic=parsed.deterministic,
         )
     finally:
         if progress_printer is not None:
