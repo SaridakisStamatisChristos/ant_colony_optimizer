@@ -60,7 +60,8 @@ python -m pip install "neuro-ant-optimizer[backtest]"
 neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 \
   --objective sharpe --cov-model lw --out bt_out \
   --save-weights --tx-cost-bps 5 --tx-cost-mode upfront \
-  --factor-align strict --factors path/to/factors.csv
+  --factor-align strict --factors path/to/factors.csv \
+  --rf-bps 25 --trading-days 260
 # --cov-model: sample | ewma (use --ewma_span) | lw | oas
 # tx-cost-mode: upfront | amortized | posthoc | none
 # factor-align: strict (require coverage) | subset (allow missing windows)
@@ -68,6 +69,11 @@ neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 \
 # pass --skip-plot to avoid importing matplotlib when running headless
 # writes metrics.csv (incl. sortino, cvar), equity.csv, equity_net_of_tc.csv (if posthoc),
 # factor_diagnostics.json, factor_constraints.csv (when factors are provided) and weights.csv
+
+`--rf-bps` sets the annualized risk-free rate (in basis points) used when reporting Sharpe,
+Sortino, and information ratios. `--trading-days` controls the number of periods per year
+used to annualize returns and tracking error; adjust it if you are working with non-daily
+data.
 Behavior summary
 
 --tx-cost-mode upfront → costs applied inside the loop on the first day of each block.
@@ -79,6 +85,35 @@ Behavior summary
 --tx-cost-mode none → no costs at all.
 
 Outputs metrics.csv, equity.csv, factor_diagnostics.json and (if matplotlib is present) equity.png.
+
+### Verifying CLI outputs
+
+The CLI writes every artifact into the directory passed via `--out`. After a run, list
+the folder to confirm `rebalance_report.csv` and the other CSVs were written:
+
+```
+ls -l /tmp/te
+```
+
+Common files include:
+
+* `metrics.csv` — summary Sharpe (net of the configured risk-free rate), drawdown, turnover, etc.
+* `equity.csv` — gross equity curve
+* `equity_net_of_tc.csv` — equity net of transaction costs (when `tx_cost_mode=posthoc`)
+* `rebalance_report.csv` — per-block turnover, costs, realized returns, and block-level Sharpe/Sortino/IR diagnostics
+* `run_config.json` — CLI arguments, resolved constraints, and package metadata
+
+Preview the contents with `head` to make sure data was recorded:
+
+```
+head -n 5 /tmp/te/rebalance_report.csv
+head -n 20 /tmp/te/metrics.csv
+```
+
+If the rebalance report is missing after a successful run, the most common reason is that
+no rebalances were executed (e.g., the dataset is shorter than the `--lookback` window).
+Decrease the lookback or supply a longer history so the optimizer can evaluate at least
+one block.
 
 ## Factor inputs
 

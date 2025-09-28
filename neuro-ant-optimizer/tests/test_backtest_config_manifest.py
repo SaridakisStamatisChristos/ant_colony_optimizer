@@ -55,7 +55,9 @@ def test_config_overrides_and_manifest(tmp_path: Path, monkeypatch) -> None:
     )
 
     stub = _StubOptimizer(np.array([0.6, 0.4], dtype=float))
-    monkeypatch.setattr(bt, "_build_optimizer", lambda n_assets, seed: stub)
+    monkeypatch.setattr(
+        bt, "_build_optimizer", lambda n_assets, seed, risk_free_rate=0.0: stub
+    )
 
     bt.main(["--config", str(config_path), "--lookback", "5"])
 

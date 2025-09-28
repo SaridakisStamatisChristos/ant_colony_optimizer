@@ -3,6 +3,8 @@ from __future__ import annotations
 from importlib import import_module
 from pathlib import Path
 
+import math
+
 import numpy as np
 import pytest
 
@@ -76,7 +78,9 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         np.array([0.7, 0.3], dtype=float),
     ]
     stub = _StubOptimizer(weights_seq)
-    monkeypatch.setattr(bt, "_build_optimizer", lambda n_assets, seed: stub)
+    monkeypatch.setattr(
+        bt, "_build_optimizer", lambda n_assets, seed, risk_free_rate=0.0: stub
+    )
 
     results = bt.backtest(
         frame,
@@ -116,6 +120,23 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         assert record["first_violation"] is None
         assert record["feasible"] is True
         assert record["projection_iterations"] == 0
+        block_returns = block @ w
+        ann_factor = math.sqrt(252)
+        block_mean = float(block_returns.mean())
+        block_std = float(block_returns.std())
+        expected_block_sharpe = 0.0
+        if block_std > 1e-12:
+            expected_block_sharpe = float((block_mean * 252) / (block_std * ann_factor))
+        downside = block_returns[block_returns < 0]
+        expected_block_sortino = 0.0
+        if downside.size:
+            downside_vol = float(downside.std() * ann_factor)
+            if downside_vol > 1e-12:
+                expected_block_sortino = float((block_mean * 252) / downside_vol)
+        assert record["block_sharpe"] == pytest.approx(expected_block_sharpe)
+        assert record["block_sortino"] == pytest.approx(expected_block_sortino)
+        assert record["block_info_ratio"] is None
+        assert record["block_tracking_error"] is None
 
     # Ensure per-period net returns align with report calculations
     np.testing.assert_allclose(
@@ -129,7 +150,8 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     assert text[0] == (
         "date,gross_ret,net_tx_ret,net_slip_ret,turnover,tx_cost,slippage_cost,"
         "sector_breaches,active_breaches,group_breaches,factor_bound_breaches,"
-        "factor_inf_norm,factor_missing,first_violation,feasible,projection_iterations"
+        "factor_inf_norm,factor_missing,first_violation,feasible,projection_iterations,"
+        "block_sharpe,block_sortino,block_info_ratio,block_tracking_error"
     )
 
 
@@ -151,7 +173,9 @@ def test_active_bounds_fall_back_for_missing_benchmark(monkeypatch) -> None:
         np.array([0.1, 0.05, 0.85], dtype=float),
     ]
     stub = _StubOptimizer(weights_seq)
-    monkeypatch.setattr(bt, "_build_optimizer", lambda n_assets, seed: stub)
+    monkeypatch.setattr(
+        bt, "_build_optimizer", lambda n_assets, seed, risk_free_rate=0.0: stub
+    )
 
     results = bt.backtest(
         frame,

@@ -1088,7 +1088,9 @@ def max_drawdown(equity_curve: np.ndarray) -> float:
     return float(np.max(drawdown))
 
 
-def _build_optimizer(n_assets: int, seed: int) -> NeuroAntPortfolioOptimizer:
+def _build_optimizer(
+    n_assets: int, seed: int, risk_free_rate: float = 0.0
+) -> NeuroAntPortfolioOptimizer:
     cfg = OptimizerConfig(
         n_ants=24,
         max_iter=25,
@@ -1098,6 +1100,7 @@ def _build_optimizer(n_assets: int, seed: int) -> NeuroAntPortfolioOptimizer:
         shrinkage_delta=0.15,
         cvar_alpha=0.05,
         seed=seed,
+        risk_free=risk_free_rate,
     )
     return NeuroAntPortfolioOptimizer(n_assets, cfg)
 
@@ -1264,6 +1267,8 @@ def backtest(
     te_target: float = 0.0,
     lambda_te: float = 0.0,
     gamma_turnover: float = 0.0,
+    risk_free_rate: float = 0.0,
+    trading_days: int = 252,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -1301,6 +1306,14 @@ def backtest(
             "max": _manifest_bound(max_active_val),
         }
     }
+
+    if trading_days <= 0:
+        raise ValueError("trading_days must be positive")
+
+    annual_rf = float(risk_free_rate)
+    if annual_rf <= -1.0:
+        raise ValueError("risk_free_rate must be greater than -100%")
+    periodic_rf = float((1.0 + annual_rf) ** (1.0 / trading_days) - 1.0)
 
     returns = _frame_to_numpy(df)
     if returns.size == 0:
@@ -1398,7 +1411,7 @@ def backtest(
     )
     constraint_manifest["factor_bounds"] = factor_bounds_manifest
 
-    optimizer = _build_optimizer(returns.shape[1], seed)
+    optimizer = _build_optimizer(returns.shape[1], seed, risk_free_rate=periodic_rf)
     if te_target < 0.0:
         raise ValueError("te_target must be non-negative")
     if lambda_te < 0.0:
@@ -1751,6 +1764,37 @@ def backtest(
         elif turnover_violation:
             first_violation = "TURNOVER"
 
+        block_info_ratio: Optional[float] = None
+        block_tracking_error: Optional[float] = None
+        if benchmark_series is not None:
+            active_block = block_returns - benchmark_series[start:end]
+            if active_block.size:
+                block_tracking_error = float(
+                    np.std(active_block) * math.sqrt(trading_days)
+                )
+                active_mean = float(active_block.mean() * trading_days)
+                if block_tracking_error <= 1e-12:
+                    if abs(active_mean) <= 1e-12:
+                        block_info_ratio = 0.0
+                    else:
+                        block_info_ratio = float(math.copysign(1e6, active_mean))
+                else:
+                    block_info_ratio = float(active_mean / block_tracking_error)
+
+        excess_block = block_returns - periodic_rf
+        block_std = float(np.std(excess_block)) if excess_block.size else 0.0
+        ann_factor = math.sqrt(trading_days)
+        block_mean_excess = float(excess_block.mean()) if excess_block.size else 0.0
+        block_sharpe = 0.0
+        if block_std > 1e-12:
+            block_sharpe = float((block_mean_excess * trading_days) / (block_std * ann_factor))
+        block_sortino = 0.0
+        downside = excess_block[excess_block < 0]
+        if downside.size:
+            downside_vol = float(downside.std() * ann_factor)
+            if downside_vol > 1e-12:
+                block_sortino = float((block_mean_excess * trading_days) / downside_vol)
+
         rebalance_records.append(
             {
                 "date": rebalance_date,
@@ -1769,6 +1813,10 @@ def backtest(
                 "first_violation": first_violation,
                 "feasible": bool(feasible_flags[-1]),
                 "projection_iterations": int(projection_iters[-1]),
+                "block_sharpe": block_sharpe,
+                "block_sortino": block_sortino,
+                "block_info_ratio": block_info_ratio,
+                "block_tracking_error": block_tracking_error,
             }
         )
         cursor += block_len
@@ -1791,12 +1839,33 @@ def backtest(
     if slippage is not None:
         slippage_net_returns = net_slip_returns_arr.copy()
 
-    ann_vol = float(np.std(realized_returns_arr) * math.sqrt(252)) if realized_returns_arr.size else 0.0
-    ann_return = float(np.mean(realized_returns_arr) * 252) if realized_returns_arr.size else 0.0
-    sharpe = ann_return / ann_vol if ann_vol > 1e-12 else 0.0
-    negatives = realized_returns_arr[realized_returns_arr < 0]
-    downside_vol = float(negatives.std() * math.sqrt(252)) if negatives.size else 0.0
-    sortino = ann_return / downside_vol if downside_vol > 1e-12 else 0.0
+    ann_factor = math.sqrt(trading_days)
+    ann_vol = (
+        float(np.std(realized_returns_arr) * ann_factor)
+        if realized_returns_arr.size
+        else 0.0
+    )
+    ann_return = (
+        float(np.mean(realized_returns_arr) * trading_days)
+        if realized_returns_arr.size
+        else 0.0
+    )
+    excess_returns = realized_returns_arr - periodic_rf
+    excess_mean = (
+        float(excess_returns.mean() * trading_days)
+        if excess_returns.size
+        else 0.0
+    )
+    sharpe = 0.0
+    if ann_vol > 1e-12:
+        sharpe = float(excess_mean / ann_vol)
+    negatives = excess_returns[excess_returns < 0]
+    downside_vol = (
+        float(negatives.std() * ann_factor)
+        if negatives.size
+        else 0.0
+    )
+    sortino = float(excess_mean / downside_vol) if downside_vol > 1e-12 else 0.0
     alpha = float(np.clip(metric_alpha, 1e-4, 0.5))
     if realized_returns_arr.size:
         tail_len = max(1, int(math.floor(alpha * realized_returns_arr.size)))
@@ -1811,12 +1880,17 @@ def backtest(
     info_ratio = None
     if benchmark_returns_arr.size == realized_returns_arr.size and realized_returns_arr.size:
         active = realized_returns_arr - benchmark_returns_arr
-        te = float(np.std(active))
+        te = float(np.std(active) * ann_factor)
         tracking_error = te
+        active_mean = float(active.mean() * trading_days)
         if te <= 1e-12:
-            info_ratio = 0.0 if abs(active.mean()) <= 1e-12 else math.copysign(1e6, active.mean())
+            info_ratio = (
+                0.0
+                if abs(active_mean) <= 1e-12
+                else float(math.copysign(1e6, active_mean))
+            )
         else:
-            info_ratio = float(active.mean() / te)
+            info_ratio = float(active_mean / te)
 
     return {
         "dates": realized_dates,
@@ -1843,6 +1917,9 @@ def backtest(
         "te_target": float(optimizer.cfg.te_target),
         "lambda_te": float(optimizer.cfg.lambda_te),
         "gamma_turnover": float(optimizer.cfg.gamma_turnover),
+        "risk_free_rate": annual_rf,
+        "periodic_risk_free": periodic_rf,
+        "trading_days": int(trading_days),
         "factor_records": factor_records,
         "factor_names": factor_names,
         "factor_tolerance": factor_tolerance,
@@ -2001,6 +2078,10 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "first_violation",
         "feasible",
         "projection_iterations",
+        "block_sharpe",
+        "block_sortino",
+        "block_info_ratio",
+        "block_tracking_error",
     ]
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=header)
@@ -2184,6 +2265,18 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
     parser.add_argument(
+        "--rf-bps",
+        type=float,
+        default=0.0,
+        help="Annualized risk-free rate in basis points (default: 0)",
+    )
+    parser.add_argument(
+        "--trading-days",
+        type=int,
+        default=252,
+        help="Trading periods per year used for annualization",
+    )
+    parser.add_argument(
         "--save-weights",
         action="store_true",
         help="Write weights.csv with per-step allocations",
@@ -2307,6 +2400,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         te_target=parsed.te_target,
         lambda_te=parsed.lambda_te,
         gamma_turnover=parsed.gamma_turnover,
+        risk_free_rate=float(parsed.rf_bps) / 1e4,
+        trading_days=parsed.trading_days,
     )
 
     out_dir = Path(parsed.out)
