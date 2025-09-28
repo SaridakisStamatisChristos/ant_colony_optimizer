@@ -96,6 +96,21 @@ _CUSTOM_OBJECTIVE_REGISTRY: Dict[str, ObjectiveFunction] = {}
 _COVARIANCE_REGISTRY: Dict[str, CovarianceFunction] = {}
 
 
+@dataclass(frozen=True)
+class ScenarioShock:
+    asset_indices: Tuple[int, ...]
+    date_indices: Optional[Tuple[int, ...]]
+    shift: float = 0.0
+    scale: float = 0.0
+
+
+@dataclass(frozen=True)
+class ScenarioDefinition:
+    name: str
+    shocks: Tuple[ScenarioShock, ...]
+    thresholds: Mapping[str, float] = field(default_factory=dict)
+
+
 def register_objective(name: str, fn: ObjectiveFunction) -> None:
     key = str(name).strip().lower()
     if not key:
@@ -707,6 +722,7 @@ if _PYDANTIC_AVAILABLE:
         warm_start: Optional[str] = None
         warm_align: Literal["by_date", "last_row"] = "last_row"
         decay: float = Field(ge=0.0, le=1.0, default=0.0)
+        scenarios: Optional[Any] = None
 
         @model_validator(mode="after")
         def check_covariance_deps(self) -> "RunConfig":
@@ -775,6 +791,7 @@ else:
             "warm_start": None,
             "warm_align": "last_row",
             "decay": 0.0,
+            "scenarios": None,
         }
 
         _tx_cost_modes = {"none", "upfront", "amortized", "posthoc"}
@@ -2599,6 +2616,7 @@ def backtest(
     missing_factor_logged: Set[Any] = set()
     factor_records: List[Dict[str, Any]] = []
     rebalance_records: List[Dict[str, Any]] = []
+    walk_windows: List[Tuple[int, int]] = []
 
     rebalance_points = list(range(lookback, n_periods, step))
     n_windows = len(rebalance_points)
@@ -2722,6 +2740,7 @@ def backtest(
         end = min(start + step, n_periods)
         train = returns[start - lookback : start]
         test = returns[start:end]
+        walk_windows.append((int(start), int(end)))
         mu = train.mean(axis=0)
         bench_stats: Optional[BenchmarkStats] = None
         if benchmark_series is not None:
@@ -3224,6 +3243,7 @@ def backtest(
         "weights": np.asarray(weights, dtype=float_dtype),
         "rebalance_dates": rebalance_dates,
         "asset_names": asset_names,
+        "walk_windows": [(int(start), int(end)) for start, end in walk_windows],
         "cov_model": cov_model_label,
         "benchmark_returns": benchmark_returns_arr if benchmark_returns_arr.size else None,
         "sharpe": sharpe,
@@ -3360,6 +3380,376 @@ def _write_weights(weights_path: Path, results: Dict[str, Any]) -> None:
         header = ",".join(header_cols)
         data = W
     np.savetxt(weights_path, data, delimiter=",", header=header, comments="", fmt="%s")
+
+
+_SCENARIO_THRESHOLD_RULES: Dict[str, str] = {
+    "sharpe": "min",
+    "info_ratio": "min",
+    "ann_return": "min",
+    "max_drawdown": "max",
+    "tracking_error": "max",
+}
+
+
+def _load_scenarios_config(
+    spec: Any,
+    *,
+    asset_names: Sequence[str],
+    dates: Sequence[Any],
+) -> List[ScenarioDefinition]:
+    if spec is None:
+        return []
+    raw = spec
+    if isinstance(raw, Mapping) and "scenarios" in raw:
+        scenarios_raw = raw["scenarios"]
+    else:
+        scenarios_raw = raw
+    if not isinstance(scenarios_raw, Sequence):
+        raise ValueError("Scenario configuration must be a sequence or mapping with 'scenarios'")
+    asset_map = {str(name): idx for idx, name in enumerate(asset_names)}
+    date_map = {_stringify(date): idx for idx, date in enumerate(dates)}
+    definitions: List[ScenarioDefinition] = []
+    for entry in scenarios_raw:
+        if not isinstance(entry, Mapping):
+            raise ValueError("Scenario entries must be mappings")
+        name_raw = entry.get("name") or entry.get("id")
+        if name_raw is None:
+            raise ValueError("Scenario entries must include a name")
+        name = str(name_raw)
+        shocks_raw = entry.get("shocks") or []
+        if not isinstance(shocks_raw, Sequence):
+            raise ValueError(f"Scenario '{name}' shocks must be a sequence")
+        shocks: List[ScenarioShock] = []
+        for shock in shocks_raw:
+            if not isinstance(shock, Mapping):
+                raise ValueError(f"Scenario '{name}' shock specifications must be mappings")
+            assets_spec = shock.get("assets", "*")
+            asset_indices: List[int] = []
+            if assets_spec in {"*", "all", None}:
+                asset_indices = list(range(len(asset_names)))
+            else:
+                if isinstance(assets_spec, (str, Path)):
+                    assets_iter: Sequence[Any] = [assets_spec]
+                else:
+                    if not isinstance(assets_spec, Sequence):
+                        raise ValueError(
+                            f"Scenario '{name}' assets specification must be a string or sequence"
+                        )
+                    assets_iter = assets_spec
+                for asset_name in assets_iter:
+                    asset_key = str(asset_name)
+                    if asset_key in {"*", "all"}:
+                        asset_indices = list(range(len(asset_names)))
+                        break
+                    idx = asset_map.get(asset_key)
+                    if idx is None:
+                        raise ValueError(f"Scenario '{name}' references unknown asset '{asset_key}'")
+                    asset_indices.append(idx)
+            asset_indices = sorted(dict.fromkeys(int(idx) for idx in asset_indices))
+            if not asset_indices:
+                raise ValueError(f"Scenario '{name}' shock does not target any known assets")
+            raw_dates = shock.get("dates")
+            if raw_dates is None and "date" in shock:
+                raw_dates = shock.get("date")
+            date_indices: Optional[Tuple[int, ...]] = None
+            if raw_dates is not None:
+                if isinstance(raw_dates, Sequence) and not isinstance(raw_dates, (str, bytes)):
+                    dates_iter: Sequence[Any] = raw_dates
+                else:
+                    dates_iter = [raw_dates]
+                indices: List[int] = []
+                for raw_date in dates_iter:
+                    if isinstance(raw_date, (int, np.integer)):
+                        idx_val = int(raw_date)
+                    else:
+                        key = str(raw_date).strip()
+                        if key.lower() == "last":
+                            idx_val = len(dates) - 1
+                        else:
+                            mapped = date_map.get(key)
+                            if mapped is None:
+                                normalized_key: Optional[str] = None
+                                try:
+                                    normalized_key = _stringify(np.datetime64(key))
+                                except Exception:  # pragma: no cover - best effort coercion
+                                    normalized_key = None
+                                if normalized_key is not None:
+                                    mapped = date_map.get(normalized_key)
+                            if mapped is None and pd is not None:  # pragma: no branch - optional
+                                try:
+                                    normalized_pd = _stringify(pd.Timestamp(key))
+                                except Exception:  # pragma: no cover - best effort coercion
+                                    normalized_pd = None
+                                if normalized_pd is not None:
+                                    mapped = date_map.get(normalized_pd)
+                            if mapped is None:
+                                raise ValueError(
+                                    f"Scenario '{name}' references unknown date '{raw_date}'"
+                                )
+                            idx_val = int(mapped)
+                    indices.append(idx_val)
+                date_indices = tuple(sorted(dict.fromkeys(indices)))
+            shift_val = shock.get("shift")
+            scale_val = shock.get("scale")
+            shift = float(shift_val) if shift_val is not None else 0.0
+            scale = float(scale_val) if scale_val is not None else 0.0
+            if abs(shift) <= 0.0 and abs(scale) <= 0.0:
+                raise ValueError(f"Scenario '{name}' shock must specify a non-zero shift or scale")
+            shocks.append(
+                ScenarioShock(
+                    asset_indices=tuple(asset_indices),
+                    date_indices=date_indices,
+                    shift=shift,
+                    scale=scale,
+                )
+            )
+        thresholds_raw = entry.get("thresholds") or entry.get("limits") or {}
+        if thresholds_raw and not isinstance(thresholds_raw, Mapping):
+            raise ValueError(f"Scenario '{name}' thresholds must be a mapping")
+        thresholds: Dict[str, float] = {}
+        if isinstance(thresholds_raw, Mapping):
+            for key, value in thresholds_raw.items():
+                try:
+                    thresholds[str(key)] = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Scenario '{name}' threshold for '{key}' must be numeric"
+                    ) from exc
+        definitions.append(
+            ScenarioDefinition(name=name, shocks=tuple(shocks), thresholds=thresholds)
+        )
+    return definitions
+
+
+def _apply_scenario_shocks(
+    base_returns: np.ndarray,
+    scenario: ScenarioDefinition,
+    default_rows: np.ndarray,
+) -> np.ndarray:
+    shocked = np.asarray(base_returns, dtype=float).copy()
+    if not scenario.shocks:
+        return shocked
+    for shock in scenario.shocks:
+        cols = np.asarray(shock.asset_indices, dtype=int)
+        if cols.size == 0:
+            continue
+        if shock.date_indices is None:
+            rows = np.asarray(default_rows, dtype=int)
+        else:
+            rows = np.asarray(shock.date_indices, dtype=int)
+        if rows.size == 0:
+            continue
+        grid = np.ix_(rows, cols)
+        if abs(shock.scale) > 0.0:
+            shocked[grid] = shocked[grid] * (1.0 + shock.scale)
+        if abs(shock.shift) > 0.0:
+            shocked[grid] = shocked[grid] + shock.shift
+    return shocked
+
+
+def _replay_walk_returns(
+    returns: np.ndarray,
+    windows: Sequence[Tuple[int, int]],
+    weights: np.ndarray,
+) -> np.ndarray:
+    weights_arr = np.asarray(weights, dtype=float)
+    if weights_arr.ndim == 1:
+        weights_arr = weights_arr.reshape(1, -1)
+    if weights_arr.shape[0] != len(windows):
+        raise ValueError("Weight history length does not match walk windows")
+    blocks: List[np.ndarray] = []
+    for (start, end), w in zip(windows, weights_arr):
+        block = np.asarray(returns[start:end], dtype=float)
+        if block.size == 0:
+            continue
+        contrib = block @ np.asarray(w, dtype=float)
+        blocks.append(np.asarray(contrib, dtype=float).reshape(-1))
+    if not blocks:
+        return np.zeros(0, dtype=float)
+    return np.concatenate(blocks)
+
+
+def _compute_scenario_metrics(
+    realized_returns: np.ndarray,
+    benchmark_returns: Optional[np.ndarray],
+    periodic_rf: float,
+    trading_days: int,
+) -> Dict[str, Any]:
+    realized_arr = np.asarray(realized_returns, dtype=float)
+    ann_factor = math.sqrt(max(1, int(trading_days)))
+    ann_vol = (
+        float(np.std(realized_arr) * ann_factor) if realized_arr.size else 0.0
+    )
+    ann_return = (
+        float(np.mean(realized_arr) * trading_days) if realized_arr.size else 0.0
+    )
+    excess = realized_arr - float(periodic_rf)
+    excess_mean = (
+        float(excess.mean() * trading_days) if excess.size else 0.0
+    )
+    sharpe = float(excess_mean / ann_vol) if ann_vol > 1e-12 else 0.0
+    equity = np.cumprod(1.0 + realized_arr, dtype=float) if realized_arr.size else np.ones(0)
+    mdd = max_drawdown(equity) if equity.size else 0.0
+    tracking_error: Optional[float] = None
+    info_ratio: Optional[float] = None
+    if benchmark_returns is not None:
+        bench = np.asarray(benchmark_returns, dtype=float)
+        if bench.size == realized_arr.size and realized_arr.size:
+            active = realized_arr - bench
+            te = float(np.std(active) * ann_factor)
+            tracking_error = te
+            active_mean = float(active.mean() * trading_days)
+            if te <= 1e-12:
+                if abs(active_mean) <= 1e-12:
+                    info_ratio = 0.0
+                else:
+                    info_ratio = float(math.copysign(1e6, active_mean))
+            else:
+                info_ratio = float(active_mean / te)
+    return {
+        "sharpe": sharpe,
+        "ann_return": ann_return,
+        "ann_vol": ann_vol,
+        "max_drawdown": mdd,
+        "tracking_error": tracking_error,
+        "info_ratio": info_ratio,
+    }
+
+
+def _count_breaches(metrics: Mapping[str, Any], thresholds: Mapping[str, float]) -> int:
+    if not thresholds:
+        return 0
+    breaches = 0
+    for key, limit in thresholds.items():
+        if key not in metrics:
+            continue
+        value = metrics.get(key)
+        if value is None:
+            continue
+        rule = _SCENARIO_THRESHOLD_RULES.get(key, "max")
+        try:
+            limit_val = float(limit)
+        except (TypeError, ValueError):
+            continue
+        val = float(value)
+        if rule == "min":
+            if val < limit_val - 1e-12:
+                breaches += 1
+        else:
+            if val > limit_val + 1e-12:
+                breaches += 1
+    return breaches
+
+
+def _evaluate_scenarios(
+    scenarios: Sequence[ScenarioDefinition],
+    *,
+    returns: np.ndarray,
+    windows: Sequence[Tuple[int, int]],
+    weights: np.ndarray,
+    benchmark: Optional[np.ndarray],
+    periodic_rf: float,
+    trading_days: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
+    if not scenarios:
+        return [], {}
+    returns_arr = np.asarray(returns, dtype=float)
+    weights_arr = np.asarray(weights, dtype=float)
+    if weights_arr.ndim == 1 and weights_arr.size:
+        weights_arr = weights_arr.reshape(1, -1)
+    if weights_arr.size == 0 or not windows:
+        return [], {}
+    if weights_arr.shape[0] != len(windows):
+        raise ValueError("Scenario replay requires weight history for each walk window")
+    row_mask = np.zeros(returns_arr.shape[0], dtype=bool)
+    for start, end in windows:
+        row_mask[int(start) : int(end)] = True
+    default_rows = np.nonzero(row_mask)[0]
+    if default_rows.size == 0:
+        return [], {}
+    bench_arr = None
+    if benchmark is not None:
+        bench_arr = np.asarray(benchmark, dtype=float)
+    reports: List[Dict[str, Any]] = []
+    shocked_weights: Dict[str, np.ndarray] = {}
+    last_index = int(default_rows[-1])
+    for scenario in scenarios:
+        shocked_returns = _apply_scenario_shocks(returns_arr, scenario, default_rows)
+        walk_returns = _replay_walk_returns(shocked_returns, windows, weights_arr)
+        bench_series = None
+        if bench_arr is not None and bench_arr.size:
+            if bench_arr.size != walk_returns.size:
+                raise ValueError("Benchmark series length mismatch for scenario replay")
+            bench_series = bench_arr
+        metrics = _compute_scenario_metrics(walk_returns, bench_series, periodic_rf, trading_days)
+        breaches = _count_breaches(metrics, scenario.thresholds)
+        reports.append(
+            {
+                "scenario": scenario.name,
+                "sharpe": metrics["sharpe"],
+                "ann_return": metrics["ann_return"],
+                "ann_vol": metrics["ann_vol"],
+                "max_drawdown": metrics["max_drawdown"],
+                "tracking_error": metrics["tracking_error"],
+                "info_ratio": metrics["info_ratio"],
+                "breaches": breaches,
+            }
+        )
+        last_returns = shocked_returns[last_index]
+        base_weights = np.asarray(weights_arr[-1], dtype=float)
+        updated = base_weights * (1.0 + np.asarray(last_returns, dtype=float))
+        total = float(updated.sum())
+        if total > 1e-12:
+            updated = updated / total
+        else:
+            updated = np.zeros_like(updated)
+        shocked_weights[scenario.name] = updated
+    return reports, shocked_weights
+
+
+def _write_scenarios_report(path: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    if not records:
+        return
+    columns = [
+        "scenario",
+        "sharpe",
+        "ann_return",
+        "ann_vol",
+        "max_drawdown",
+        "tracking_error",
+        "info_ratio",
+        "breaches",
+    ]
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(columns)
+        for record in records:
+            row = []
+            for col in columns:
+                value = record.get(col)
+                row.append("" if value is None else value)
+            writer.writerow(row)
+
+
+def _write_shocked_weights(
+    path: Path,
+    asset_names: Sequence[str],
+    shocked: Mapping[str, np.ndarray],
+) -> None:
+    if not shocked:
+        return
+    scenario_names = list(shocked.keys())
+    assets = list(asset_names) if asset_names else [f"A{i}" for i in range(len(next(iter(shocked.values()))))]
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["asset", *scenario_names])
+        for idx, asset in enumerate(assets):
+            row: List[Any] = [asset]
+            for name in scenario_names:
+                weights = np.asarray(shocked[name], dtype=float)
+                value = weights[idx] if idx < weights.size else ""
+                row.append(value)
+            writer.writerow(row)
 
 
 def _write_factor_constraints(path: Path, results: Dict[str, Any]) -> None:
@@ -3763,6 +4153,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="YAML/JSON file describing factor exposure bounds",
+    )
+    parser.add_argument(
+        "--scenarios",
+        type=str,
+        default=None,
+        help="YAML/JSON file describing stress scenarios to replay",
     )
     parser.add_argument("--lookback", type=int, default=252)
     parser.add_argument("--step", type=int, default=21)
@@ -4185,6 +4581,39 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         _write_exposures(out_dir / "exposures.csv", results)
     if parsed.save_weights:
         _write_weights(out_dir / "weights.csv", results)
+
+    scenario_spec = getattr(parsed, "scenarios", None)
+    if scenario_spec:
+        scenario_data = _maybe_load_structure(scenario_spec)
+        scenario_asset_names = results.get("asset_names") or asset_names_for_baseline
+        if scenario_asset_names is None:
+            scenario_asset_names = []
+        scenario_defs = _load_scenarios_config(
+            scenario_data,
+            asset_names=list(scenario_asset_names),
+            dates=date_index,
+        )
+        if scenario_defs:
+            windows = results.get("walk_windows") or []
+            weights_history = results.get("weights")
+            benchmark_series = results.get("benchmark_returns")
+            scenario_rows, shocked_weights = _evaluate_scenarios(
+                scenario_defs,
+                returns=returns_preview,
+                windows=windows,
+                weights=weights_history,
+                benchmark=benchmark_series,
+                periodic_rf=float(results.get("periodic_risk_free", 0.0)),
+                trading_days=int(results.get("trading_days", 252)),
+            )
+            if scenario_rows:
+                _write_scenarios_report(out_dir / "scenarios_report.csv", scenario_rows)
+            if shocked_weights:
+                _write_shocked_weights(
+                    out_dir / "weights_after_shock.csv",
+                    list(scenario_asset_names),
+                    shocked_weights,
+                )
 
     diagnostics = results.get("factor_diagnostics")
     if diagnostics:
