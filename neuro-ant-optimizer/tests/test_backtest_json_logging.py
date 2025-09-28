@@ -43,6 +43,10 @@ def test_cli_json_logging_schema(tmp_path: Path) -> None:
         "cov_model",
         "costs",
         "turnover",
+        "turnover_pre_decay",
+        "turnover_post_decay",
+        "warm_applied",
+        "decay",
         "feasible",
         "breaches",
         "block",
@@ -61,6 +65,10 @@ def test_cli_json_logging_schema(tmp_path: Path) -> None:
         assert payload["objective"] == "sharpe"
         assert payload["cov_model"] == "sample"
         assert isinstance(payload["turnover"], float)
+        assert isinstance(payload["turnover_pre_decay"], float)
+        assert isinstance(payload["turnover_post_decay"], float)
+        assert isinstance(payload["warm_applied"], bool)
+        assert isinstance(payload["decay"], float)
         assert isinstance(payload["feasible"], bool)
 
         costs = payload["costs"]

@@ -26,6 +26,7 @@ from typing import (
     TextIO,
     Tuple,
     Union,
+    Literal,
 )
 
 import numpy as np
@@ -49,6 +50,31 @@ try:  # pragma: no cover - optional dependency
     import yaml  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - minimal environments
     yaml = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+    _PYDANTIC_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - minimal environments
+    BaseModel = object  # type: ignore[assignment]
+    ConfigDict = None  # type: ignore[assignment]
+    Field = None  # type: ignore[assignment]
+
+    def model_validator(*_args: Any, **_kwargs: Any):  # type: ignore[override]
+        def decorator(func: Callable[[Any], Any]) -> Callable[[Any], Any]:
+            return func
+
+        return decorator
+
+    class ValidationError(Exception):  # type: ignore[override]
+        def __init__(self, errors: Sequence[Mapping[str, Any]]):
+            super().__init__("Validation failed")
+            self._errors = list(errors)
+
+        def errors(self) -> Sequence[Mapping[str, Any]]:  # type: ignore[override]
+            return list(self._errors)
+
+    _PYDANTIC_AVAILABLE = False
 
 
 SCHEMA_VERSION = "1.0.0"
@@ -276,6 +302,407 @@ def _load_run_config(path: Path) -> Dict[str, Any]:
         normalized[norm_key] = value
     return normalized
 
+
+if _PYDANTIC_AVAILABLE:
+
+    class RunConfig(BaseModel):
+        model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+        csv: str
+        benchmark_csv: Optional[str] = None
+        baseline: Optional[Literal["equal", "cap"]] = None
+        cap_weights: Optional[str] = None
+        out: str = "bt_out"
+        lookback: int = Field(ge=1, default=252)
+        step: int = Field(ge=1, default=21)
+        objective: Literal[
+            "sharpe",
+            "max_return",
+            "min_variance",
+            "risk_parity",
+            "min_cvar",
+            "tracking_error",
+            "min_tracking_error",
+            "info_ratio",
+            "te_target",
+            "multi_term",
+        ] = "sharpe"
+        cov_model: Literal["sample", "ewma", "lw", "oas"] = "sample"
+        ewma_span: Optional[int] = Field(default=None, ge=2)
+        seed: int = 7
+        tx_cost_bps: float = Field(ge=0.0, default=0.0)
+        tx_cost_mode: Literal["none", "upfront", "amortized", "posthoc"] = "posthoc"
+        rf_bps: float = 0.0
+        trading_days: int = Field(ge=1, default=252)
+        factors: Optional[str] = None
+        factor_align: Literal["strict", "subset"] = "strict"
+        factors_required: bool = False
+        factor_targets: Optional[str] = None
+        factor_tolerance: float = Field(ge=0.0, default=1e-6)
+        benchmark_weights: Optional[Any] = None
+        active_min: Optional[float] = None
+        active_max: Optional[float] = None
+        active_group_caps: Optional[Any] = None
+        factor_bounds: Optional[Any] = None
+        te_target: float = Field(ge=0.0, default=0.0)
+        lambda_te: float = Field(ge=0.0, default=0.0)
+        gamma_turnover: float = Field(ge=0.0, default=0.0)
+        refine_every: int = Field(ge=1, default=1)
+        out_format: Literal["csv", "parquet"] = "csv"
+        save_weights: bool = False
+        skip_plot: bool = False
+        dry_run: bool = False
+        float32: bool = False
+        cache_cov: int = Field(ge=0, default=8)
+        max_workers: Optional[int] = Field(default=None, ge=1)
+        log_json: Optional[str] = None
+        progress: bool = False
+        slippage: Optional[str] = None
+        metric_alpha: float = Field(ge=0.0, le=1.0, default=0.05)
+        warm_start: Optional[str] = None
+        warm_align: Literal["by_date", "last_row"] = "last_row"
+        decay: float = Field(ge=0.0, le=1.0, default=0.0)
+
+        @model_validator(mode="after")
+        def check_covariance_deps(self) -> "RunConfig":
+            if self.cov_model != "ewma":
+                object.__setattr__(self, "ewma_span", None)
+            return self
+
+else:
+
+    class RunConfig:
+        __slots__ = ("_data",)
+
+        _defaults: Dict[str, Any] = {
+            "csv": None,
+            "benchmark_csv": None,
+            "baseline": None,
+            "cap_weights": None,
+            "out": "bt_out",
+            "lookback": 252,
+            "step": 21,
+            "objective": "sharpe",
+            "cov_model": "sample",
+            "ewma_span": None,
+            "seed": 7,
+            "tx_cost_bps": 0.0,
+            "tx_cost_mode": "posthoc",
+            "rf_bps": 0.0,
+            "trading_days": 252,
+            "factors": None,
+            "factor_align": "strict",
+            "factors_required": False,
+            "factor_targets": None,
+            "factor_tolerance": 1e-6,
+            "benchmark_weights": None,
+            "active_min": None,
+            "active_max": None,
+            "active_group_caps": None,
+            "factor_bounds": None,
+            "te_target": 0.0,
+            "lambda_te": 0.0,
+            "gamma_turnover": 0.0,
+            "refine_every": 1,
+            "out_format": "csv",
+            "save_weights": False,
+            "skip_plot": False,
+            "dry_run": False,
+            "float32": False,
+            "cache_cov": 8,
+            "max_workers": None,
+            "log_json": None,
+            "progress": False,
+            "slippage": None,
+            "metric_alpha": 0.05,
+            "warm_start": None,
+            "warm_align": "last_row",
+            "decay": 0.0,
+        }
+
+        _objective_choices = {
+            "sharpe",
+            "max_return",
+            "min_variance",
+            "risk_parity",
+            "min_cvar",
+            "tracking_error",
+            "min_tracking_error",
+            "info_ratio",
+            "te_target",
+            "multi_term",
+        }
+
+        _cov_choices = {"sample", "ewma", "lw", "oas"}
+        _tx_cost_modes = {"none", "upfront", "amortized", "posthoc"}
+        _warm_align = {"by_date", "last_row"}
+        _factor_align = {"strict", "subset"}
+        _baseline_modes = {"equal", "cap"}
+        _out_formats = {"csv", "parquet"}
+
+        def __init__(self, data: Dict[str, Any]) -> None:
+            self._data = data
+
+        @classmethod
+        def _bool(cls, value: Any, name: str, errors: List[Dict[str, Any]]) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, np.integer)):
+                return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"true", "yes", "1", "on"}:
+                    return True
+                if lowered in {"false", "no", "0", "off"}:
+                    return False
+            errors.append({"loc": (name,), "msg": "Input should be a valid boolean"})
+            return False
+
+        @classmethod
+        def _int(
+            cls, value: Any, name: str, errors: List[Dict[str, Any]], *, ge: Optional[int] = None
+        ) -> Optional[int]:
+            try:
+                ivalue = int(value)
+            except (TypeError, ValueError):
+                errors.append({"loc": (name,), "msg": "Input should be a valid integer"})
+                return None
+            if ge is not None and ivalue < ge:
+                errors.append({"loc": (name,), "msg": f"Input should be greater than or equal to {ge}"})
+                return None
+            return ivalue
+
+        @classmethod
+        def _float(
+            cls,
+            value: Any,
+            name: str,
+            errors: List[Dict[str, Any]],
+            *,
+            ge: Optional[float] = None,
+            le: Optional[float] = None,
+        ) -> Optional[float]:
+            try:
+                fvalue = float(value)
+            except (TypeError, ValueError):
+                errors.append({"loc": (name,), "msg": "Input should be a valid number"})
+                return None
+            if ge is not None and fvalue < ge:
+                errors.append({"loc": (name,), "msg": f"Input should be greater than or equal to {ge}"})
+                return None
+            if le is not None and fvalue > le:
+                errors.append({"loc": (name,), "msg": f"Input should be less than or equal to {le}"})
+                return None
+            return fvalue
+
+        @classmethod
+        def model_validate(cls, raw: Mapping[str, Any]) -> "RunConfig":
+            if not isinstance(raw, Mapping):
+                raise ValidationError([{ "loc": ("<root>",), "msg": "Input should be a mapping" }])
+
+            errors: List[Dict[str, Any]] = []
+            data: Dict[str, Any] = dict(cls._defaults)
+
+            for key in raw.keys():
+                if key not in data:
+                    errors.append({"loc": (key,), "msg": "extra fields not permitted"})
+
+            csv_value = raw.get("csv")
+            if not csv_value:
+                errors.append({"loc": ("csv",), "msg": "Field required"})
+            else:
+                data["csv"] = str(csv_value).strip()
+
+            optional_str_fields = [
+                "benchmark_csv",
+                "cap_weights",
+                "out",
+                "factors",
+                "factor_targets",
+                "log_json",
+                "slippage",
+                "warm_start",
+            ]
+            for field in optional_str_fields:
+                if field in raw:
+                    value = raw[field]
+                    data[field] = None if value is None else str(value).strip()
+
+            if "baseline" in raw:
+                value = raw["baseline"]
+                if value is None:
+                    data["baseline"] = None
+                else:
+                    choice = str(value).strip()
+                    if choice not in cls._baseline_modes:
+                        errors.append({"loc": ("baseline",), "msg": "Input should be 'equal' or 'cap'"})
+                    else:
+                        data["baseline"] = choice
+
+            for field in ("active_min", "active_max"):
+                if field in raw and raw[field] is not None:
+                    result = cls._float(raw[field], field, errors)
+                    if result is not None:
+                        data[field] = result
+
+            for field in ("lookback", "step"):
+                if field in raw:
+                    result = cls._int(raw[field], field, errors, ge=1)
+                    if result is not None:
+                        data[field] = result
+
+            if "objective" in raw:
+                obj = str(raw["objective"]).strip()
+                if obj not in cls._objective_choices:
+                    errors.append({"loc": ("objective",), "msg": "Input should be a valid objective"})
+                else:
+                    data["objective"] = obj
+
+            if "cov_model" in raw:
+                cov = str(raw["cov_model"]).strip()
+                if cov not in cls._cov_choices:
+                    errors.append({"loc": ("cov_model",), "msg": "Input should be one of sample, ewma, lw, oas"})
+                else:
+                    data["cov_model"] = cov
+
+            if "ewma_span" in raw and raw["ewma_span"] is not None:
+                span = cls._int(raw["ewma_span"], "ewma_span", errors, ge=2)
+                if span is not None:
+                    data["ewma_span"] = span
+
+            if "seed" in raw:
+                result = cls._int(raw["seed"], "seed", errors)
+                if result is not None:
+                    data["seed"] = result
+
+            float_fields = {
+                "tx_cost_bps": (0.0, None),
+                "rf_bps": (None, None),
+                "te_target": (0.0, None),
+                "lambda_te": (0.0, None),
+                "gamma_turnover": (0.0, None),
+                "metric_alpha": (0.0, 1.0),
+                "factor_tolerance": (0.0, None),
+                "decay": (0.0, 1.0),
+            }
+            for field, bounds in float_fields.items():
+                if field in raw:
+                    result = cls._float(raw[field], field, errors, ge=bounds[0], le=bounds[1])
+                    if result is not None:
+                        data[field] = result
+
+            if "trading_days" in raw:
+                result = cls._int(raw["trading_days"], "trading_days", errors, ge=1)
+                if result is not None:
+                    data["trading_days"] = result
+
+            if "cache_cov" in raw:
+                result = cls._int(raw["cache_cov"], "cache_cov", errors, ge=0)
+                if result is not None:
+                    data["cache_cov"] = result
+
+            if "max_workers" in raw and raw["max_workers"] is not None:
+                result = cls._int(raw["max_workers"], "max_workers", errors, ge=1)
+                if result is not None:
+                    data["max_workers"] = result
+
+            bool_fields = [
+                "factors_required",
+                "save_weights",
+                "skip_plot",
+                "dry_run",
+                "float32",
+                "progress",
+            ]
+            for field in bool_fields:
+                if field in raw:
+                    data[field] = cls._bool(raw[field], field, errors)
+
+            if "tx_cost_mode" in raw:
+                mode = str(raw["tx_cost_mode"]).strip()
+                if mode not in cls._tx_cost_modes:
+                    errors.append({"loc": ("tx_cost_mode",), "msg": "Input should be one of none, upfront, amortized, posthoc"})
+                else:
+                    data["tx_cost_mode"] = mode
+
+            if "factor_align" in raw:
+                align = str(raw["factor_align"]).strip()
+                if align not in cls._factor_align:
+                    errors.append({"loc": ("factor_align",), "msg": "Input should be 'strict' or 'subset'"})
+                else:
+                    data["factor_align"] = align
+
+            if "warm_align" in raw:
+                align = str(raw["warm_align"]).strip()
+                if align not in cls._warm_align:
+                    errors.append({"loc": ("warm_align",), "msg": "Input should be 'by_date' or 'last_row'"})
+                else:
+                    data["warm_align"] = align
+
+            if "out_format" in raw:
+                fmt = str(raw["out_format"]).strip()
+                if fmt not in cls._out_formats:
+                    errors.append({"loc": ("out_format",), "msg": "Input should be 'csv' or 'parquet'"})
+                else:
+                    data["out_format"] = fmt
+
+            if "refine_every" in raw:
+                result = cls._int(raw["refine_every"], "refine_every", errors, ge=1)
+                if result is not None:
+                    data["refine_every"] = result
+
+            passthrough_fields = [
+                "benchmark_weights",
+                "active_group_caps",
+                "factor_bounds",
+            ]
+            for field in passthrough_fields:
+                if field in raw:
+                    data[field] = raw[field]
+
+            if errors:
+                raise ValidationError(errors)
+
+            if data["cov_model"] != "ewma":
+                data["ewma_span"] = None
+
+            return cls(data)
+
+        def model_dump(self) -> Dict[str, Any]:
+            return dict(self._data)
+
+
+def _read_weights_csv(path: Path) -> Tuple[List[Any], np.ndarray, List[str]]:
+    raw = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding="utf-8")
+    if raw.size == 0:
+        return [], np.zeros((0, 0), dtype=float), []
+    names = list(raw.dtype.names or [])
+    dates: List[Any] = []
+    if "date" in names:
+        names.remove("date")
+        dates = np.atleast_1d(raw["date"]).tolist()
+    matrix_rows: List[np.ndarray] = []
+    for name in names:
+        matrix_rows.append(np.atleast_1d(raw[name]).astype(float))
+    if not matrix_rows:
+        return dates, np.zeros((0, 0), dtype=float), []
+    matrix = np.vstack(matrix_rows).T
+    return dates, matrix, names
+
+
+def _align_warm_to_assets(
+    warm_names: Sequence[str], warm_w: np.ndarray, dest_assets: Sequence[str]
+) -> np.ndarray:
+    index = {name: idx for idx, name in enumerate(warm_names)}
+    aligned = np.zeros(len(dest_assets), dtype=float)
+    for j, asset in enumerate(dest_assets):
+        idx = index.get(asset)
+        if idx is not None and warm_w.size:
+            aligned[j] = float(warm_w[idx])
+    total = float(aligned.sum())
+    if total > 1e-12:
+        aligned /= total
+    return aligned
 
 def _load_data_structure(path: Path) -> Any:
     text = path.read_text(encoding="utf-8")
@@ -679,12 +1106,15 @@ def _write_run_manifest(
     config_path: Optional[Path],
     results: Optional[Dict[str, Any]] = None,
     extras: Optional[Dict[str, Any]] = None,
+    *,
+    validated: bool = False,
 ) -> None:
     manifest: Dict[str, Any] = {
         "args": _serialize_args(args),
         "schema_version": SCHEMA_VERSION,
         "package_version": __version__,
         "python_version": sys.version,
+        "validated": bool(validated),
     }
     if config_path is not None:
         manifest["config_path"] = str(config_path)
@@ -711,6 +1141,10 @@ def _write_run_manifest(
         diagnostics = results.get("factor_diagnostics")
         if diagnostics is not None:
             manifest["factor_diagnostics"] = diagnostics
+        manifest["decay"] = results.get("decay")
+        manifest["warm_start"] = results.get("warm_start")
+        manifest["warm_align"] = results.get("warm_align")
+        manifest["warm_applied_count"] = results.get("warm_applied_count", 0)
 
     (out_dir / "run_config.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
@@ -1366,6 +1800,9 @@ def backtest(
     dtype: np.dtype = np.float64,
     cov_cache_size: int = 8,
     max_workers: Optional[int] = None,
+    warm_start: Optional[Any] = None,
+    warm_align: str = "last_row",
+    decay: float = 0.0,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -1403,6 +1840,7 @@ def backtest(
             "max": _manifest_bound(max_active_val),
         }
     }
+    warm_warnings: List[str] = []
 
     if trading_days <= 0:
         raise ValueError("trading_days must be positive")
@@ -1411,6 +1849,13 @@ def backtest(
     if annual_rf <= -1.0:
         raise ValueError("risk_free_rate must be greater than -100%")
     periodic_rf = float((1.0 + annual_rf) ** (1.0 / trading_days) - 1.0)
+
+    warm_align_mode = str(warm_align or "last_row").lower()
+    if warm_align_mode not in {"by_date", "last_row"}:
+        raise ValueError("warm_align must be either 'by_date' or 'last_row'")
+    decay_value = float(decay)
+    if decay_value < 0.0 or decay_value > 1.0:
+        raise ValueError("decay must be between 0 and 1")
 
     float_dtype = np.dtype(dtype)
     if float_dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
@@ -1509,6 +1954,18 @@ def backtest(
     if returns.shape[1] == 0:
         raise ValueError("No assets remain after aligning factors with returns")
 
+    warm_path_obj: Optional[Path] = None
+    warm_dates: List[Any] = []
+    warm_matrix: np.ndarray = np.zeros((0, 0), dtype=float)
+    warm_names: List[str] = []
+    if warm_start is not None:
+        warm_path_obj = Path(str(warm_start))
+        if not warm_path_obj.exists():
+            raise FileNotFoundError(f"Warm-start weights file '{warm_path_obj}' not found")
+        warm_dates, warm_matrix, warm_names = _read_weights_csv(warm_path_obj)
+        if warm_matrix.ndim == 1:
+            warm_matrix = warm_matrix.reshape(1, -1)
+
     bench_vector, bench_mask, bench_manifest = _prepare_benchmark_weights(
         benchmark_weights, asset_names
     )
@@ -1567,6 +2024,8 @@ def backtest(
     feasible_flags: List[bool] = []
     projection_iters: List[int] = []
     prev_weights: Optional[np.ndarray] = None
+    prev_weights_is_warm = False
+    warm_applied_count = 0
     tc = float(tx_cost_bps) / 1e4
     missing_factor_logged: Set[Any] = set()
     factor_records: List[Dict[str, Any]] = []
@@ -1590,11 +2049,44 @@ def backtest(
     if factor_panel is not None:
         factor_index_map = factor_panel.index_map()
 
+    warm_vector: Optional[np.ndarray] = None
+    if warm_matrix.size and len(asset_names):
+        row_idx = warm_matrix.shape[0] - 1
+        matched = False
+        if warm_align_mode == "by_date" and warm_dates:
+            if rebalance_points:
+                target_date = dates[rebalance_points[0]]
+                target_str = _stringify(target_date)
+                for idx, raw_date in enumerate(warm_dates):
+                    if _stringify(raw_date) == target_str:
+                        row_idx = idx
+                        matched = True
+                        break
+            if not matched and warm_matrix.shape[0] > 0 and rebalance_points:
+                if "warm_date_fallback" not in warm_warnings:
+                    warm_warnings.append("warm_date_fallback")
+        candidate = np.asarray(warm_matrix[row_idx], dtype=float)
+        aligned = _align_warm_to_assets(warm_names, candidate, asset_names)
+        if float(np.abs(aligned).sum()) <= 1e-12:
+            if "warm_no_overlap" not in warm_warnings:
+                warm_warnings.append("warm_no_overlap")
+        else:
+            warm_vector = aligned.astype(float_dtype, copy=False)
+    if warm_vector is not None:
+        prev_weights = warm_vector
+        prev_weights_is_warm = True
+
+    max_cov_cache = max(0, int(cov_cache_size))
+
     if not rebalance_points:
         if progress_callback is not None:
             progress_callback(0, 0)
         empty = np.array([], dtype=float_dtype)
         benchmark_returns = empty if benchmark_series is not None else None
+        warn_list = ["no_rebalances"]
+        for item in warm_warnings:
+            if item not in warn_list:
+                warn_list.append(item)
         return {
             "dates": [],
             "returns": empty,
@@ -1634,18 +2126,21 @@ def backtest(
             "projection_iterations": [],
             "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
             "constraint_manifest": constraint_manifest,
-            "warnings": ["no_rebalances"],
+            "warnings": warn_list,
             "cov_cache_size": int(max_cov_cache),
             "cov_cache_hits": 0,
             "cov_cache_misses": 0,
             "cov_cache_evictions": 0,
             "max_workers": max_workers_value,
             "dtype": float_dtype.name,
+            "decay": decay_value,
+            "warm_start": str(warm_path_obj) if warm_path_obj is not None else None,
+            "warm_align": warm_align_mode,
+            "warm_applied_count": 0,
         }
 
     # include model + params in the cache key to avoid collisions across models/spans
     cov_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
-    max_cov_cache = max(0, int(cov_cache_size))
     cov_cache_hits = 0
     cov_cache_misses = 0
     cov_cache_evictions = 0
@@ -1757,7 +2252,13 @@ def backtest(
         opt_elapsed_ms = (time.perf_counter() - opt_start) * 1000.0
         feasible_flags.append(bool(getattr(result, "feasible", True)))
         projection_iters.append(int(getattr(result, "projection_iterations", 0)))
-        w = result.weights
+        w_opt = result.weights
+        warm_applied_flag = prev_weights_is_warm
+        turn_pre = turnover(prev_weights, w_opt)
+        w = w_opt
+        if prev_weights is not None and decay_value > 0.0:
+            w = (1.0 - decay_value) * w_opt + decay_value * prev_weights
+        turn = turnover(prev_weights, w)
         weights.append(w)
         rebalance_dates.append(rebalance_date)
 
@@ -1767,7 +2268,6 @@ def backtest(
         gross_returns_arr[idx_slice] = gross_block_returns
         length = max(1, block_len)
 
-        turn = turnover(prev_weights, w)
         turnovers_arr[window_idx] = float(turn)
         turnover_violation = False
         if np.isfinite(constraints.max_turnover):
@@ -1814,6 +2314,9 @@ def backtest(
         if benchmark_series is not None and benchmark_realized_arr is not None:
             benchmark_realized_arr[idx_slice] = benchmark_series[start:end]
         prev_weights = w
+        if warm_applied_flag:
+            warm_applied_count += 1
+        prev_weights_is_warm = False
 
         sector_breaches = 0
         sector_exposures: Dict[str, float] = {}
@@ -1987,13 +2490,18 @@ def backtest(
             if downside_vol > 1e-12:
                 block_sortino = float((block_mean_excess * trading_days) / downside_vol)
 
+        turn_pre_val = float(turn_pre)
+        turn_post_val = float(turn)
+
         rebalance_records.append(
             {
                 "date": rebalance_date,
                 "gross_ret": float(np.prod(1.0 + gross_block_returns) - 1.0),
                 "net_tx_ret": float(np.prod(1.0 + tx_block_returns) - 1.0),
                 "net_slip_ret": float(np.prod(1.0 + slip_block_returns) - 1.0),
-                "turnover": float(turn),
+                "turnover": turn_post_val,
+                "turnover_pre_decay": turn_pre_val,
+                "turnover_post_decay": turn_post_val,
                 "tx_cost": float(tx_cost_value),
                 "slippage_cost": float(slip_cost),
                 "sector_breaches": int(sector_breaches),
@@ -2009,6 +2517,8 @@ def backtest(
                 "block_sortino": block_sortino,
                 "block_info_ratio": block_info_ratio,
                 "block_tracking_error": block_tracking_error,
+                "warm_applied": bool(warm_applied_flag),
+                "decay": float(decay_value),
             }
         )
         if rebalance_callback is not None:
@@ -2022,6 +2532,8 @@ def backtest(
                     "slippage": float(slip_cost),
                 },
                 "turnover": float(turn),
+                "turnover_pre_decay": float(turn_pre),
+                "turnover_post_decay": float(turn),
                 "feasible": bool(feasible_flags[-1]),
                 "breaches": {
                     "active": int(active_breaches),
@@ -2041,6 +2553,8 @@ def backtest(
                     "cov_ms": float(cov_elapsed_ms),
                     "opt_ms": float(opt_elapsed_ms),
                 },
+                "warm_applied": bool(warm_applied_flag),
+                "decay": float(decay_value),
             }
             rebalance_callback(log_record)
         if progress_callback is not None:
@@ -2118,6 +2632,8 @@ def backtest(
         else:
             info_ratio = float(active_mean / te)
 
+    warnings_list = list(dict.fromkeys(warm_warnings))
+
     return {
         "dates": realized_dates,
         "returns": realized_returns_arr,
@@ -2157,13 +2673,17 @@ def backtest(
         "projection_iterations": projection_iters,
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
-        "warnings": [],
+        "warnings": warnings_list,
         "cov_cache_size": int(max_cov_cache),
         "cov_cache_hits": int(cov_cache_hits),
         "cov_cache_misses": int(cov_cache_misses),
         "cov_cache_evictions": int(cov_cache_evictions),
         "max_workers": max_workers_value,
         "dtype": float_dtype.name,
+        "decay": decay_value,
+        "warm_start": str(warm_path_obj) if warm_path_obj is not None else None,
+        "warm_align": warm_align_mode,
+        "warm_applied_count": int(warm_applied_count),
     }
 
 
@@ -2313,6 +2833,8 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "net_tx_ret",
         "net_slip_ret",
         "turnover",
+        "turnover_pre_decay",
+        "turnover_post_decay",
         "tx_cost",
         "slippage_cost",
         "sector_breaches",
@@ -2328,6 +2850,8 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "block_sortino",
         "block_info_ratio",
         "block_tracking_error",
+        "warm_applied",
+        "decay",
     ]
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=header)
@@ -2673,6 +3197,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Penalty weight applied to turnover in multi_term objective",
     )
+    parser.add_argument(
+        "--warm-start",
+        type=str,
+        default=None,
+        help="weights.csv from prior run for initial prev_weights",
+    )
+    parser.add_argument(
+        "--warm-align",
+        choices=["by_date", "last_row"],
+        default="last_row",
+        help="match warm-start weights to first rebalance date or use last row",
+    )
+    parser.add_argument(
+        "--decay",
+        type=float,
+        default=0.0,
+        help="Blend current optimal weights with previous allocations (0..1)",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
     parser.add_argument(
@@ -2787,11 +3329,24 @@ def main(args: Optional[Iterable[str]] = None) -> None:
 
     preliminary, _ = parser.parse_known_args(args=args)
     config_path: Optional[Path] = None
+    cfg_validated = False
+    cfg_blob: Dict[str, Any] = {}
     if preliminary.config:
         config_path = Path(preliminary.config)
-        config_overrides = _load_run_config(config_path)
-        config_overrides.pop("config", None)
-        parser.set_defaults(**config_overrides)
+        raw_config = _load_run_config(config_path)
+        try:
+            model = RunConfig.model_validate(raw_config)
+            cfg_blob = model.model_dump()
+            cfg_validated = True
+        except ValidationError as exc:
+            lines = []
+            for err in exc.errors():
+                loc = ".".join(map(str, err.get("loc", []))) or "<root>"
+                lines.append(f"{loc}: {err.get('msg')}")
+            message = "Invalid config:\n  " + "\n  ".join(lines)
+            raise SystemExit(message)
+        cfg_blob.pop("config", None)
+        parser.set_defaults(**cfg_blob)
 
     parsed = parser.parse_args(args=args)
     if not parsed.csv:
@@ -2876,6 +3431,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             dtype=float_dtype,
             cov_cache_size=parsed.cache_cov,
             max_workers=parsed.max_workers,
+            warm_start=parsed.warm_start,
+            warm_align=parsed.warm_align,
+            decay=parsed.decay,
         )
     finally:
         if progress_printer is not None:
@@ -2950,6 +3508,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             config_path,
             results=results,
             extras=constraint_manifest,
+            validated=cfg_validated,
         )
         return
 
@@ -2998,6 +3557,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         config_path,
         results=results,
         extras=constraint_manifest,
+        validated=cfg_validated,
     )
 
     if not parsed.skip_plot:
