@@ -630,6 +630,9 @@ def _write_run_manifest(
         warnings = results.get("warnings")
         if warnings:
             manifest["warnings"] = list(warnings)
+        diagnostics = results.get("factor_diagnostics")
+        if diagnostics is not None:
+            manifest["factor_diagnostics"] = diagnostics
 
     (out_dir / "run_config.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
@@ -2506,6 +2509,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip generating the equity plot",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and configuration without writing backtest artifacts",
+    )
+    parser.add_argument(
         "--tx-cost-bps",
         type=float,
         default=0.0,
@@ -2706,6 +2714,18 @@ def main(args: Optional[Iterable[str]] = None) -> None:
 
     out_dir = Path(parsed.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    constraint_manifest = results.get("constraint_manifest")
+
+    if parsed.dry_run:
+        _write_run_manifest(
+            out_dir,
+            parsed,
+            config_path,
+            results=results,
+            extras=constraint_manifest,
+        )
+        return
+
     _write_metrics(out_dir / "metrics.csv", results)
     _write_rebalance_report(out_dir / "rebalance_report.csv", results)
     _write_equity(out_dir / "equity.csv", results)
@@ -2750,7 +2770,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         parsed,
         config_path,
         results=results,
-        extras=results.get("constraint_manifest"),
+        extras=constraint_manifest,
     )
 
     if not parsed.skip_plot:
