@@ -101,6 +101,18 @@ data.
 
 ---
 
+### Recipes
+
+| Config | Command | Highlights | Expected artifacts |
+| --- | --- | --- | --- |
+| `minimal.yaml` | `neuro-ant-backtest --config examples/configs/minimal.yaml` | Baseline sample-covariance run without factors. | `runs/minimal/metrics.csv`<br>`runs/minimal/rebalance_report.csv`<br>`runs/minimal/weights.csv` |
+| `daily_oas.yaml` | `neuro-ant-backtest --config examples/configs/daily_oas.yaml` | Daily OAS covariance with strict factor alignment, amortized costs, and slippage. | `runs/daily_oas/metrics.csv`<br>`runs/daily_oas/rebalance_report.csv`<br>`runs/daily_oas/factor_diagnostics.json`<br>`runs/daily_oas/weights.csv` |
+| `weekly_subset.yaml` | `neuro-ant-backtest --config examples/configs/weekly_subset.yaml` | Weekly run that allows factor gaps (`subset` alignment) and logs posthoc costs. | `runs/weekly_subset/metrics.csv`<br>`runs/weekly_subset/rebalance_report.csv`<br>`runs/weekly_subset/equity_net_of_tc.csv`<br>`runs/weekly_subset/factor_diagnostics.json` |
+
+Each command resolves paths relative to the repository root. Change `--out` inside the YAML files if you prefer a different artifact directory.
+
+---
+
 ### Verifying CLI outputs
 
 The CLI writes every artifact into the directory passed via `--out`. After a run, list
@@ -130,6 +142,18 @@ If the dataset is shorter than the configured `--lookback`, the CLI still emits
 inspect `run_config.json` for `"warnings": ["no_rebalances"]` to confirm the guardrail
 was triggered. Provide a longer history or decrease the lookback to produce rebalance
 windows.
+
+---
+
+### Troubleshooting
+
+| Symptom | How to resolve |
+| --- | --- |
+| No rebalances (empty `rebalance_report.csv`, `"warnings": ["no_rebalances"]`) | Ensure the dataset has at least `lookback + step` rows or lower the lookback/step so the rolling window fits the history. |
+| Factor gaps reported in `factor_diagnostics.json` | Switch to `factor_align: subset` to allow gaps, adjust `factors_required`, or extend the factor panel so every rebalance date has coverage. |
+| PSD repair warnings or singular covariance | Enable shrinkage via `use_shrinkage: true`, choose a regularized model such as `cov_model: lw`/`oas`, or shorten the lookback relative to the universe size. |
+| NaNs detected in returns or factors | Sanitize inputs before running (drop missing rows, forward-fill, or clip infinities) so the optimizer can project feasible weights. |
+| Reported Sharpe differs from expectations with a risk-free rate | Set `--rf-bps` (CLI) or `risk_free_rate` (API) to your benchmark value and verify `--trading-days` matches the data frequency used to annualize results. |
 
 ---
 
