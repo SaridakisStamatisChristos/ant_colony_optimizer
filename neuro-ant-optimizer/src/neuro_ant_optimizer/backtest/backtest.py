@@ -2262,7 +2262,9 @@ def _read_csv(csv_path: Path):
     return _Frame(values, dates, header_cols)
 
 
-def main(args: Optional[Iterable[str]] = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the argument parser for the backtest CLI."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
@@ -2427,6 +2429,12 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         default=1,
         help="Run SLSQP refinement every k rebalances",
     )
+
+    return parser
+
+
+def main(args: Optional[Iterable[str]] = None) -> None:
+    parser = build_parser()
 
     preliminary, _ = parser.parse_known_args(args=args)
     config_path: Optional[Path] = None
