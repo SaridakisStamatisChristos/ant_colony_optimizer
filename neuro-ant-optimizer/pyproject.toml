@@ -31,7 +31,7 @@ dev = [
   "mypy>=1.10",
   "pre-commit>=3.7",
 ]
-backtest = ["pandas>=2.0", "matplotlib>=3.7"]
+backtest = ["pandas>=2.0", "matplotlib>=3.7", "pydantic>=2.7"]
 
 [project.scripts]
 neuro-ant-backtest = "neuro_ant_optimizer.backtest.backtest:main"

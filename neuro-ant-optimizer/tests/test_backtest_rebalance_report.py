@@ -107,6 +107,8 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         expected_net_tx = float(np.prod(1.0 + tx_block) - 1.0)
 
         assert record["turnover"] == pytest.approx(expected_turn)
+        assert record["turnover_pre_decay"] == pytest.approx(expected_turn)
+        assert record["turnover_post_decay"] == pytest.approx(expected_turn)
         assert record["tx_cost"] == pytest.approx(tc * expected_turn)
         assert record["gross_ret"] == pytest.approx(expected_gross)
         assert record["net_tx_ret"] == pytest.approx(expected_net_tx)
@@ -137,6 +139,8 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         assert record["block_sortino"] == pytest.approx(expected_block_sortino)
         assert record["block_info_ratio"] is None
         assert record["block_tracking_error"] is None
+        assert record["warm_applied"] is False
+        assert record["decay"] == pytest.approx(0.0)
 
     # Ensure per-period net returns align with report calculations
     np.testing.assert_allclose(
@@ -148,10 +152,11 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     bt._write_rebalance_report(report_path, results)
     text = report_path.read_text().splitlines()
     assert text[0] == (
-        "date,gross_ret,net_tx_ret,net_slip_ret,turnover,tx_cost,slippage_cost,"
-        "sector_breaches,active_breaches,group_breaches,factor_bound_breaches,"
-        "factor_inf_norm,factor_missing,first_violation,feasible,projection_iterations,"
-        "block_sharpe,block_sortino,block_info_ratio,block_tracking_error"
+        "date,gross_ret,net_tx_ret,net_slip_ret,turnover,turnover_pre_decay,"
+        "turnover_post_decay,tx_cost,slippage_cost,sector_breaches,active_breaches,"
+        "group_breaches,factor_bound_breaches,factor_inf_norm,factor_missing,first_violation,"
+        "feasible,projection_iterations,block_sharpe,block_sortino,block_info_ratio,"
+        "block_tracking_error,warm_applied,decay"
     )
 
 
