@@ -1209,10 +1209,11 @@ def _build_constraints(n_assets: int) -> PortfolioConstraints:
     )
 
 
-def _frame_to_numpy(frame: Any) -> np.ndarray:
+def _frame_to_numpy(frame: Any, dtype: Optional[np.dtype] = None) -> np.ndarray:
+    np_dtype = np.dtype(dtype) if dtype is not None else np.float64
     if hasattr(frame, "to_numpy"):
-        return frame.to_numpy(dtype=float)  # type: ignore[no-any-return]
-    return np.asarray(frame, dtype=float)
+        return frame.to_numpy(dtype=np_dtype)  # type: ignore[no-any-return]
+    return np.asarray(frame, dtype=np_dtype)
 
 
 def _frame_index(frame: Any, length: int) -> List[Any]:
@@ -1362,6 +1363,9 @@ def backtest(
     trading_days: int = 252,
     progress_callback: Optional[ProgressCallback] = None,
     rebalance_callback: Optional[RebalanceLogCallback] = None,
+    dtype: np.dtype = np.float64,
+    cov_cache_size: int = 8,
+    max_workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -1408,7 +1412,13 @@ def backtest(
         raise ValueError("risk_free_rate must be greater than -100%")
     periodic_rf = float((1.0 + annual_rf) ** (1.0 / trading_days) - 1.0)
 
-    returns = _frame_to_numpy(df)
+    float_dtype = np.dtype(dtype)
+    if float_dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
+        float_dtype = np.dtype(np.float64)
+    max_workers_value = None if max_workers is None else int(max_workers)
+    if max_workers_value is not None and max_workers_value <= 0:
+        raise ValueError("max_workers must be positive when provided")
+    returns = _frame_to_numpy(df, float_dtype)
     if returns.size == 0:
         raise ValueError("input dataframe must contain returns")
 
@@ -1417,8 +1427,8 @@ def backtest(
     dates = _frame_index(df, n_periods)
     benchmark_series: Optional[np.ndarray] = None
     if benchmark is not None:
-        bench_values = _frame_to_numpy(benchmark)
-        bench_values = np.asarray(bench_values, dtype=float)
+        bench_values = _frame_to_numpy(benchmark, float_dtype)
+        bench_values = np.asarray(bench_values, dtype=float_dtype)
         if bench_values.ndim > 2:
             raise ValueError("Benchmark series must be one or two dimensional")
         if bench_values.ndim == 2:
@@ -1427,7 +1437,7 @@ def backtest(
             if bench_values.shape[1] > 1:
                 raise ValueError("Benchmark series must contain exactly one column")
             bench_values = bench_values[:, 0]
-        benchmark_series = np.asarray(bench_values, dtype=float).reshape(-1)
+        benchmark_series = np.asarray(bench_values, dtype=float_dtype).reshape(-1)
         if benchmark_series.size != n_periods:
             raise ValueError("Benchmark length must match returns length")
 
@@ -1462,6 +1472,13 @@ def backtest(
             factors, df, align=factor_align
         )
         factor_missing_dates = set(factor_diagnostics.missing_rebalance_dates)
+        if factor_panel.loadings.dtype != float_dtype:
+            factor_panel = FactorPanel(
+                factor_panel.dates,
+                factor_panel.assets,
+                factor_panel.loadings.astype(float_dtype, copy=False),
+                list(factor_panel.factor_names),
+            )
         if factor_diagnostics.dropped_assets:
             print(
                 "Warning: dropping assets without factor data: "
@@ -1479,8 +1496,9 @@ def backtest(
         factor_names = list(factor_panel.factor_names)
         if factor_targets is not None:
             factor_target_vec = validate_factor_targets(factor_targets, factor_names)
+            factor_target_vec = factor_target_vec.astype(float_dtype, copy=False)
         else:
-            factor_target_vec = np.zeros(len(factor_names), dtype=float)
+            factor_target_vec = np.zeros(len(factor_names), dtype=float_dtype)
         if factors_required and factor_missing_dates:
             sorted_missing = sorted(
                 factor_diagnostics.missing_rebalance_dates, key=_sort_key
@@ -1494,6 +1512,10 @@ def backtest(
     bench_vector, bench_mask, bench_manifest = _prepare_benchmark_weights(
         benchmark_weights, asset_names
     )
+    if bench_vector is not None:
+        bench_vector = bench_vector.astype(float_dtype, copy=False)
+    if bench_mask is not None:
+        bench_mask = bench_mask.astype(bool, copy=False)
     constraint_manifest["benchmark_weights"] = bench_manifest
     group_map, group_bounds, group_manifest = _prepare_active_groups(
         active_group_caps, asset_names
@@ -1505,6 +1527,8 @@ def backtest(
     constraint_manifest["factor_bounds"] = factor_bounds_manifest
 
     optimizer = _build_optimizer(returns.shape[1], seed, risk_free_rate=periodic_rf)
+    if max_workers_value is not None:
+        setattr(optimizer.cfg, "max_workers", max_workers_value)
     if te_target < 0.0:
         raise ValueError("te_target must be non-negative")
     if lambda_te < 0.0:
@@ -1531,8 +1555,10 @@ def backtest(
         constraints.active_group_map = None
         constraints.active_group_bounds = None
     if factor_lower_arr is not None:
+        factor_lower_arr = factor_lower_arr.astype(float_dtype, copy=False)
         constraints.factor_lower_bounds = factor_lower_arr
     if factor_upper_arr is not None:
+        factor_upper_arr = factor_upper_arr.astype(float_dtype, copy=False)
         constraints.factor_upper_bounds = factor_upper_arr
 
     weights: List[np.ndarray] = []
@@ -1549,15 +1575,15 @@ def backtest(
     rebalance_points = list(range(lookback, n_periods, step))
     n_windows = len(rebalance_points)
     total_test_periods = max(n_periods - lookback, 0)
-    gross_returns_arr = np.empty(total_test_periods, dtype=float)
-    realized_returns_arr = np.empty(total_test_periods, dtype=float)
-    net_tx_returns_arr = np.empty(total_test_periods, dtype=float)
-    net_slip_returns_arr = np.empty(total_test_periods, dtype=float)
+    gross_returns_arr = np.empty(total_test_periods, dtype=float_dtype)
+    realized_returns_arr = np.empty(total_test_periods, dtype=float_dtype)
+    net_tx_returns_arr = np.empty(total_test_periods, dtype=float_dtype)
+    net_slip_returns_arr = np.empty(total_test_periods, dtype=float_dtype)
     benchmark_realized_arr = (
-        np.empty(total_test_periods, dtype=float) if benchmark_series is not None else None
+        np.empty(total_test_periods, dtype=float_dtype) if benchmark_series is not None else None
     )
-    slippage_costs = np.zeros(n_windows, dtype=float)
-    turnovers_arr = np.zeros(n_windows, dtype=float)
+    slippage_costs = np.zeros(n_windows, dtype=float_dtype)
+    turnovers_arr = np.zeros(n_windows, dtype=float_dtype)
     cursor = 0
 
     factor_index_map: Optional[Dict[Any, int]] = None
@@ -1567,7 +1593,7 @@ def backtest(
     if not rebalance_points:
         if progress_callback is not None:
             progress_callback(0, 0)
-        empty = np.array([], dtype=float)
+        empty = np.array([], dtype=float_dtype)
         benchmark_returns = empty if benchmark_series is not None else None
         return {
             "dates": [],
@@ -1576,7 +1602,7 @@ def backtest(
             "net_tx_returns": empty,
             "net_slip_returns": empty,
             "equity": empty,
-            "weights": np.empty((0, n_assets), dtype=float),
+            "weights": np.empty((0, n_assets), dtype=float_dtype),
             "rebalance_dates": [],
             "asset_names": asset_names,
             "cov_model": cov_model,
@@ -1609,10 +1635,20 @@ def backtest(
             "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
             "constraint_manifest": constraint_manifest,
             "warnings": ["no_rebalances"],
+            "cov_cache_size": int(max_cov_cache),
+            "cov_cache_hits": 0,
+            "cov_cache_misses": 0,
+            "cov_cache_evictions": 0,
+            "max_workers": max_workers_value,
+            "dtype": float_dtype.name,
         }
 
     # include model + params in the cache key to avoid collisions across models/spans
     cov_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+    max_cov_cache = max(0, int(cov_cache_size))
+    cov_cache_hits = 0
+    cov_cache_misses = 0
+    cov_cache_evictions = 0
 
     if progress_callback is not None:
         progress_callback(0, n_windows)
@@ -1643,11 +1679,14 @@ def backtest(
         cov_key: Optional[Tuple[Any, ...]] = (cov_model, span, window_hash)
         cov_elapsed_ms = 0.0
         cov: Optional[np.ndarray] = None
-        cached_cov = cov_cache.get(cov_key) if cov_key is not None else None
+        cached_cov = (
+            cov_cache.get(cov_key) if (cov_key is not None and max_cov_cache > 0) else None
+        )
         if cached_cov is not None:
             cov_start = time.perf_counter()
             cov = cached_cov.copy()
             cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
+            cov_cache_hits += 1
         if cov is None:
             cov_start = time.perf_counter()
             if cov_model == "ewma":
@@ -1663,10 +1702,12 @@ def backtest(
                 cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
             cov = nearest_psd(cov_raw)
             cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
-            if cov_key is not None:
+            if cov_key is not None and max_cov_cache > 0:
                 cov_cache[cov_key] = cov.copy()
-                while len(cov_cache) > 8:
+                while len(cov_cache) > max_cov_cache:
                     cov_cache.popitem(last=False)
+                    cov_cache_evictions += 1
+            cov_cache_misses += 1
 
         rebalance_date = dates[start]
         factors_missing = False
@@ -1681,6 +1722,7 @@ def backtest(
                 if snapshot is None:
                     factors_missing = True
                 else:
+                    snapshot = snapshot.astype(float_dtype, copy=False)
                     constraints.factor_loadings = snapshot
                     constraints.factor_targets = factor_target_vec
                     current_factor_snapshot = snapshot
@@ -1719,7 +1761,7 @@ def backtest(
         weights.append(w)
         rebalance_dates.append(rebalance_date)
 
-        gross_block_returns = np.asarray(test @ w, dtype=float).reshape(-1)
+        gross_block_returns = np.asarray(test @ w, dtype=float_dtype).reshape(-1)
         block_len = gross_block_returns.size
         idx_slice = slice(cursor, cursor + block_len)
         gross_returns_arr[idx_slice] = gross_block_returns
@@ -1809,7 +1851,7 @@ def backtest(
         active = w.copy()
         tol_active = 1e-9
         if bench_weights is not None:
-            bench_arr = np.asarray(bench_weights, dtype=float).ravel()
+            bench_arr = np.asarray(bench_weights, dtype=float_dtype).ravel()
             if bench_arr.shape != w.shape:
                 raise ValueError("benchmark_weights dimension mismatch with weights")
             if constraints.benchmark_mask is not None:
@@ -2013,7 +2055,7 @@ def backtest(
         benchmark_returns_arr = benchmark_realized_arr[:cursor]
     else:
         benchmark_returns_arr = np.array([])
-    equity = np.cumprod(1.0 + realized_returns_arr)
+    equity = np.cumprod(1.0 + realized_returns_arr, dtype=float_dtype)
     slippage_costs_arr = slippage_costs[: len(weights)] if n_windows else np.array([])
     avg_slippage_bps = (
         float(slippage_costs_arr.mean() * 1e4) if slippage_costs_arr.size else 0.0
@@ -2083,7 +2125,7 @@ def backtest(
         "net_tx_returns": net_tx_returns_arr,
         "net_slip_returns": net_slip_returns_arr,
         "equity": equity,
-        "weights": np.asarray(weights),
+        "weights": np.asarray(weights, dtype=float_dtype),
         "rebalance_dates": rebalance_dates,
         "asset_names": asset_names,
         "cov_model": cov_model,
@@ -2116,6 +2158,12 @@ def backtest(
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
         "warnings": [],
+        "cov_cache_size": int(max_cov_cache),
+        "cov_cache_hits": int(cov_cache_hits),
+        "cov_cache_misses": int(cov_cache_misses),
+        "cov_cache_evictions": int(cov_cache_evictions),
+        "max_workers": max_workers_value,
+        "dtype": float_dtype.name,
     }
 
 
@@ -2138,6 +2186,10 @@ def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
             "te_target",
             "lambda_te",
             "gamma_turnover",
+            "cov_cache_size",
+            "cov_cache_hits",
+            "cov_cache_misses",
+            "cov_cache_evictions",
         ]
         for key in standard_metrics:
             writer.writerow([key, results.get(key)])
@@ -2599,6 +2651,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Penalty weight applied to tracking error in multi_term objective",
     )
     parser.add_argument(
+        "--float32",
+        action="store_true",
+        help="Use float32 for all numpy computations",
+    )
+    parser.add_argument(
+        "--cache-cov",
+        type=int,
+        default=8,
+        help="Maximum number of covariance matrices to cache",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum number of parallel workers to use (if supported)",
+    )
+    parser.add_argument(
         "--gamma-turnover",
         type=float,
         default=0.0,
@@ -2728,6 +2797,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     if not parsed.csv:
         raise ValueError("--csv must be provided via CLI or config")
 
+    float_dtype = np.float32 if parsed.float32 else np.float64
     df = _read_csv(Path(parsed.csv))
     benchmark_df = _read_csv(Path(parsed.benchmark_csv)) if parsed.benchmark_csv else None
     factor_panel = load_factor_panel(Path(parsed.factors)) if parsed.factors else None
@@ -2743,7 +2813,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     factor_bounds_spec = parsed.factor_bounds or None
 
     tx_cost_bps = float(parsed.tx_cost_bps) if parsed.tx_cost_mode != "none" else 0.0
-    returns_arr_for_baseline = _frame_to_numpy(df)
+    returns_arr_for_baseline = _frame_to_numpy(df, float_dtype)
     returns_arr_for_baseline = np.atleast_2d(returns_arr_for_baseline)
     asset_names_for_baseline = _extract_asset_names(df, returns_arr_for_baseline.shape[1])
     all_dates = _frame_index(df, returns_arr_for_baseline.shape[0])
@@ -2803,6 +2873,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             trading_days=parsed.trading_days,
             progress_callback=progress_printer,
             rebalance_callback=jsonl_writer.write if jsonl_writer else None,
+            dtype=float_dtype,
+            cov_cache_size=parsed.cache_cov,
+            max_workers=parsed.max_workers,
         )
     finally:
         if progress_printer is not None:
@@ -2817,13 +2890,13 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             if date not in date_to_ret:
                 raise ValueError("Baseline returns missing date alignment")
             baseline_returns.append(date_to_ret[date])
-        baseline_arr = np.asarray(baseline_returns, dtype=float)
-        baseline_equity = np.cumprod(1.0 + baseline_arr)
+        baseline_arr = np.asarray(baseline_returns, dtype=float_dtype)
+        baseline_equity = np.cumprod(1.0 + baseline_arr, dtype=float_dtype)
         results["baseline_returns"] = baseline_arr
         results["baseline_equity"] = baseline_equity
         results["baseline_label"] = baseline_label
         if baseline_weights is not None:
-            results["baseline_weights"] = baseline_weights
+            results["baseline_weights"] = np.asarray(baseline_weights, dtype=float_dtype)
 
         trading_days = max(1, int(results.get("trading_days", 252)))
         ann_factor = math.sqrt(trading_days)
@@ -2851,7 +2924,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             else:
                 baseline_info_ratio = float(active_mean / te)
 
-        realized_arr = np.asarray(results["returns"], dtype=float)
+        realized_arr = np.asarray(results["returns"], dtype=float_dtype)
         active_vs_baseline = realized_arr - baseline_arr
         alpha_vs_baseline = (
             float(active_vs_baseline.mean() * trading_days) if active_vs_baseline.size else 0.0
@@ -2897,13 +2970,13 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     if isinstance(net_tx_returns, np.ndarray) and net_tx_returns.size:
         net_results = dict(results)
         net_results["returns"] = net_tx_returns
-        net_results["equity"] = np.cumprod(1.0 + net_tx_returns)
+        net_results["equity"] = np.cumprod(1.0 + net_tx_returns, dtype=float_dtype)
         _write_equity(out_dir / "equity_net_of_tc.csv", net_results)
     slip_returns = results.get("slippage_net_returns")
     if isinstance(slip_returns, np.ndarray) and slip_returns.size:
         slip_results = dict(results)
         slip_results["returns"] = slip_returns
-        slip_results["equity"] = np.cumprod(1.0 + slip_returns)
+        slip_results["equity"] = np.cumprod(1.0 + slip_returns, dtype=float_dtype)
         _write_equity(out_dir / "equity_net_of_slippage.csv", slip_results)
     if parsed.factors:
         _write_factor_constraints(out_dir / "factor_constraints.csv", results)
@@ -2933,20 +3006,22 @@ def main(args: Optional[Iterable[str]] = None) -> None:
 
             plt.figure()
             dates = results["dates"]
-            gross_curve = np.cumprod(1.0 + np.asarray(results["gross_returns"], dtype=float))
+            gross_curve = np.cumprod(
+                1.0 + np.asarray(results["gross_returns"], dtype=float_dtype), dtype=float_dtype
+            )
             plt.plot(dates, gross_curve, label="gross")
             if isinstance(net_tx_returns, np.ndarray) and net_tx_returns.size:
-                net_curve = np.cumprod(1.0 + net_tx_returns)
+                net_curve = np.cumprod(1.0 + net_tx_returns, dtype=float_dtype)
                 if not np.allclose(net_curve, gross_curve):
                     plt.plot(dates, net_curve, label="net tx")
             if isinstance(slip_returns, np.ndarray) and slip_returns.size:
-                slip_curve = np.cumprod(1.0 + slip_returns)
+                slip_curve = np.cumprod(1.0 + slip_returns, dtype=float_dtype)
                 if not np.allclose(slip_curve, gross_curve):
                     plt.plot(dates, slip_curve, label="net slippage")
             baseline_equity = results.get("baseline_equity")
             baseline_label_plot = results.get("baseline_label")
             if baseline_equity is not None and baseline_label_plot is not None:
-                baseline_curve = np.asarray(baseline_equity, dtype=float)
+                baseline_curve = np.asarray(baseline_equity, dtype=float_dtype)
                 if baseline_curve.size == gross_curve.size:
                     plt.plot(dates, baseline_curve, label=f"baseline ({baseline_label_plot})")
             plt.title(f"Equity — {parsed.objective}")
