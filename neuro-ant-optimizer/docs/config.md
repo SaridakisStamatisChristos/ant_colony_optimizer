@@ -46,7 +46,8 @@ The CLI and YAML/JSON configs expose the same knobs. The table below lists every
 | `--factor-targets` | `None` | CSV/Parquet/YAML vector of factor targets. |
 | `--factor-align` | `strict` | Factor alignment policy (`strict` requires full coverage, `subset` allows gaps). |
 | `--factors-required` | `False` | Fail if any rebalance window lacks factor data (even in `subset` mode). |
-| `--slippage` | `None` | Slippage model spec (for example `proportional:5`). |
+| `--slippage` | `None` | Slippage model spec (e.g. `impact:k=25,alpha=1.5,spread=2bps`). |
+| `--nt-band` | `0` | No-trade band around the previous weights (accepts decimals, `%`, or `bps`). |
 | `--refine-every` | `1` | Run SLSQP refinement every *k* rebalances. |
 
 ## Configuration files

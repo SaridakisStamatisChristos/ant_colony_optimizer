@@ -569,6 +569,7 @@ _CI_METRIC_KEYS: Tuple[str, ...] = _STANDARD_METRIC_KEYS + _BASELINE_METRIC_KEYS
 class SlippageConfig:
     model: str
     param: float
+    params: Dict[str, float] = field(default_factory=dict)
 
 
 class _ProgressPrinter:
@@ -704,6 +705,31 @@ def _load_sweep_config(path: Path) -> Mapping[str, Any]:
     return data
 
 
+def _parse_fractional_value(text: str) -> float:
+    lowered = text.strip().lower()
+    if lowered.endswith("bps"):
+        lowered = lowered[:-3]
+        return float(lowered) / 1e4
+    if lowered.endswith("bp"):
+        lowered = lowered[:-2]
+        return float(lowered) / 1e4
+    if lowered.endswith("%"):
+        lowered = lowered[:-1]
+        return float(lowered) / 100.0
+    return float(lowered)
+
+
+def _parse_bps_value(text: str) -> float:
+    lowered = text.strip().lower()
+    if lowered.endswith("bps"):
+        lowered = lowered[:-3]
+    elif lowered.endswith("bp"):
+        lowered = lowered[:-2]
+    elif lowered.endswith("%"):
+        return float(lowered[:-1]) * 100.0
+    return float(lowered)
+
+
 if _PYDANTIC_AVAILABLE:
 
     class RunConfig(BaseModel):
@@ -750,6 +776,7 @@ if _PYDANTIC_AVAILABLE:
         log_json: Optional[str] = None
         progress: bool = False
         slippage: Optional[str] = None
+        nt_band: float = Field(ge=0.0, default=0.0)
         metric_alpha: float = Field(ge=0.0, le=1.0, default=0.05)
         warm_start: Optional[str] = None
         warm_align: Literal["by_date", "last_row"] = "last_row"
@@ -823,6 +850,7 @@ else:
             "log_json": None,
             "progress": False,
             "slippage": None,
+            "nt_band": 0.0,
             "metric_alpha": 0.05,
             "warm_start": None,
             "warm_align": "last_row",
@@ -1004,6 +1032,7 @@ else:
                 "gamma_turnover": (0.0, None),
                 "metric_alpha": (0.0, 1.0),
                 "factor_tolerance": (0.0, None),
+                "nt_band": (0.0, None),
                 "decay": (0.0, 1.0),
             }
             for field, bounds in float_fields.items():
@@ -1855,19 +1884,55 @@ def parse_slippage(spec: Optional[str]) -> Optional[SlippageConfig]:
     text = spec.strip().lower()
     if ":" in text:
         model, param_text = text.split(":", 1)
-        try:
-            param = float(param_text)
-        except ValueError as exc:  # pragma: no cover - defensive
-            raise ValueError(f"Invalid slippage parameter '{param_text}'") from exc
+        model = model.strip()
+        param_text = param_text.strip()
     else:
         model = text
-        param = float("nan")
-    defaults = {"proportional": 5.0, "square": 1.0, "vol_scaled": 1.0}
+        param_text = ""
+    defaults = {
+        "proportional": 5.0,
+        "square": 1.0,
+        "vol_scaled": 1.0,
+        "impact": 25.0,
+    }
     if model not in defaults:
         raise ValueError(f"Unsupported slippage model '{model}'")
-    if not np.isfinite(param):
-        param = defaults[model]
-    return SlippageConfig(model=model, param=param)
+    params: Dict[str, float] = {}
+    if model == "impact":
+        if param_text:
+            for chunk in param_text.split(","):
+                if not chunk.strip():
+                    continue
+                if "=" not in chunk:
+                    raise ValueError(
+                        "Impact slippage parameters must be provided as key=value pairs"
+                    )
+                key, value = chunk.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key == "k":
+                    params["k"] = _parse_bps_value(value)
+                elif key == "alpha":
+                    params["alpha"] = float(value)
+                elif key == "spread":
+                    params["spread"] = _parse_fractional_value(value)
+                elif key == "participation":
+                    params["participation"] = _parse_fractional_value(value)
+                else:
+                    raise ValueError(f"Unknown impact slippage parameter '{key}'")
+        params.setdefault("k", defaults[model])
+        params.setdefault("alpha", 1.5)
+        params.setdefault("spread", 0.0)
+        param_value = params["k"]
+    else:
+        if not param_text:
+            param_value = defaults[model]
+        else:
+            try:
+                param_value = float(param_text)
+            except ValueError as exc:  # pragma: no cover - defensive
+                raise ValueError(f"Invalid slippage parameter '{param_text}'") from exc
+    return SlippageConfig(model=model, param=param_value, params=params)
 
 
 def _cross_sectional_volatility(block: np.ndarray) -> float:
@@ -1932,9 +1997,26 @@ def _compute_factor_snapshot(
 
 
 def _compute_slippage_cost(
-    cfg: Optional[SlippageConfig], turn: float, asset_block: np.ndarray
+    cfg: Optional[SlippageConfig],
+    delta: Optional[np.ndarray],
+    asset_block: np.ndarray,
+    turn: float,
 ) -> float:
-    if cfg is None or turn <= 0:
+    if cfg is None:
+        return 0.0
+    if cfg.model == "impact":
+        if delta is None:
+            return 0.0
+        abs_delta = np.abs(np.asarray(delta, dtype=float))
+        if not abs_delta.size:
+            return 0.0
+        k_bps = cfg.params.get("k", cfg.param)
+        alpha = cfg.params.get("alpha", 1.5)
+        spread = cfg.params.get("spread", 0.0)
+        impact_component = (k_bps / 1e4) * float(np.sum(abs_delta ** alpha))
+        spread_component = float(spread) * float(abs_delta.sum())
+        return impact_component + spread_component
+    if turn <= 0:
         return 0.0
     if cfg.model == "proportional":
         return (cfg.param / 1e4) * turn
@@ -1944,6 +2026,60 @@ def _compute_slippage_cost(
         vol = _cross_sectional_volatility(asset_block)
         return cfg.param * turn * vol
     return 0.0
+
+
+def _apply_no_trade_band(
+    target: np.ndarray,
+    previous: Optional[np.ndarray],
+    band: float,
+) -> Tuple[np.ndarray, int]:
+    if previous is None or band <= 0.0:
+        return target, 0
+    prev = np.asarray(previous, dtype=float)
+    desired = np.asarray(target, dtype=float)
+    if prev.shape != desired.shape:
+        raise ValueError("Weight vectors must share the same shape for no-trade band")
+    delta = desired - prev
+    mask = np.abs(delta) <= band
+    hits = int(np.count_nonzero(mask))
+    if hits == 0:
+        return desired, 0
+    adjusted = desired.copy()
+    adjusted[mask] = prev[mask]
+    if hits == adjusted.size:
+        return prev.copy(), hits
+    target_sum = float(desired[~mask].sum())
+    remaining = float(1.0 - prev[mask].sum())
+    if abs(target_sum) > 1e-12:
+        scale = remaining / target_sum
+        adjusted[~mask] = desired[~mask] * scale
+    else:
+        adjusted = prev.copy()
+    return adjusted, hits
+
+
+def _apply_participation_cap(
+    previous: Optional[np.ndarray],
+    target: np.ndarray,
+    cap: Optional[float],
+) -> Tuple[np.ndarray, int]:
+    if previous is None or cap is None or cap <= 0.0:
+        return target, 0
+    prev = np.asarray(previous, dtype=float)
+    desired = np.asarray(target, dtype=float)
+    if prev.shape != desired.shape:
+        raise ValueError("Weight vectors must share the same shape for participation cap")
+    delta = desired - prev
+    abs_delta = np.abs(delta)
+    breaches = abs_delta > cap
+    if not np.any(breaches):
+        return desired, 0
+    clipped = np.clip(delta, -cap, cap)
+    adjusted = prev + clipped
+    total = float(adjusted.sum())
+    if abs(total) > 1e-12:
+        adjusted = adjusted / total
+    return adjusted, int(np.count_nonzero(breaches))
 
 
 def ewma_cov(returns: np.ndarray, span: int = 60) -> np.ndarray:
@@ -2416,6 +2552,7 @@ def backtest(
     factor_align: str = "strict",
     factors_required: bool = False,
     slippage: Optional[SlippageConfig] = None,
+    nt_band: float = 0.0,
     refine_every: int = 1,
     cov_model: str = "sample",
     benchmark: Optional[Any] = None,
@@ -2492,6 +2629,9 @@ def backtest(
     decay_value = float(decay)
     if decay_value < 0.0 or decay_value > 1.0:
         raise ValueError("decay must be between 0 and 1")
+    nt_band_value = float(nt_band)
+    if nt_band_value < 0.0:
+        raise ValueError("nt_band must be non-negative")
 
     float_dtype = np.dtype(dtype)
     if float_dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
@@ -2895,12 +3035,22 @@ def backtest(
         opt_elapsed_ms = (time.perf_counter() - opt_start) * 1000.0
         feasible_flags.append(bool(getattr(result, "feasible", True)))
         projection_iters.append(int(getattr(result, "projection_iterations", 0)))
-        w_opt = result.weights
+        w_opt = np.asarray(result.weights, dtype=float_dtype)
         warm_applied_flag = prev_weights_is_warm
         turn_pre = turnover(prev_weights, w_opt)
-        w = w_opt
+        w_target = w_opt
+        nt_band_hits = 0
+        if nt_band_value > 0.0:
+            w_target, nt_band_hits = _apply_no_trade_band(w_target, prev_weights, nt_band_value)
+            w_target = np.asarray(w_target, dtype=float_dtype)
+        w = w_target
         if prev_weights is not None and decay_value > 0.0:
-            w = (1.0 - decay_value) * w_opt + decay_value * prev_weights
+            w = (1.0 - decay_value) * w_target + decay_value * prev_weights
+        participation_cap = None
+        if slippage is not None:
+            participation_cap = slippage.params.get("participation")
+        w, participation_breaches = _apply_participation_cap(prev_weights, w, participation_cap)
+        w = np.asarray(w, dtype=float_dtype)
         turn = turnover(prev_weights, w)
         weights.append(w)
         rebalance_dates.append(rebalance_date)
@@ -2946,7 +3096,8 @@ def backtest(
             elif tx_cost_mode == "posthoc":
                 tx_block_returns = tx_block_returns - (tx_cost_value / length)
 
-        slip_cost = _compute_slippage_cost(slippage, turn, test)
+        trade_delta = w if prev_weights is None else w - prev_weights
+        slip_cost = _compute_slippage_cost(slippage, trade_delta, test, turn)
         slippage_costs[window_idx] = float(slip_cost)
         slip_block_returns = tx_block_returns.copy()
         if slippage is not None and slip_cost > 0.0:
@@ -3161,6 +3312,8 @@ def backtest(
                 "turnover_post_decay": turn_post_val,
                 "tx_cost": float(tx_cost_value),
                 "slippage_cost": float(slip_cost),
+                "nt_band_hits": int(nt_band_hits),
+                "participation_breaches": int(participation_breaches),
                 "sector_breaches": int(sector_breaches),
                 "active_breaches": int(active_breaches),
                 "group_breaches": int(group_breaches),
@@ -3191,6 +3344,8 @@ def backtest(
                 "turnover": float(turn),
                 "turnover_pre_decay": float(turn_pre),
                 "turnover_post_decay": float(turn),
+                "nt_band_hits": int(nt_band_hits),
+                "participation_breaches": int(participation_breaches),
                 "feasible": bool(feasible_flags[-1]),
                 "breaches": {
                     "active": int(active_breaches),
@@ -4066,6 +4221,8 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "turnover_post_decay",
         "tx_cost",
         "slippage_cost",
+        "nt_band_hits",
+        "participation_breaches",
         "sector_breaches",
         "active_breaches",
         "group_breaches",
@@ -4600,6 +4757,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Slippage model specification (e.g. proportional:5)",
     )
     parser.add_argument(
+        "--nt-band",
+        type=str,
+        default="0",
+        help="No-trade band threshold (e.g. 5bps or 0.001)",
+    )
+    parser.add_argument(
         "--refine-every",
         type=int,
         default=1,
@@ -4683,6 +4846,13 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     benchmark_df = _read_csv(Path(parsed.benchmark_csv)) if parsed.benchmark_csv else None
     factor_panel = load_factor_panel(Path(parsed.factors)) if parsed.factors else None
     slippage_cfg = parse_slippage(parsed.slippage)
+    nt_band_spec = getattr(parsed, "nt_band", 0.0)
+    if isinstance(nt_band_spec, str):
+        nt_band_value = _parse_fractional_value(nt_band_spec)
+    else:
+        nt_band_value = float(nt_band_spec)
+    if nt_band_value < 0.0:
+        raise ValueError("--nt-band must be non-negative")
     factor_target_vec = None
     if parsed.factor_targets:
         if factor_panel is None:
@@ -4732,6 +4902,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         factor_align=parsed.factor_align,
         factors_required=parsed.factors_required,
         slippage=slippage_cfg,
+        nt_band=nt_band_value,
         refine_every=parsed.refine_every,
         cov_model=parsed.cov_model,
         benchmark_weights=benchmark_weights_spec,

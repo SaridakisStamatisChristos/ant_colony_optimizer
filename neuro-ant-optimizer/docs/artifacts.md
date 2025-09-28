@@ -30,6 +30,7 @@ One row per rebalance window with feasibility, turnover, and diagnostic metrics.
 | `gross_ret` / `net_tx_ret` / `net_slip_ret` | Block returns before costs, net of transaction costs, and net of slippage. |
 | `turnover_pre_decay` / `turnover_post_decay` | Turnover before and after applying the decay blend. `turnover` mirrors the post-decay value. |
 | `tx_cost` / `slippage_cost` | Costs incurred during the block. |
+| `nt_band_hits` / `participation_breaches` | Count of assets skipped by the no-trade band and clipped by participation caps. |
 | `sector_breaches` / `active_breaches` / `group_breaches` / `factor_bound_breaches` | Count of constraint violations detected after projection. |
 | `factor_inf_norm` | Infinity norm of factor exposures relative to the target vector. |
 | `factor_missing` | `True` if the factor panel lacked data for this window. |
