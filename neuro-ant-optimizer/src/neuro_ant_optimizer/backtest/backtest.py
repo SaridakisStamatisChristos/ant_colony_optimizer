@@ -12,7 +12,21 @@ import math
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+import time
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    TextIO,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
@@ -38,6 +52,10 @@ except ModuleNotFoundError:  # pragma: no cover - minimal environments
 
 
 SCHEMA_VERSION = "1.0.0"
+
+
+ProgressCallback = Callable[[int, int], None]
+RebalanceLogCallback = Callable[[Dict[str, Any]], None]
 
 
 @dataclass
@@ -139,6 +157,66 @@ class FactorDiagnostics:
 class SlippageConfig:
     model: str
     param: float
+
+
+class _ProgressPrinter:
+    """Render incremental progress updates for CLI runs."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._is_tty = bool(getattr(stream, "isatty", lambda: False)())
+        self._last: Tuple[int, int] = (-1, -1)
+        self._finished = False
+
+    def __call__(self, current: int, total: int) -> None:
+        if current < 0:
+            current = 0
+        if total < 0:
+            total = 0
+        if not self._is_tty and (current, total) == self._last:
+            return
+        if total > 0:
+            pct = (current / total) * 100.0
+        else:
+            pct = 0.0
+        if self._is_tty:
+            msg = f"\rProgress: {current}/{total} ({pct:5.1f}%)"
+            self._stream.write(msg)
+            if total == 0 or current >= total:
+                if not self._finished:
+                    self._stream.write("\n")
+                    self._finished = True
+        else:
+            msg = f"Progress: {current}/{total}"
+            self._stream.write(msg + "\n")
+            if total == 0 or current >= total:
+                self._finished = True
+        self._stream.flush()
+        self._last = (current, total)
+
+    def close(self) -> None:
+        if self._is_tty and not self._finished and self._last != (-1, -1):
+            self._stream.write("\n")
+            self._stream.flush()
+        self._finished = True
+
+
+class _JsonlWriter:
+    """Write JSON objects line-by-line to a file handle."""
+
+    def __init__(self, handle: TextIO) -> None:
+        self._handle = handle
+
+    def write(self, payload: Mapping[str, Any]) -> None:
+        json.dump(payload, self._handle, sort_keys=True)
+        self._handle.write("\n")
+        self._handle.flush()
+
+    def close(self) -> None:
+        try:
+            self._handle.flush()
+        finally:
+            self._handle.close()
 
 
 def _coerce_scalar(text: str) -> Any:
@@ -1131,10 +1209,10 @@ def _build_constraints(n_assets: int) -> PortfolioConstraints:
     )
 
 
-def _frame_to_numpy(frame: Any) -> np.ndarray:
+def _frame_to_numpy(frame: Any, dtype: Any = float) -> np.ndarray:
     if hasattr(frame, "to_numpy"):
-        return frame.to_numpy(dtype=float)  # type: ignore[no-any-return]
-    return np.asarray(frame, dtype=float)
+        return frame.to_numpy(dtype=dtype)  # type: ignore[no-any-return]
+    return np.asarray(frame, dtype=dtype)
 
 
 def _frame_index(frame: Any, length: int) -> List[Any]:
@@ -1282,8 +1360,19 @@ def backtest(
     gamma_turnover: float = 0.0,
     risk_free_rate: float = 0.0,
     trading_days: int = 252,
+    dtype: Any = np.float64,
+    cov_cache_size: int = 8,
+    max_workers: Optional[int] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    rebalance_callback: Optional[RebalanceLogCallback] = None,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
+
+    dtype = np.dtype(dtype)
+    if dtype.kind != "f":
+        raise ValueError("dtype must be a floating-point type")
+    if dtype.itemsize not in (4, 8):
+        raise ValueError("dtype must be float32 or float64")
 
     if lookback <= 0 or step <= 0:
         raise ValueError("lookback and step must be positive integers")
@@ -1328,17 +1417,22 @@ def backtest(
         raise ValueError("risk_free_rate must be greater than -100%")
     periodic_rf = float((1.0 + annual_rf) ** (1.0 / trading_days) - 1.0)
 
-    returns = _frame_to_numpy(df)
+    if cov_cache_size < 0:
+        raise ValueError("cov_cache_size must be non-negative")
+    cov_cache_capacity = int(cov_cache_size)
+
+    returns = _frame_to_numpy(df, dtype=dtype)
     if returns.size == 0:
         raise ValueError("input dataframe must contain returns")
+    returns = np.asarray(returns, dtype=dtype)
 
     set_seed(seed)
     n_periods, n_assets = returns.shape
     dates = _frame_index(df, n_periods)
     benchmark_series: Optional[np.ndarray] = None
     if benchmark is not None:
-        bench_values = _frame_to_numpy(benchmark)
-        bench_values = np.asarray(bench_values, dtype=float)
+        bench_values = _frame_to_numpy(benchmark, dtype=dtype)
+        bench_values = np.asarray(bench_values, dtype=dtype)
         if bench_values.ndim > 2:
             raise ValueError("Benchmark series must be one or two dimensional")
         if bench_values.ndim == 2:
@@ -1347,7 +1441,7 @@ def backtest(
             if bench_values.shape[1] > 1:
                 raise ValueError("Benchmark series must contain exactly one column")
             bench_values = bench_values[:, 0]
-        benchmark_series = np.asarray(bench_values, dtype=float).reshape(-1)
+        benchmark_series = np.asarray(bench_values, dtype=dtype).reshape(-1)
         if benchmark_series.size != n_periods:
             raise ValueError("Benchmark length must match returns length")
 
@@ -1469,15 +1563,15 @@ def backtest(
     rebalance_points = list(range(lookback, n_periods, step))
     n_windows = len(rebalance_points)
     total_test_periods = max(n_periods - lookback, 0)
-    gross_returns_arr = np.empty(total_test_periods, dtype=float)
-    realized_returns_arr = np.empty(total_test_periods, dtype=float)
-    net_tx_returns_arr = np.empty(total_test_periods, dtype=float)
-    net_slip_returns_arr = np.empty(total_test_periods, dtype=float)
+    gross_returns_arr = np.empty(total_test_periods, dtype=dtype)
+    realized_returns_arr = np.empty(total_test_periods, dtype=dtype)
+    net_tx_returns_arr = np.empty(total_test_periods, dtype=dtype)
+    net_slip_returns_arr = np.empty(total_test_periods, dtype=dtype)
     benchmark_realized_arr = (
-        np.empty(total_test_periods, dtype=float) if benchmark_series is not None else None
+        np.empty(total_test_periods, dtype=dtype) if benchmark_series is not None else None
     )
-    slippage_costs = np.zeros(n_windows, dtype=float)
-    turnovers_arr = np.zeros(n_windows, dtype=float)
+    slippage_costs = np.zeros(n_windows, dtype=dtype)
+    turnovers_arr = np.zeros(n_windows, dtype=dtype)
     cursor = 0
 
     factor_index_map: Optional[Dict[Any, int]] = None
@@ -1485,7 +1579,9 @@ def backtest(
         factor_index_map = factor_panel.index_map()
 
     if not rebalance_points:
-        empty = np.array([], dtype=float)
+        if progress_callback is not None:
+            progress_callback(0, 0)
+        empty = np.array([], dtype=dtype)
         benchmark_returns = empty if benchmark_series is not None else None
         return {
             "dates": [],
@@ -1494,7 +1590,7 @@ def backtest(
             "net_tx_returns": empty,
             "net_slip_returns": empty,
             "equity": empty,
-            "weights": np.empty((0, n_assets), dtype=float),
+            "weights": np.empty((0, n_assets), dtype=dtype),
             "rebalance_dates": [],
             "asset_names": asset_names,
             "cov_model": cov_model,
@@ -1527,40 +1623,63 @@ def backtest(
             "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
             "constraint_manifest": constraint_manifest,
             "warnings": ["no_rebalances"],
+            "cov_cache_stats": {
+                "size": cov_cache_capacity,
+                "hits": 0,
+                "misses": 0,
+                "evictions": 0,
+            },
+            "dtype": dtype.name,
+            "max_workers": max_workers,
         }
 
     # include model + params in the cache key to avoid collisions across models/spans
     cov_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+    cov_cache_hits = 0
+    cov_cache_misses = 0
+    cov_cache_evictions = 0
+
+    if progress_callback is not None:
+        progress_callback(0, n_windows)
 
     for window_idx, start in enumerate(rebalance_points):
         end = min(start + step, n_periods)
         train = returns[start - lookback : start]
         test = returns[start:end]
-        mu = train.mean(axis=0)
+        mu = np.asarray(train.mean(axis=0), dtype=dtype)
         bench_stats: Optional[BenchmarkStats] = None
         if benchmark_series is not None:
             bench_train = benchmark_series[start - lookback : start]
             if bench_train.shape[0] != train.shape[0]:
                 raise ValueError("Benchmark lookback does not match returns lookback")
             bench_mean = float(bench_train.mean())
-            centered_b = bench_train - bench_mean
+            centered_b = np.asarray(bench_train - bench_mean, dtype=dtype)
             centered_assets = train - mu
             denom = max(1, centered_b.shape[0] - 1)
-            cov_vector = centered_assets.T @ centered_b / denom
+            cov_vector = (centered_assets.T @ centered_b) / denom
             variance = float(np.dot(centered_b, centered_b) / denom)
             bench_stats = BenchmarkStats(
                 mean=bench_mean,
                 variance=max(variance, 0.0),
-                cov_vector=cov_vector,
+                cov_vector=np.asarray(cov_vector, dtype=float),
             )
         span = ewma_span if cov_model == "ewma" and ewma_span is not None else None
         window_hash = _hash_returns_window(train)
-        cov_key: Optional[Tuple[Any, ...]] = (cov_model, span, window_hash)
+        cov_key: Optional[Tuple[Any, ...]] = None
+        cached_cov: Optional[np.ndarray] = None
+        if cov_cache_capacity > 0:
+            cov_key = (cov_model, span, window_hash)
+            cached_cov = cov_cache.get(cov_key)
+        cov_elapsed_ms = 0.0
         cov: Optional[np.ndarray] = None
-        cached_cov = cov_cache.get(cov_key) if cov_key is not None else None
         if cached_cov is not None:
+            cov_cache_hits += 1
+            cov_start = time.perf_counter()
             cov = cached_cov.copy()
-        if cov is None:
+            cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
+        else:
+            cov_cache_misses += 1
+            cov_start = time.perf_counter()
             if cov_model == "ewma":
                 assert span is not None
                 cov_raw = ewma_cov(train, span=span)
@@ -1573,10 +1692,13 @@ def backtest(
             if optimizer.cfg.use_shrinkage:
                 cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
             cov = nearest_psd(cov_raw)
+            cov = np.asarray(cov, dtype=dtype)
+            cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
             if cov_key is not None:
                 cov_cache[cov_key] = cov.copy()
-                while len(cov_cache) > 8:
+                while len(cov_cache) > cov_cache_capacity:
                     cov_cache.popitem(last=False)
+                    cov_cache_evictions += 1
 
         rebalance_date = dates[start]
         factors_missing = False
@@ -1613,6 +1735,7 @@ def backtest(
 
         constraints.prev_weights = prev_weights
         should_refine = (len(weights) % refine_every) == 0
+        opt_start = time.perf_counter()
         result = optimizer.optimize(
             mu,
             cov,
@@ -1621,13 +1744,14 @@ def backtest(
             refine=should_refine,
             benchmark=bench_stats,
         )
+        opt_elapsed_ms = (time.perf_counter() - opt_start) * 1000.0
         feasible_flags.append(bool(getattr(result, "feasible", True)))
         projection_iters.append(int(getattr(result, "projection_iterations", 0)))
-        w = result.weights
+        w = np.asarray(result.weights, dtype=dtype)
         weights.append(w)
         rebalance_dates.append(rebalance_date)
 
-        gross_block_returns = np.asarray(test @ w, dtype=float).reshape(-1)
+        gross_block_returns = np.asarray(test @ w, dtype=dtype).reshape(-1)
         block_len = gross_block_returns.size
         idx_slice = slice(cursor, cursor + block_len)
         gross_returns_arr[idx_slice] = gross_block_returns
@@ -1717,7 +1841,7 @@ def backtest(
         active = w.copy()
         tol_active = 1e-9
         if bench_weights is not None:
-            bench_arr = np.asarray(bench_weights, dtype=float).ravel()
+            bench_arr = np.asarray(bench_weights, dtype=dtype).ravel()
             if bench_arr.shape != w.shape:
                 raise ValueError("benchmark_weights dimension mismatch with weights")
             if constraints.benchmark_mask is not None:
@@ -1877,6 +2001,40 @@ def backtest(
                 "block_tracking_error": block_tracking_error,
             }
         )
+        if rebalance_callback is not None:
+            log_record: Dict[str, Any] = {
+                "date": _stringify(rebalance_date),
+                "seed": int(seed),
+                "objective": str(objective),
+                "cov_model": str(cov_model),
+                "costs": {
+                    "tx": float(tx_cost_value),
+                    "slippage": float(slip_cost),
+                },
+                "turnover": float(turn),
+                "feasible": bool(feasible_flags[-1]),
+                "breaches": {
+                    "active": int(active_breaches),
+                    "group": int(group_breaches),
+                    "factor": int(factor_bound_breaches),
+                    "sector": int(sector_breaches),
+                },
+                "block": {
+                    "sharpe": float(block_sharpe),
+                    "sortino": float(block_sortino),
+                    "ir": None if block_info_ratio is None else float(block_info_ratio),
+                    "te": None
+                    if block_tracking_error is None
+                    else float(block_tracking_error),
+                },
+                "timings": {
+                    "cov_ms": float(cov_elapsed_ms),
+                    "opt_ms": float(opt_elapsed_ms),
+                },
+            }
+            rebalance_callback(log_record)
+        if progress_callback is not None:
+            progress_callback(window_idx + 1, n_windows)
         cursor += block_len
 
     gross_returns_arr = gross_returns_arr[:cursor]
@@ -1886,13 +2044,20 @@ def backtest(
     if benchmark_realized_arr is not None:
         benchmark_returns_arr = benchmark_realized_arr[:cursor]
     else:
-        benchmark_returns_arr = np.array([])
-    equity = np.cumprod(1.0 + realized_returns_arr)
-    slippage_costs_arr = slippage_costs[: len(weights)] if n_windows else np.array([])
+        benchmark_returns_arr = np.array([], dtype=dtype)
+    realized_for_equity = realized_returns_arr.astype(dtype, copy=False)
+    equity = np.cumprod(
+        np.add(realized_for_equity, dtype.type(1.0), dtype=dtype), dtype=dtype
+    )
+    slippage_costs_arr = (
+        slippage_costs[: len(weights)] if n_windows else np.array([], dtype=dtype)
+    )
     avg_slippage_bps = (
         float(slippage_costs_arr.mean() * 1e4) if slippage_costs_arr.size else 0.0
     )
-    turnovers_used = turnovers_arr[: len(weights)] if n_windows else np.array([])
+    turnovers_used = (
+        turnovers_arr[: len(weights)] if n_windows else np.array([], dtype=dtype)
+    )
     slippage_net_returns: Optional[np.ndarray] = None
     if slippage is not None:
         slippage_net_returns = net_slip_returns_arr.copy()
@@ -1950,6 +2115,19 @@ def backtest(
         else:
             info_ratio = float(active_mean / te)
 
+    cov_cache_stats = {
+        "size": cov_cache_capacity,
+        "hits": cov_cache_hits,
+        "misses": cov_cache_misses,
+        "evictions": cov_cache_evictions,
+    }
+
+    weights_arr = (
+        np.asarray(weights, dtype=dtype)
+        if weights
+        else np.empty((0, n_assets), dtype=dtype)
+    )
+
     return {
         "dates": realized_dates,
         "returns": realized_returns_arr,
@@ -1957,7 +2135,7 @@ def backtest(
         "net_tx_returns": net_tx_returns_arr,
         "net_slip_returns": net_slip_returns_arr,
         "equity": equity,
-        "weights": np.asarray(weights),
+        "weights": weights_arr,
         "rebalance_dates": rebalance_dates,
         "asset_names": asset_names,
         "cov_model": cov_model,
@@ -1990,6 +2168,9 @@ def backtest(
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
         "warnings": [],
+        "cov_cache_stats": cov_cache_stats,
+        "dtype": dtype.name,
+        "max_workers": max_workers,
     }
 
 
@@ -2481,6 +2662,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
     parser.add_argument(
+        "--log-json",
+        type=str,
+        default=None,
+        help="Write per-rebalance JSON lines to the given file",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Display progress updates during the backtest run",
+    )
+    parser.add_argument(
+        "--float32",
+        action="store_true",
+        help="Use float32 precision for internal backtest arrays",
+    )
+    parser.add_argument(
+        "--cache-cov",
+        type=int,
+        default=8,
+        help="Number of covariance matrices to cache (0 disables caching)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum worker threads for future parallel execution",
+    )
+    parser.add_argument(
         "--out-format",
         choices=["csv", "parquet"],
         default="csv",
@@ -2606,7 +2815,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     factor_bounds_spec = parsed.factor_bounds or None
 
     tx_cost_bps = float(parsed.tx_cost_bps) if parsed.tx_cost_mode != "none" else 0.0
-    returns_arr_for_baseline = _frame_to_numpy(df)
+    run_dtype = np.float32 if parsed.float32 else np.float64
+    returns_arr_for_baseline = _frame_to_numpy(df, dtype=run_dtype)
     returns_arr_for_baseline = np.atleast_2d(returns_arr_for_baseline)
     asset_names_for_baseline = _extract_asset_names(df, returns_arr_for_baseline.shape[1])
     all_dates = _frame_index(df, returns_arr_for_baseline.shape[0])
@@ -2625,36 +2835,56 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             cap_weights_path=Path(parsed.cap_weights) if parsed.cap_weights else None,
         )
 
-    results = backtest(
-        df,
-        lookback=parsed.lookback,
-        step=parsed.step,
-        ewma_span=parsed.ewma_span,
-        objective=parsed.objective,
-        seed=parsed.seed,
-        tx_cost_bps=tx_cost_bps,
-        tx_cost_mode=parsed.tx_cost_mode,
-        metric_alpha=parsed.metric_alpha,
-        factors=factor_panel,
-        factor_targets=factor_target_vec,
-        factor_tolerance=parsed.factor_tolerance,
-        factor_align=parsed.factor_align,
-        factors_required=parsed.factors_required,
-        slippage=slippage_cfg,
-        refine_every=parsed.refine_every,
-        cov_model=parsed.cov_model,
-        benchmark=benchmark_df,
-        benchmark_weights=benchmark_weights_spec,
-        active_min=parsed.active_min,
-        active_max=parsed.active_max,
-        active_group_caps=active_group_spec,
-        factor_bounds=factor_bounds_spec,
-        te_target=parsed.te_target,
-        lambda_te=parsed.lambda_te,
-        gamma_turnover=parsed.gamma_turnover,
-        risk_free_rate=float(parsed.rf_bps) / 1e4,
-        trading_days=parsed.trading_days,
-    )
+    jsonl_writer: Optional[_JsonlWriter] = None
+    progress_printer: Optional[_ProgressPrinter] = None
+    try:
+        if parsed.log_json:
+            log_path = Path(parsed.log_json)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            jsonl_writer = _JsonlWriter(log_path.open("w", encoding="utf-8"))
+        if parsed.progress:
+            progress_printer = _ProgressPrinter(sys.stderr)
+
+        results = backtest(
+            df,
+            lookback=parsed.lookback,
+            step=parsed.step,
+            ewma_span=parsed.ewma_span,
+            objective=parsed.objective,
+            seed=parsed.seed,
+            tx_cost_bps=tx_cost_bps,
+            tx_cost_mode=parsed.tx_cost_mode,
+            metric_alpha=parsed.metric_alpha,
+            factors=factor_panel,
+            factor_targets=factor_target_vec,
+            factor_tolerance=parsed.factor_tolerance,
+            factor_align=parsed.factor_align,
+            factors_required=parsed.factors_required,
+            slippage=slippage_cfg,
+            refine_every=parsed.refine_every,
+            cov_model=parsed.cov_model,
+            benchmark=benchmark_df,
+            benchmark_weights=benchmark_weights_spec,
+            active_min=parsed.active_min,
+            active_max=parsed.active_max,
+            active_group_caps=active_group_spec,
+            factor_bounds=factor_bounds_spec,
+            te_target=parsed.te_target,
+            lambda_te=parsed.lambda_te,
+            gamma_turnover=parsed.gamma_turnover,
+            risk_free_rate=float(parsed.rf_bps) / 1e4,
+            trading_days=parsed.trading_days,
+            dtype=run_dtype,
+            cov_cache_size=parsed.cache_cov,
+            max_workers=parsed.max_workers,
+            progress_callback=progress_printer,
+            rebalance_callback=jsonl_writer.write if jsonl_writer else None,
+        )
+    finally:
+        if progress_printer is not None:
+            progress_printer.close()
+        if jsonl_writer is not None:
+            jsonl_writer.close()
 
     if baseline_series_full is not None:
         date_to_ret = {date: float(ret) for date, ret in zip(all_dates, baseline_series_full)}
