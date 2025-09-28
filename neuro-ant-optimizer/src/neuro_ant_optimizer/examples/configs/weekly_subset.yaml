@@ -1,0 +1,17 @@
+# Weekly rebalance allowing factor gaps (logged in factor_diagnostics.json)
+csv: data/returns_weekly.csv
+factors: data/factors_weekly.csv
+lookback: 52
+step: 5
+cov_model: lw
+objective: sharpe
+refine_every: 2
+seed: 11
+factor_align: subset
+factors_required: false
+factor_tolerance: 5e-6
+tx_cost_bps: 5
+tx_cost_mode: posthoc
+slippage: square:1.5
+skip_plot: true
+out: runs/weekly_subset

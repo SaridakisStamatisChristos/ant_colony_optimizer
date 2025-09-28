@@ -10,7 +10,9 @@ except Exception:  # pragma: no cover
     torch = None  # type: ignore
 
 
-def set_seed(seed: int, deterministic_torch: bool = True) -> None:
+def set_seed(
+    seed: int, deterministic_torch: bool = True, *, strict: bool = False
+) -> None:
     """Set numpy (and torch if present) seeds; prefer deterministic backends."""
 
     np.random.seed(seed)
@@ -24,8 +26,10 @@ def set_seed(seed: int, deterministic_torch: bool = True) -> None:
             _t.use_deterministic_algorithms(True)
             _t.backends.cudnn.benchmark = False
             _t.backends.cudnn.deterministic = True
-        except Exception:
-            pass
+        except Exception as exc:
+            if strict:
+                raise RuntimeError("Deterministic torch backends unavailable") from exc
+            return
 
 
 def nearest_psd(cov: np.ndarray, eps: float = 1e-10) -> np.ndarray:

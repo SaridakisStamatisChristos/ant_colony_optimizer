@@ -1,0 +1,19 @@
+# Sector/group-level active caps using benchmark-relative exposures
+csv: data/returns.csv
+benchmark_csv: data/benchmark.csv
+lookback: 252
+step: 21
+objective: sharpe
+cov_model: oas
+active_min: -0.03
+active_max: 0.04
+active_group_caps:
+  Tech:
+    members: [AAPL, MSFT, NVDA, AMD]
+    bounds: [-0.03, 0.04]
+  Industrials:
+    members: [BA, HON, LMT]
+    cap: 0.05
+refine_every: 2
+seed: 5
+out: runs/active_groups

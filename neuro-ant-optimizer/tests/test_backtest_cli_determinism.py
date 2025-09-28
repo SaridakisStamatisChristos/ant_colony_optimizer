@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from neuro_ant_optimizer.backtest.backtest import main as backtest_main
@@ -41,3 +42,27 @@ def test_backtest_cli_determinism(tmp_path: Path) -> None:
         first_bytes = (first_out / artifact).read_bytes()
         second_bytes = (second_out / artifact).read_bytes()
         assert first_bytes == second_bytes, f"{artifact} mismatch"
+
+
+def test_backtest_cli_manifest_records_deterministic(tmp_path: Path) -> None:
+    out_dir = tmp_path / "dry"
+    args = [
+        "--csv",
+        "backtest/sample_returns.csv",
+        "--lookback",
+        "5",
+        "--step",
+        "2",
+        "--objective",
+        "sharpe",
+        "--seed",
+        "123",
+        "--out",
+        str(out_dir),
+        "--dry-run",
+        "--deterministic",
+        "--skip-plot",
+    ]
+    backtest_main(args)
+    manifest = json.loads((out_dir / "run_config.json").read_text())
+    assert manifest["deterministic_torch"] is True

@@ -1,0 +1,33 @@
+# Combined constraint demo: active bounds, groups, and factor exposures
+csv: data/returns.csv
+benchmark_csv: data/benchmark.csv
+factors: data/factors_style.csv
+lookback: 252
+step: 21
+objective: sharpe
+cov_model: lw
+active_min: -0.04
+active_max: 0.05
+active_group_caps:
+  GrowthTech:
+    members: [AAPL, MSFT, NVDA, AMD]
+    bounds: [-0.05, 0.06]
+  Industrials:
+    members: [BA, HON, LMT]
+    cap: 0.05
+  EnergyFinancials:
+    members: [JPM, XOM]
+    bounds: [-0.04, 0.04]
+factor_bounds:
+  value:
+    bounds: [-0.12, 0.12]
+  momentum:
+    lower: -0.05
+    upper: 0.05
+  quality:
+    bounds: [-0.08, 0.08]
+factor_tolerance: 2e-5
+refine_every: 2
+seed: 19
+skip_plot: true
+out: runs/active_constraints

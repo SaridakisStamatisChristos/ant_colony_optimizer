@@ -1,0 +1,15 @@
+site_name: Neuro Ant Optimizer
+nav:
+  - Home: index.md
+  - Configuration: config.md
+  - Artifacts: artifacts.md
+  - Reproducibility: reproducibility.md
+theme:
+  name: readthedocs
+repo_url: https://github.com/quantresearch/neuro-ant-optimizer
+docs_dir: docs
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
