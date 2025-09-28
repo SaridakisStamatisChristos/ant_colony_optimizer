@@ -31,8 +31,11 @@ from typing import (
     Literal,
     MutableMapping,
 )
+from types import SimpleNamespace
 
 import numpy as np
+from scipy.cluster.hierarchy import linkage
+from scipy.spatial.distance import squareform
 
 from neuro_ant_optimizer import __version__
 from neuro_ant_optimizer.constraints import PortfolioConstraints
@@ -95,6 +98,52 @@ CovarianceFunction = Callable[..., np.ndarray]
 
 _CUSTOM_OBJECTIVE_REGISTRY: Dict[str, ObjectiveFunction] = {}
 _COVARIANCE_REGISTRY: Dict[str, CovarianceFunction] = {}
+
+
+@dataclass(frozen=True)
+class CovarianceModelSpec:
+    fn: CovarianceFunction
+    params: Mapping[str, Any]
+    base: str
+    label: str
+    is_custom: bool
+
+
+def _coerce_parameter_value(value: str) -> Any:
+    text = str(value).strip()
+    lower = text.lower()
+    if lower == "none":
+        return None
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def _parse_cov_model_spec(raw: str) -> Tuple[str, Dict[str, Any]]:
+    base, *tokens = raw.split(":")
+    params: Dict[str, Any] = {}
+    for token in tokens:
+        if not token:
+            continue
+        if "=" not in token:
+            raise ValueError(
+                "Covariance model parameters must be provided as key=value pairs"
+            )
+        key, value = token.split("=", 1)
+        key = key.strip().lower()
+        if not key:
+            raise ValueError("Covariance model parameter keys must be non-empty")
+        params[key] = _coerce_parameter_value(value)
+    return base, params
 
 
 @dataclass(frozen=True)
@@ -2147,9 +2196,168 @@ def _oas_cov(returns: np.ndarray) -> np.ndarray:
     return 0.5 * (Sigma + Sigma.T)
 
 
+def _ridge_cov(returns: np.ndarray, alpha: float = 0.05) -> np.ndarray:
+    X = np.asarray(returns, dtype=float)
+    if X.size == 0:
+        return np.zeros((0, 0), dtype=float)
+    cov = _sample_cov(X)
+    if cov.size == 0:
+        return cov
+    lam = float(alpha)
+    if lam < 0.0:
+        lam = 0.0
+    n = cov.shape[0]
+    ridge = cov + lam * np.eye(n, dtype=float)
+    return 0.5 * (ridge + ridge.T)
+
+
+def _soft_threshold(value: float, lam: float) -> float:
+    if value > lam:
+        return value - lam
+    if value < -lam:
+        return value + lam
+    return 0.0
+
+
+def _lasso_coordinate_descent(
+    gram: np.ndarray,
+    target: np.ndarray,
+    alpha: float,
+    *,
+    tol: float = 1e-5,
+    max_iter: int = 100,
+) -> np.ndarray:
+    size = gram.shape[0]
+    if size == 0:
+        return np.zeros(0, dtype=float)
+    diag = np.diag(gram).copy()
+    diag = np.where(diag <= 0, 1e-12, diag)
+    beta = np.zeros(size, dtype=float)
+    lam = float(max(alpha, 0.0))
+    for _ in range(max_iter):
+        beta_old = beta.copy()
+        for j in range(size):
+            residual = target[j] - np.dot(gram[j], beta) + gram[j, j] * beta[j]
+            beta[j] = _soft_threshold(residual, lam) / max(gram[j, j], 1e-12)
+        if np.max(np.abs(beta - beta_old)) <= tol:
+            break
+    return beta
+
+
+def _graphical_lasso(emp_cov: np.ndarray, alpha: float, *, max_iter: int, tol: float) -> np.ndarray:
+    S = np.asarray(emp_cov, dtype=float)
+    n_features = S.shape[0]
+    if n_features == 0:
+        return np.zeros((0, 0), dtype=float)
+    covariance = S.copy()
+    precision = np.linalg.pinv(covariance + alpha * np.eye(n_features, dtype=float))
+    indices = np.arange(n_features)
+    lam = float(max(alpha, 0.0))
+    for _ in range(max(1, int(max_iter))):
+        precision_prev = precision.copy()
+        for idx in range(n_features):
+            mask = indices != idx
+            cov_11 = covariance[np.ix_(mask, mask)]
+            if cov_11.size == 0:
+                covariance[idx, idx] = max(float(S[idx, idx]), 1e-12)
+                precision[idx, idx] = 1.0 / max(covariance[idx, idx], 1e-12)
+                continue
+            s12 = S[mask, idx]
+            beta = _lasso_coordinate_descent(
+                cov_11,
+                s12,
+                lam,
+                tol=max(tol, 1e-8),
+                max_iter=max_iter,
+            )
+            cov12 = cov_11 @ beta
+            covariance[idx, mask] = cov12
+            covariance[mask, idx] = cov12
+            w_ii = max(float(S[idx, idx]), 1e-12)
+            theta_ii_denom = max(w_ii - float(np.dot(beta, cov12)), 1e-12)
+            theta_ii = 1.0 / theta_ii_denom
+            precision[idx, idx] = theta_ii
+            precision[mask, idx] = precision[idx, mask] = -theta_ii * beta
+        if np.max(np.abs(precision - precision_prev)) <= tol:
+            break
+    covariance = 0.5 * (covariance + covariance.T)
+    covariance[np.diag_indices_from(covariance)] = np.maximum(
+        covariance.diagonal(), 1e-10
+    )
+    return nearest_psd(covariance)
+
+
+def _glasso_cov(
+    returns: np.ndarray,
+    *,
+    alpha: float = 0.01,
+    max_iter: int = 100,
+    tol: float = 1e-4,
+) -> np.ndarray:
+    X = np.asarray(returns, dtype=float)
+    if X.size == 0:
+        return np.zeros((0, 0), dtype=float)
+    emp_cov = _sample_cov(X)
+    lam = float(alpha)
+    if lam <= 0.0:
+        return nearest_psd(emp_cov)
+    return _graphical_lasso(emp_cov, lam, max_iter=max_iter, tol=tol)
+
+
+def _bayesian_cov(
+    returns: np.ndarray,
+    *,
+    nu: Optional[float] = None,
+    prior_scale: Optional[float] = None,
+) -> np.ndarray:
+    X = np.asarray(returns, dtype=float)
+    T, N = X.shape
+    if N == 0:
+        return np.zeros((0, 0), dtype=float)
+    if T <= 1:
+        scale = float(prior_scale) if prior_scale is not None else 1.0
+        return scale * np.eye(N, dtype=float)
+    Xc = X - X.mean(axis=0, keepdims=True)
+    sample = (Xc.T @ Xc) / (T - 1)
+    nu_value = float(nu) if nu is not None else float(N + 2)
+    nu_value = max(nu_value, 0.0)
+    if prior_scale is None:
+        prior = np.diag(np.diag(sample))
+    else:
+        prior = float(prior_scale) * np.eye(N, dtype=float)
+    total = float(T + nu_value)
+    if total <= 0:
+        return nearest_psd(sample)
+    shrunk = (T / total) * sample + (nu_value / total) * prior
+    return 0.5 * (shrunk + shrunk.T)
+
+
 register_cov_model("sample", lambda returns, **_: _sample_cov(np.asarray(returns, dtype=float)))
 register_cov_model("lw", lambda returns, **_: _lw_cov(np.asarray(returns, dtype=float)))
 register_cov_model("oas", lambda returns, **_: _oas_cov(np.asarray(returns, dtype=float)))
+register_cov_model(
+    "ridge",
+    lambda returns, **kw: _ridge_cov(
+        np.asarray(returns, dtype=float), alpha=float(kw.get("alpha", 0.05))
+    ),
+)
+register_cov_model(
+    "glasso",
+    lambda returns, **kw: _glasso_cov(
+        np.asarray(returns, dtype=float),
+        alpha=float(kw.get("alpha", 0.01)),
+        max_iter=int(kw.get("max_iter", 100)),
+        tol=float(kw.get("tol", 1e-4)),
+    ),
+)
+register_cov_model(
+    "bayesian",
+    lambda returns, **kw: _bayesian_cov(
+        np.asarray(returns, dtype=float),
+        nu=kw.get("nu"),
+        prior_scale=kw.get("prior_scale"),
+    ),
+)
 
 
 def _ewma_adapter(returns: np.ndarray, *, span: Optional[int] = None, **_: Any) -> np.ndarray:
@@ -2158,6 +2366,86 @@ def _ewma_adapter(returns: np.ndarray, *, span: Optional[int] = None, **_: Any) 
 
 
 register_cov_model("ewma", _ewma_adapter)
+
+
+def _hrp_quasi_diag(linkage_matrix: np.ndarray) -> List[int]:
+    link = np.asarray(linkage_matrix, dtype=float)
+    if link.size == 0:
+        return []
+    n = link.shape[0] + 1
+    order = [int(link[-1, 0]), int(link[-1, 1])]
+    while any(idx >= n for idx in order):
+        new_order: List[int] = []
+        for idx in order:
+            if idx < n:
+                new_order.append(int(idx))
+            else:
+                child = int(idx - n)
+                new_order.append(int(link[child, 0]))
+                new_order.append(int(link[child, 1]))
+        order = new_order
+    return [int(i) for i in order]
+
+
+def _hrp_cluster_variance(cov: np.ndarray, indices: Sequence[int]) -> float:
+    if not indices:
+        return 0.0
+    sub = cov[np.ix_(indices, indices)]
+    diag = np.diag(sub)
+    diag = np.where(diag <= 0, 1e-12, diag)
+    inv_diag = 1.0 / diag
+    weights = inv_diag / inv_diag.sum()
+    variance = float(weights @ sub @ weights)
+    return max(variance, 0.0)
+
+
+def _hierarchical_risk_parity_weights(cov: np.ndarray) -> np.ndarray:
+    cov = np.asarray(cov, dtype=float)
+    n = cov.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=float)
+    if n == 1:
+        return np.array([1.0], dtype=float)
+    diag = np.diag(cov)
+    denom = np.sqrt(np.outer(diag, diag))
+    corr = np.divide(cov, denom, out=np.ones_like(cov), where=denom > 0)
+    corr = np.clip(corr, -1.0, 1.0)
+    dist = np.sqrt(np.maximum(0.0, 0.5 * (1.0 - corr)))
+    condensed = squareform(dist, checks=False)
+    if condensed.size == 0:
+        return np.ones(n, dtype=float) / n
+    link = linkage(condensed, method="single")
+    order = _hrp_quasi_diag(link)
+    if not order:
+        return np.ones(n, dtype=float) / n
+    weights = np.ones(len(order), dtype=float)
+    stack: List[List[int]] = [list(range(len(order)))]
+    while stack:
+        cluster = stack.pop()
+        if len(cluster) <= 1:
+            continue
+        split = len(cluster) // 2
+        left = cluster[:split]
+        right = cluster[split:]
+        left_idx = [order[i] for i in left]
+        right_idx = [order[i] for i in right]
+        var_left = _hrp_cluster_variance(cov, left_idx)
+        var_right = _hrp_cluster_variance(cov, right_idx)
+        total = var_left + var_right
+        alloc_left = 0.5 if total <= 0 else 1.0 - var_left / total
+        for idx in left:
+            weights[idx] *= alloc_left
+        for idx in right:
+            weights[idx] *= 1.0 - alloc_left
+        stack.append(right)
+        stack.append(left)
+    final = np.zeros(n, dtype=float)
+    for position, asset_idx in enumerate(order):
+        final[asset_idx] = weights[position]
+    total_weight = final.sum()
+    if total_weight <= 0:
+        return np.ones(n, dtype=float) / n
+    return final / total_weight
 
 
 def turnover(previous: Optional[np.ndarray], current: np.ndarray) -> float:
@@ -2465,6 +2753,7 @@ _OBJECTIVE_MAP: Dict[str, OptimizationObjective] = {
     "max_return": OptimizationObjective.MAX_RETURN,
     "min_variance": OptimizationObjective.MIN_VARIANCE,
     "risk_parity": OptimizationObjective.RISK_PARITY,
+    "hrp": OptimizationObjective.HRP,
     "min_cvar": OptimizationObjective.MIN_CVAR,
     "tracking_error": OptimizationObjective.TRACKING_ERROR_MIN,
     "min_tracking_error": OptimizationObjective.TRACKING_ERROR_MIN,
@@ -2516,13 +2805,10 @@ def _resolve_objective(name: str) -> ObjectiveLike:
     )
 
 
-def _resolve_cov_model(name: str) -> CovarianceFunction:
+def _resolve_cov_model(name: str) -> CovarianceModelSpec:
     raw = str(name).strip()
     if not raw:
         raise ValueError("cov_model must be a non-empty string")
-    lower = raw.lower()
-    if lower in _COVARIANCE_REGISTRY:
-        return _COVARIANCE_REGISTRY[lower]
     if raw.startswith("custom:"):
         parts = raw.split(":", 2)
         if len(parts) != 3:
@@ -2530,7 +2816,20 @@ def _resolve_cov_model(name: str) -> CovarianceFunction:
                 "Custom cov_model must be specified as 'custom:<module>:<callable>'"
             )
         target = f"{parts[1]}:{parts[2]}"
-        return _import_callable(target, "covariance model")
+        fn = _import_callable(target, "covariance model")
+        return CovarianceModelSpec(fn=fn, params={}, base=raw, label=raw, is_custom=True)
+    base, params = _parse_cov_model_spec(raw)
+    lower = base.strip().lower()
+    if lower in _COVARIANCE_REGISTRY:
+        fn = _COVARIANCE_REGISTRY[lower]
+        label = raw if params else lower
+        return CovarianceModelSpec(
+            fn=fn,
+            params=params,
+            base=lower,
+            label=label,
+            is_custom=False,
+        )
     raise ValueError(
         f"Unknown cov_model '{name}' (available: {get_available_cov_models()})"
     )
@@ -2584,16 +2883,23 @@ def backtest(
     if refine_every <= 0:
         raise ValueError("refine_every must be positive")
     objective_spec = _resolve_objective(objective)
-    cov_model_name = str(cov_model)
-    cov_callable = _resolve_cov_model(cov_model_name)
-    cov_is_custom = cov_model_name.startswith("custom:")
-    cov_model_lower = cov_model_name.lower()
-    cov_cache_name = cov_model_name if cov_is_custom else cov_model_lower
-    cov_model_label = cov_model_name if cov_is_custom else cov_model_lower
+    cov_model_spec = str(cov_model)
+    cov_spec = _resolve_cov_model(cov_model_spec)
+    cov_callable = cov_spec.fn
+    cov_params = dict(cov_spec.params)
+    cov_is_custom = cov_spec.is_custom
+    cov_model_lower = cov_spec.base
+    cov_model_label = cov_spec.label
     if cov_model_lower != "ewma":
         ewma_span = None
     else:
-        if ewma_span is None:
+        span_override = cov_params.pop("span", None)
+        if span_override is not None:
+            try:
+                ewma_span = int(span_override)
+            except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+                raise ValueError("ewma span parameter must be an integer") from exc
+        elif ewma_span is None:
             ewma_span = 60
         try:
             ewma_span = int(ewma_span)
@@ -2601,6 +2907,8 @@ def backtest(
             raise ValueError("ewma_span must be an integer") from exc
         if ewma_span < 2:
             raise ValueError("ewma_span must be >= 2")
+    cov_cache_base = cov_model_spec if cov_is_custom else cov_model_lower
+    cov_param_items = tuple(sorted(cov_params.items()))
 
     min_active_val = _coerce_optional_float(active_min)
     max_active_val = _coerce_optional_float(active_max)
@@ -2959,7 +3267,12 @@ def backtest(
             )
         span = ewma_span if cov_model_lower == "ewma" and ewma_span is not None else None
         window_hash = _hash_returns_window(train)
-        cov_key: Optional[Tuple[Any, ...]] = (cov_cache_name, span, window_hash)
+        cov_key: Optional[Tuple[Any, ...]] = (
+            cov_cache_base,
+            cov_param_items,
+            span,
+            window_hash,
+        )
         cov_elapsed_ms = 0.0
         cov: Optional[np.ndarray] = None
         cached_cov = (
@@ -2972,7 +3285,7 @@ def backtest(
             cov_cache_hits += 1
         if cov is None:
             cov_start = time.perf_counter()
-            cov_kwargs: Dict[str, Any] = {}
+            cov_kwargs: Dict[str, Any] = dict(cov_params)
             if span is not None:
                 cov_kwargs["span"] = span
             cov_raw = np.asarray(cov_callable(train, **cov_kwargs), dtype=float)
@@ -3024,14 +3337,22 @@ def backtest(
         constraints.prev_weights = prev_weights
         should_refine = (len(weights) % refine_every) == 0
         opt_start = time.perf_counter()
-        result = optimizer.optimize(
-            mu,
-            cov,
-            constraints,
-            objective=objective_spec,
-            refine=should_refine,
-            benchmark=bench_stats,
-        )
+        if objective_spec == OptimizationObjective.HRP:
+            hrp_weights = _hierarchical_risk_parity_weights(cov)
+            result = SimpleNamespace(
+                weights=hrp_weights,
+                feasible=True,
+                projection_iterations=0,
+            )
+        else:
+            result = optimizer.optimize(
+                mu,
+                cov,
+                constraints,
+                objective=objective_spec,
+                refine=should_refine,
+                benchmark=bench_stats,
+            )
         opt_elapsed_ms = (time.perf_counter() - opt_start) * 1000.0
         feasible_flags.append(bool(getattr(result, "feasible", True)))
         projection_iters.append(int(getattr(result, "projection_iterations", 0)))
@@ -4586,13 +4907,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--cov-model",
         type=str,
         default="sample",
-        help="Covariance backend (sample|ewma|lw|oas or custom:<module>:<callable>)",
+        help=(
+            "Covariance backend (sample|ewma|lw|oas|ridge|glasso|bayesian"
+            " or custom:<module>:<callable>; optional :param=value suffixes allowed)"
+        ),
     )
     parser.add_argument(
         "--objective",
         type=str,
         default="sharpe",
-        help="Optimization objective name or custom:<module>:<callable>",
+        help="Optimization objective name (e.g. sharpe, hrp) or custom:<module>:<callable>",
     )
     parser.add_argument(
         "--te-target",
