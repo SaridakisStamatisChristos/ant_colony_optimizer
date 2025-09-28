@@ -12,7 +12,21 @@ import math
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+import time
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    TextIO,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
@@ -38,6 +52,10 @@ except ModuleNotFoundError:  # pragma: no cover - minimal environments
 
 
 SCHEMA_VERSION = "1.0.0"
+
+
+ProgressCallback = Callable[[int, int], None]
+RebalanceLogCallback = Callable[[Dict[str, Any]], None]
 
 
 @dataclass
@@ -139,6 +157,66 @@ class FactorDiagnostics:
 class SlippageConfig:
     model: str
     param: float
+
+
+class _ProgressPrinter:
+    """Render incremental progress updates for CLI runs."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._is_tty = bool(getattr(stream, "isatty", lambda: False)())
+        self._last: Tuple[int, int] = (-1, -1)
+        self._finished = False
+
+    def __call__(self, current: int, total: int) -> None:
+        if current < 0:
+            current = 0
+        if total < 0:
+            total = 0
+        if not self._is_tty and (current, total) == self._last:
+            return
+        if total > 0:
+            pct = (current / total) * 100.0
+        else:
+            pct = 0.0
+        if self._is_tty:
+            msg = f"\rProgress: {current}/{total} ({pct:5.1f}%)"
+            self._stream.write(msg)
+            if total == 0 or current >= total:
+                if not self._finished:
+                    self._stream.write("\n")
+                    self._finished = True
+        else:
+            msg = f"Progress: {current}/{total}"
+            self._stream.write(msg + "\n")
+            if total == 0 or current >= total:
+                self._finished = True
+        self._stream.flush()
+        self._last = (current, total)
+
+    def close(self) -> None:
+        if self._is_tty and not self._finished and self._last != (-1, -1):
+            self._stream.write("\n")
+            self._stream.flush()
+        self._finished = True
+
+
+class _JsonlWriter:
+    """Write JSON objects line-by-line to a file handle."""
+
+    def __init__(self, handle: TextIO) -> None:
+        self._handle = handle
+
+    def write(self, payload: Mapping[str, Any]) -> None:
+        json.dump(payload, self._handle, sort_keys=True)
+        self._handle.write("\n")
+        self._handle.flush()
+
+    def close(self) -> None:
+        try:
+            self._handle.flush()
+        finally:
+            self._handle.close()
 
 
 def _coerce_scalar(text: str) -> Any:
@@ -1282,6 +1360,8 @@ def backtest(
     gamma_turnover: float = 0.0,
     risk_free_rate: float = 0.0,
     trading_days: int = 252,
+    progress_callback: Optional[ProgressCallback] = None,
+    rebalance_callback: Optional[RebalanceLogCallback] = None,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -1485,6 +1565,8 @@ def backtest(
         factor_index_map = factor_panel.index_map()
 
     if not rebalance_points:
+        if progress_callback is not None:
+            progress_callback(0, 0)
         empty = np.array([], dtype=float)
         benchmark_returns = empty if benchmark_series is not None else None
         return {
@@ -1532,6 +1614,9 @@ def backtest(
     # include model + params in the cache key to avoid collisions across models/spans
     cov_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 
+    if progress_callback is not None:
+        progress_callback(0, n_windows)
+
     for window_idx, start in enumerate(rebalance_points):
         end = min(start + step, n_periods)
         train = returns[start - lookback : start]
@@ -1556,11 +1641,15 @@ def backtest(
         span = ewma_span if cov_model == "ewma" and ewma_span is not None else None
         window_hash = _hash_returns_window(train)
         cov_key: Optional[Tuple[Any, ...]] = (cov_model, span, window_hash)
+        cov_elapsed_ms = 0.0
         cov: Optional[np.ndarray] = None
         cached_cov = cov_cache.get(cov_key) if cov_key is not None else None
         if cached_cov is not None:
+            cov_start = time.perf_counter()
             cov = cached_cov.copy()
+            cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
         if cov is None:
+            cov_start = time.perf_counter()
             if cov_model == "ewma":
                 assert span is not None
                 cov_raw = ewma_cov(train, span=span)
@@ -1573,6 +1662,7 @@ def backtest(
             if optimizer.cfg.use_shrinkage:
                 cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
             cov = nearest_psd(cov_raw)
+            cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
             if cov_key is not None:
                 cov_cache[cov_key] = cov.copy()
                 while len(cov_cache) > 8:
@@ -1613,6 +1703,7 @@ def backtest(
 
         constraints.prev_weights = prev_weights
         should_refine = (len(weights) % refine_every) == 0
+        opt_start = time.perf_counter()
         result = optimizer.optimize(
             mu,
             cov,
@@ -1621,6 +1712,7 @@ def backtest(
             refine=should_refine,
             benchmark=bench_stats,
         )
+        opt_elapsed_ms = (time.perf_counter() - opt_start) * 1000.0
         feasible_flags.append(bool(getattr(result, "feasible", True)))
         projection_iters.append(int(getattr(result, "projection_iterations", 0)))
         w = result.weights
@@ -1877,6 +1969,40 @@ def backtest(
                 "block_tracking_error": block_tracking_error,
             }
         )
+        if rebalance_callback is not None:
+            log_record: Dict[str, Any] = {
+                "date": _stringify(rebalance_date),
+                "seed": int(seed),
+                "objective": str(objective),
+                "cov_model": str(cov_model),
+                "costs": {
+                    "tx": float(tx_cost_value),
+                    "slippage": float(slip_cost),
+                },
+                "turnover": float(turn),
+                "feasible": bool(feasible_flags[-1]),
+                "breaches": {
+                    "active": int(active_breaches),
+                    "group": int(group_breaches),
+                    "factor": int(factor_bound_breaches),
+                    "sector": int(sector_breaches),
+                },
+                "block": {
+                    "sharpe": float(block_sharpe),
+                    "sortino": float(block_sortino),
+                    "ir": None if block_info_ratio is None else float(block_info_ratio),
+                    "te": None
+                    if block_tracking_error is None
+                    else float(block_tracking_error),
+                },
+                "timings": {
+                    "cov_ms": float(cov_elapsed_ms),
+                    "opt_ms": float(opt_elapsed_ms),
+                },
+            }
+            rebalance_callback(log_record)
+        if progress_callback is not None:
+            progress_callback(window_idx + 1, n_windows)
         cursor += block_len
 
     gross_returns_arr = gross_returns_arr[:cursor]
@@ -2481,6 +2607,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
     parser.add_argument(
+        "--log-json",
+        type=str,
+        default=None,
+        help="Write per-rebalance JSON lines to the given file",
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Display progress updates during the backtest run",
+    )
+    parser.add_argument(
         "--out-format",
         choices=["csv", "parquet"],
         default="csv",
@@ -2625,36 +2762,53 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             cap_weights_path=Path(parsed.cap_weights) if parsed.cap_weights else None,
         )
 
-    results = backtest(
-        df,
-        lookback=parsed.lookback,
-        step=parsed.step,
-        ewma_span=parsed.ewma_span,
-        objective=parsed.objective,
-        seed=parsed.seed,
-        tx_cost_bps=tx_cost_bps,
-        tx_cost_mode=parsed.tx_cost_mode,
-        metric_alpha=parsed.metric_alpha,
-        factors=factor_panel,
-        factor_targets=factor_target_vec,
-        factor_tolerance=parsed.factor_tolerance,
-        factor_align=parsed.factor_align,
-        factors_required=parsed.factors_required,
-        slippage=slippage_cfg,
-        refine_every=parsed.refine_every,
-        cov_model=parsed.cov_model,
-        benchmark=benchmark_df,
-        benchmark_weights=benchmark_weights_spec,
-        active_min=parsed.active_min,
-        active_max=parsed.active_max,
-        active_group_caps=active_group_spec,
-        factor_bounds=factor_bounds_spec,
-        te_target=parsed.te_target,
-        lambda_te=parsed.lambda_te,
-        gamma_turnover=parsed.gamma_turnover,
-        risk_free_rate=float(parsed.rf_bps) / 1e4,
-        trading_days=parsed.trading_days,
-    )
+    jsonl_writer: Optional[_JsonlWriter] = None
+    progress_printer: Optional[_ProgressPrinter] = None
+    try:
+        if parsed.log_json:
+            log_path = Path(parsed.log_json)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            jsonl_writer = _JsonlWriter(log_path.open("w", encoding="utf-8"))
+        if parsed.progress:
+            progress_printer = _ProgressPrinter(sys.stderr)
+
+        results = backtest(
+            df,
+            lookback=parsed.lookback,
+            step=parsed.step,
+            ewma_span=parsed.ewma_span,
+            objective=parsed.objective,
+            seed=parsed.seed,
+            tx_cost_bps=tx_cost_bps,
+            tx_cost_mode=parsed.tx_cost_mode,
+            metric_alpha=parsed.metric_alpha,
+            factors=factor_panel,
+            factor_targets=factor_target_vec,
+            factor_tolerance=parsed.factor_tolerance,
+            factor_align=parsed.factor_align,
+            factors_required=parsed.factors_required,
+            slippage=slippage_cfg,
+            refine_every=parsed.refine_every,
+            cov_model=parsed.cov_model,
+            benchmark=benchmark_df,
+            benchmark_weights=benchmark_weights_spec,
+            active_min=parsed.active_min,
+            active_max=parsed.active_max,
+            active_group_caps=active_group_spec,
+            factor_bounds=factor_bounds_spec,
+            te_target=parsed.te_target,
+            lambda_te=parsed.lambda_te,
+            gamma_turnover=parsed.gamma_turnover,
+            risk_free_rate=float(parsed.rf_bps) / 1e4,
+            trading_days=parsed.trading_days,
+            progress_callback=progress_printer,
+            rebalance_callback=jsonl_writer.write if jsonl_writer else None,
+        )
+    finally:
+        if progress_printer is not None:
+            progress_printer.close()
+        if jsonl_writer is not None:
+            jsonl_writer.close()
 
     if baseline_series_full is not None:
         date_to_ret = {date: float(ret) for date, ret in zip(all_dates, baseline_series_full)}
