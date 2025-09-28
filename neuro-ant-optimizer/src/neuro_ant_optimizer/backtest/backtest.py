@@ -37,6 +37,9 @@ except ModuleNotFoundError:  # pragma: no cover - minimal environments
     yaml = None  # type: ignore
 
 
+SCHEMA_VERSION = "1.0.0"
+
+
 @dataclass
 class FactorPanel:
     dates: List[Any]
@@ -596,10 +599,12 @@ def _write_run_manifest(
     out_dir: Path,
     args: argparse.Namespace,
     config_path: Optional[Path],
+    results: Optional[Dict[str, Any]] = None,
     extras: Optional[Dict[str, Any]] = None,
 ) -> None:
     manifest: Dict[str, Any] = {
         "args": _serialize_args(args),
+        "schema_version": SCHEMA_VERSION,
         "package_version": __version__,
         "python_version": sys.version,
     }
@@ -620,6 +625,11 @@ def _write_run_manifest(
     git_sha = _resolve_git_sha()
     if git_sha:
         manifest["git_sha"] = git_sha
+
+    if results is not None:
+        warnings = results.get("warnings")
+        if warnings:
+            manifest["warnings"] = list(warnings)
 
     (out_dir / "run_config.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
@@ -1471,6 +1481,51 @@ def backtest(
     if factor_panel is not None:
         factor_index_map = factor_panel.index_map()
 
+    if not rebalance_points:
+        empty = np.array([], dtype=float)
+        benchmark_returns = empty if benchmark_series is not None else None
+        return {
+            "dates": [],
+            "returns": empty,
+            "gross_returns": empty,
+            "net_tx_returns": empty,
+            "net_slip_returns": empty,
+            "equity": empty,
+            "weights": np.empty((0, n_assets), dtype=float),
+            "rebalance_dates": [],
+            "asset_names": asset_names,
+            "cov_model": cov_model,
+            "benchmark_returns": benchmark_returns,
+            "sharpe": 0.0,
+            "ann_return": 0.0,
+            "ann_vol": 0.0,
+            "max_drawdown": 0.0,
+            "avg_turnover": 0.0,
+            "downside_vol": 0.0,
+            "sortino": 0.0,
+            "realized_cvar": 0.0,
+            "tracking_error": None,
+            "info_ratio": None,
+            "te_target": float(optimizer.cfg.te_target),
+            "lambda_te": float(optimizer.cfg.lambda_te),
+            "gamma_turnover": float(optimizer.cfg.gamma_turnover),
+            "risk_free_rate": annual_rf,
+            "periodic_risk_free": periodic_rf,
+            "trading_days": int(trading_days),
+            "factor_records": [],
+            "factor_names": factor_names,
+            "factor_tolerance": factor_tolerance,
+            "avg_slippage_bps": 0.0,
+            "slippage_costs": empty,
+            "slippage_net_returns": None,
+            "rebalance_records": [],
+            "rebalance_feasible": [],
+            "projection_iterations": [],
+            "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
+            "constraint_manifest": constraint_manifest,
+            "warnings": ["no_rebalances"],
+        }
+
     # include model + params in the cache key to avoid collisions across models/spans
     cov_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 
@@ -1931,6 +1986,7 @@ def backtest(
         "projection_iterations": projection_iters,
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
+        "warnings": [],
     }
 
 
@@ -2059,8 +2115,6 @@ def _write_factor_constraints(path: Path, results: Dict[str, Any]) -> None:
 
 def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
     records: Sequence[Dict[str, Any]] = results.get("rebalance_records", [])  # type: ignore[assignment]
-    if not records:
-        return
     header = [
         "date",
         "gross_ret",
@@ -2086,9 +2140,31 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=header)
         writer.writeheader()
-        for record in records:
+        for record in records or []:
             row = {key: record.get(key) for key in header}
             writer.writerow(row)
+
+
+def _maybe_write_parquet(out_dir: Path, args: argparse.Namespace) -> None:
+    if getattr(args, "out_format", "csv") != "parquet":
+        return
+    if pd is None:
+        return
+    try:
+        equity_csv = out_dir / "equity.csv"
+        if equity_csv.exists():
+            pd.read_csv(equity_csv).to_parquet(out_dir / "equity.parquet")
+        rebalance_csv = out_dir / "rebalance_report.csv"
+        if rebalance_csv.exists():
+            pd.read_csv(rebalance_csv).to_parquet(out_dir / "rebalance_report.parquet")
+        metrics_csv = out_dir / "metrics.csv"
+        if metrics_csv.exists():
+            pd.read_csv(metrics_csv).to_parquet(out_dir / "metrics.parquet")
+        weights_csv = out_dir / "weights.csv"
+        if getattr(args, "save_weights", False) and weights_csv.exists():
+            pd.read_csv(weights_csv).to_parquet(out_dir / "weights.parquet")
+    except Exception:
+        pass
 
 
 def _write_exposures(path: Path, results: Dict[str, Any]) -> None:
@@ -2265,6 +2341,12 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
     parser.add_argument(
+        "--out-format",
+        choices=["csv", "parquet"],
+        default="csv",
+        help="Emit parquet artifacts alongside CSV outputs",
+    )
+    parser.add_argument(
         "--rf-bps",
         type=float,
         default=0.0,
@@ -2433,7 +2515,15 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             json.dumps(diagnostics, indent=2, sort_keys=True), encoding="utf-8"
         )
 
-    _write_run_manifest(out_dir, parsed, config_path, extras=results.get("constraint_manifest"))
+    _maybe_write_parquet(out_dir, parsed)
+
+    _write_run_manifest(
+        out_dir,
+        parsed,
+        config_path,
+        results=results,
+        extras=results.get("constraint_manifest"),
+    )
 
     if not parsed.skip_plot:
         try:
