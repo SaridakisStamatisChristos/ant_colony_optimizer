@@ -1994,7 +1994,7 @@ def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
     with metrics_path.open("w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["metric", "value"])
-        for key in [
+        standard_metrics = [
             "sharpe",
             "ann_return",
             "ann_vol",
@@ -2009,8 +2009,19 @@ def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
             "te_target",
             "lambda_te",
             "gamma_turnover",
-        ]:
-            writer.writerow([key, results[key]])
+        ]
+        for key in standard_metrics:
+            writer.writerow([key, results.get(key)])
+
+        baseline_metrics = [
+            "baseline_sharpe",
+            "baseline_info_ratio",
+            "alpha_vs_baseline",
+            "hit_rate_vs_baseline",
+        ]
+        for key in baseline_metrics:
+            if key in results:
+                writer.writerow([key, results.get(key)])
 
 
 def _write_equity(equity_path: Path, results: Dict[str, Any]) -> None:
@@ -2262,6 +2273,118 @@ def _read_csv(csv_path: Path):
     return _Frame(values, dates, header_cols)
 
 
+def _extract_asset_names(frame: Any, n_assets: int) -> List[str]:
+    if hasattr(frame, "columns") and getattr(frame, "columns") is not None:
+        cols = [str(col) for col in frame.columns]
+        if len(cols) == n_assets:
+            return cols
+    return [f"A{i}" for i in range(n_assets)]
+
+
+def _load_cap_weight_vector(path: Path, asset_names: Sequence[str]) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f"Cap weights file not found: {path}")
+
+    weights_map: Dict[str, float] = {}
+    if pd is not None:
+        frame = pd.read_csv(path)
+        lower_cols = {str(col).lower() for col in frame.columns}
+        if {"asset", "weight"}.issubset(lower_cols):
+            # Normalize column names without mutating original dataframe ordering
+            name_col = next(col for col in frame.columns if str(col).lower() == "asset")
+            weight_col = next(col for col in frame.columns if str(col).lower() == "weight")
+            for _, row in frame.iterrows():
+                asset = str(row[name_col])
+                weight = float(row[weight_col])
+                if not math.isfinite(weight):
+                    raise ValueError("Cap weight entries must be finite")
+                weights_map[asset] = weight
+        elif not frame.empty:
+            first_row = frame.iloc[0]
+            for col in frame.columns:
+                weight = float(first_row[col])
+                if not math.isfinite(weight):
+                    raise ValueError("Cap weight entries must be finite")
+                weights_map[str(col)] = weight
+    if not weights_map:
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            rows = [row for row in reader if any(cell.strip() for cell in row)]
+        if not rows:
+            raise ValueError("Cap weights file is empty")
+        header = [cell.strip() for cell in rows[0]]
+        if header and header[0].lower() in {"asset", "name"} and len(header) >= 2:
+            for row in rows[1:]:
+                if len(row) < 2:
+                    continue
+                asset = row[0].strip()
+                if not asset:
+                    continue
+                weight = float(row[1])
+                if not math.isfinite(weight):
+                    raise ValueError("Cap weight entries must be finite")
+                weights_map[asset] = weight
+        elif len(rows) >= 2:
+            for idx, col in enumerate(header):
+                if idx >= len(rows[1]):
+                    break
+                weight = float(rows[1][idx])
+                if not math.isfinite(weight):
+                    raise ValueError("Cap weight entries must be finite")
+                weights_map[col or f"A{idx}"] = weight
+        else:
+            raise ValueError("Cap weights file must contain at least one row of weights")
+
+    if not weights_map:
+        raise ValueError("Unable to parse cap weights file")
+
+    weights = np.zeros(len(asset_names), dtype=float)
+    found = 0
+    for idx, name in enumerate(asset_names):
+        weight = weights_map.get(name)
+        if weight is None:
+            raise ValueError(f"Missing cap weight for asset '{name}'")
+        weights[idx] = weight
+        found += 1
+
+    if found == 0:
+        raise ValueError("No overlapping assets found in cap weights file")
+    total = float(weights.sum())
+    if total <= 0:
+        raise ValueError("Cap weights must sum to a positive value")
+    weights /= total
+    return weights
+
+
+def _compute_baseline_returns(
+    baseline: str,
+    returns_arr: np.ndarray,
+    asset_names: Sequence[str],
+    *,
+    cap_weights_path: Optional[Path] = None,
+) -> Tuple[str, np.ndarray, np.ndarray]:
+    if returns_arr.ndim != 2:
+        raise ValueError("Returns array must be two dimensional for baseline computation")
+    n_assets = returns_arr.shape[1]
+    if n_assets == 0:
+        raise ValueError("Cannot compute baseline with zero assets")
+
+    mode = str(baseline).lower()
+    if mode == "equal":
+        weights = np.full(n_assets, 1.0 / n_assets, dtype=float)
+        label = "equal"
+    elif mode == "cap":
+        if cap_weights_path is None:
+            raise ValueError("--cap-weights must be provided when --baseline=cap")
+        weights = _load_cap_weight_vector(cap_weights_path, asset_names)
+        label = "cap"
+    else:
+        raise ValueError(f"Unknown baseline mode '{baseline}'")
+
+    returns = returns_arr @ weights
+    return label, returns.astype(float, copy=False), weights
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for the backtest CLI."""
 
@@ -2278,6 +2401,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional CSV of benchmark returns (single column)",
+    )
+    parser.add_argument(
+        "--baseline",
+        choices=["equal", "cap"],
+        default=None,
+        help="Include baseline overlay and metrics (equal or cap)",
+    )
+    parser.add_argument(
+        "--cap-weights",
+        type=str,
+        default=None,
+        help="CSV file containing cap weights (required when --baseline=cap)",
     )
     parser.add_argument(
         "--active-min",
@@ -2463,6 +2598,25 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     factor_bounds_spec = parsed.factor_bounds or None
 
     tx_cost_bps = float(parsed.tx_cost_bps) if parsed.tx_cost_mode != "none" else 0.0
+    returns_arr_for_baseline = _frame_to_numpy(df)
+    returns_arr_for_baseline = np.atleast_2d(returns_arr_for_baseline)
+    asset_names_for_baseline = _extract_asset_names(df, returns_arr_for_baseline.shape[1])
+    all_dates = _frame_index(df, returns_arr_for_baseline.shape[0])
+
+    if parsed.baseline == "cap" and not parsed.cap_weights:
+        raise ValueError("--cap-weights must be supplied when --baseline=cap")
+
+    baseline_series_full: Optional[np.ndarray] = None
+    baseline_label: Optional[str] = None
+    baseline_weights: Optional[np.ndarray] = None
+    if parsed.baseline:
+        baseline_label, baseline_series_full, baseline_weights = _compute_baseline_returns(
+            parsed.baseline,
+            returns_arr_for_baseline,
+            asset_names_for_baseline,
+            cap_weights_path=Path(parsed.cap_weights) if parsed.cap_weights else None,
+        )
+
     results = backtest(
         df,
         lookback=parsed.lookback,
@@ -2494,11 +2648,77 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         trading_days=parsed.trading_days,
     )
 
+    if baseline_series_full is not None:
+        date_to_ret = {date: float(ret) for date, ret in zip(all_dates, baseline_series_full)}
+        baseline_returns: List[float] = []
+        for date in results["dates"]:
+            if date not in date_to_ret:
+                raise ValueError("Baseline returns missing date alignment")
+            baseline_returns.append(date_to_ret[date])
+        baseline_arr = np.asarray(baseline_returns, dtype=float)
+        baseline_equity = np.cumprod(1.0 + baseline_arr)
+        results["baseline_returns"] = baseline_arr
+        results["baseline_equity"] = baseline_equity
+        results["baseline_label"] = baseline_label
+        if baseline_weights is not None:
+            results["baseline_weights"] = baseline_weights
+
+        trading_days = max(1, int(results.get("trading_days", 252)))
+        ann_factor = math.sqrt(trading_days)
+        periodic_rf = float(results.get("periodic_risk_free", 0.0))
+        excess_baseline = baseline_arr - periodic_rf
+        baseline_vol = float(np.std(baseline_arr) * ann_factor) if baseline_arr.size else 0.0
+        baseline_excess_mean = (
+            float(excess_baseline.mean() * trading_days) if baseline_arr.size else 0.0
+        )
+        baseline_sharpe = (
+            float(baseline_excess_mean / baseline_vol) if baseline_vol > 1e-12 else 0.0
+        )
+
+        benchmark_returns = results.get("benchmark_returns")
+        baseline_info_ratio: Optional[float] = None
+        if isinstance(benchmark_returns, np.ndarray) and benchmark_returns.size == baseline_arr.size:
+            active_baseline = baseline_arr - benchmark_returns
+            te = float(np.std(active_baseline) * ann_factor)
+            active_mean = float(active_baseline.mean() * trading_days)
+            if te <= 1e-12:
+                if abs(active_mean) <= 1e-12:
+                    baseline_info_ratio = 0.0
+                else:
+                    baseline_info_ratio = float(math.copysign(1e6, active_mean))
+            else:
+                baseline_info_ratio = float(active_mean / te)
+
+        realized_arr = np.asarray(results["returns"], dtype=float)
+        active_vs_baseline = realized_arr - baseline_arr
+        alpha_vs_baseline = (
+            float(active_vs_baseline.mean() * trading_days) if active_vs_baseline.size else 0.0
+        )
+        if active_vs_baseline.size:
+            hit_rate_vs_baseline = float(np.mean(realized_arr > baseline_arr))
+        else:
+            hit_rate_vs_baseline = 0.0
+
+        results["baseline_sharpe"] = baseline_sharpe
+        results["baseline_info_ratio"] = baseline_info_ratio
+        results["alpha_vs_baseline"] = alpha_vs_baseline
+        results["hit_rate_vs_baseline"] = hit_rate_vs_baseline
+
     out_dir = Path(parsed.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_metrics(out_dir / "metrics.csv", results)
     _write_rebalance_report(out_dir / "rebalance_report.csv", results)
     _write_equity(out_dir / "equity.csv", results)
+    if baseline_series_full is not None and baseline_label is not None:
+        baseline_equity_path = out_dir / f"equity_baseline_{baseline_label}.csv"
+        _write_equity(
+            baseline_equity_path,
+            {
+                "dates": results["dates"],
+                "equity": results["baseline_equity"],
+                "returns": results["baseline_returns"],
+            },
+        )
     net_tx_returns = results.get("net_tx_returns")
     if isinstance(net_tx_returns, np.ndarray) and net_tx_returns.size:
         net_results = dict(results)
@@ -2549,6 +2769,12 @@ def main(args: Optional[Iterable[str]] = None) -> None:
                 slip_curve = np.cumprod(1.0 + slip_returns)
                 if not np.allclose(slip_curve, gross_curve):
                     plt.plot(dates, slip_curve, label="net slippage")
+            baseline_equity = results.get("baseline_equity")
+            baseline_label_plot = results.get("baseline_label")
+            if baseline_equity is not None and baseline_label_plot is not None:
+                baseline_curve = np.asarray(baseline_equity, dtype=float)
+                if baseline_curve.size == gross_curve.size:
+                    plt.plot(dates, baseline_curve, label=f"baseline ({baseline_label_plot})")
             plt.title(f"Equity — {parsed.objective}")
             plt.xlabel("Date")
             plt.ylabel("Equity")
