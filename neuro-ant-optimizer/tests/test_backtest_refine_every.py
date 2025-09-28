@@ -54,7 +54,9 @@ def test_refine_every_skips(monkeypatch) -> None:
     frame = _Frame(returns)
     weights_seq = [np.array([0.5, 0.5], dtype=float) for _ in range(4)]
     tracker = _TrackingOptimizer(weights_seq)
-    monkeypatch.setattr(bt, "_build_optimizer", lambda n_assets, seed: tracker)
+    monkeypatch.setattr(
+        bt, "_build_optimizer", lambda n_assets, seed, risk_free_rate=0.0: tracker
+    )
 
     bt.backtest(frame, lookback=3, step=3, refine_every=2)
 
