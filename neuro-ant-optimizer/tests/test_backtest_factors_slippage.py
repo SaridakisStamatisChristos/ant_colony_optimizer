@@ -130,7 +130,9 @@ def test_backtest_cli_with_factors_and_slippage(tmp_path: Path) -> None:
             "--factors",
             str(factor_path),
             "--slippage",
-            "proportional:10",
+            "impact:k=25,alpha=1.5",
+            "--nt-band",
+            "5bps",
             "--out",
             str(out_dir),
         ]
