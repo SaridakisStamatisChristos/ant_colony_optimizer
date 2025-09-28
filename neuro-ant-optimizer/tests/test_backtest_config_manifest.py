@@ -68,6 +68,7 @@ def test_config_overrides_and_manifest(tmp_path: Path, monkeypatch) -> None:
     assert manifest["args"]["csv"] == str(returns_path)
     assert manifest["args"]["refine_every"] == 2
     assert manifest["config_path"] == str(config_path)
+    assert manifest["schema_version"] == bt.SCHEMA_VERSION
     assert "package_version" in manifest
     assert "python_version" in manifest
     assert "resolved_constraints" in manifest

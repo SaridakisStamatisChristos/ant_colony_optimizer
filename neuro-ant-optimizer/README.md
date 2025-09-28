@@ -125,10 +125,11 @@ head -n 5 /tmp/te/rebalance_report.csv
 head -n 20 /tmp/te/metrics.csv
 ```
 
-If the rebalance report is missing after a successful run, the most common reason is that
-**no rebalances were executed** (e.g., the dataset is shorter than the `--lookback` window).
-Decrease the lookback or supply a longer history so the optimizer can evaluate at least
-one block.
+If the dataset is shorter than the configured `--lookback`, the CLI still emits
+`rebalance_report.csv` (header only) so downstream tools do not fail. In that case,
+inspect `run_config.json` for `"warnings": ["no_rebalances"]` to confirm the guardrail
+was triggered. Provide a longer history or decrease the lookback to produce rebalance
+windows.
 
 ---
 
