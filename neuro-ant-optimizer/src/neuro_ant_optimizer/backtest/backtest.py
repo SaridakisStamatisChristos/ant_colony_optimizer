@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
+import itertools
 import hashlib
 import json
 from collections import OrderedDict
@@ -82,6 +84,343 @@ SCHEMA_VERSION = "1.0.0"
 
 ProgressCallback = Callable[[int, int], None]
 RebalanceLogCallback = Callable[[Dict[str, Any]], None]
+
+ObjectiveFunction = Callable[
+    [np.ndarray, np.ndarray, np.ndarray, PortfolioConstraints, Optional[BenchmarkStats]],
+    float,
+]
+ObjectiveLike = Union[OptimizationObjective, ObjectiveFunction]
+CovarianceFunction = Callable[..., np.ndarray]
+
+_CUSTOM_OBJECTIVE_REGISTRY: Dict[str, ObjectiveFunction] = {}
+_COVARIANCE_REGISTRY: Dict[str, CovarianceFunction] = {}
+
+
+def register_objective(name: str, fn: ObjectiveFunction) -> None:
+    key = str(name).strip().lower()
+    if not key:
+        raise ValueError("Objective name must be a non-empty string")
+    if not callable(fn):
+        raise TypeError("Objective function must be callable")
+    _CUSTOM_OBJECTIVE_REGISTRY[key] = fn
+
+
+def register_cov_model(name: str, fn: CovarianceFunction) -> None:
+    key = str(name).strip().lower()
+    if not key:
+        raise ValueError("Covariance model name must be a non-empty string")
+    if not callable(fn):
+        raise TypeError("Covariance model must be callable")
+    _COVARIANCE_REGISTRY[key] = fn
+
+
+def get_registered_objectives() -> List[str]:
+    return sorted(_CUSTOM_OBJECTIVE_REGISTRY.keys())
+
+
+def get_available_cov_models() -> List[str]:
+    return sorted(_COVARIANCE_REGISTRY.keys())
+
+
+def _mapping_to_cli(mapping: Mapping[str, Any]) -> List[str]:
+    args: List[str] = []
+    for key, value in mapping.items():
+        opt = f"--{str(key).replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                args.append(opt)
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                args.extend([opt, str(item)])
+            continue
+        args.extend([opt, str(value)])
+    return args
+
+
+def _parse_assignment_list(items: Sequence[str]) -> Dict[str, List[str]]:
+    assignments: Dict[str, List[str]] = {}
+    for entry in items:
+        if "=" not in entry:
+            raise ValueError(f"Sweep option '{entry}' must use KEY=VAL1,VAL2 syntax")
+        key, raw_values = entry.split("=", 1)
+        key = key.strip().replace("-", "_")
+        values = [val.strip() for val in raw_values.split(",") if val.strip()]
+        if not values:
+            raise ValueError(f"Sweep option '{entry}' must provide at least one value")
+        assignments[key] = values
+    return assignments
+
+
+def _normalize_sweep_values(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _strip_out_arg(args: Sequence[str]) -> Tuple[List[str], Optional[str]]:
+    cleaned: List[str] = []
+    out_value: Optional[str] = None
+    skip_next = False
+    for idx, token in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--out":
+            if idx + 1 < len(args):
+                out_value = args[idx + 1]
+                skip_next = True
+            continue
+        cleaned.append(token)
+    return cleaned, out_value
+
+
+def _args_to_mapping(args: Sequence[str]) -> Dict[str, Any]:
+    mapping: Dict[str, Any] = {}
+    idx = 0
+    while idx < len(args):
+        token = args[idx]
+        if token.startswith("--"):
+            key = token[2:].replace("-", "_")
+            next_idx = idx + 1
+            if next_idx < len(args) and not args[next_idx].startswith("--"):
+                mapping[key] = args[next_idx]
+                idx += 2
+            else:
+                mapping[key] = True
+                idx += 1
+        else:
+            idx += 1
+    return mapping
+
+
+def _format_run_name(index: int, params: Mapping[str, Any]) -> str:
+    if not params:
+        return f"run_{index:03d}"
+    pieces = []
+    for key in sorted(params.keys()):
+        value = str(params[key])
+        safe = (
+            value.replace("/", "_")
+            .replace("\\", "_")
+            .replace(":", "-")
+            .replace(" ", "")
+        )
+        pieces.append(f"{key}-{safe}")
+    return f"run_{index:03d}_" + "_".join(pieces)
+
+
+def _maybe_float(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _collect_sweep_summary(
+    run_dir: Path, params: Mapping[str, Any], base_mapping: Mapping[str, Any]
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {}
+    metrics_path = run_dir / "metrics.csv"
+    if metrics_path.exists():
+        with metrics_path.open(newline="") as fh:
+            reader = csv.reader(fh)
+            next(reader, None)
+            for row in reader:
+                if len(row) >= 2:
+                    metrics[row[0]] = row[1]
+    breaches = {
+        "sector_breaches": 0,
+        "active_breaches": 0,
+        "group_breaches": 0,
+        "factor_bound_breaches": 0,
+    }
+    report_path = run_dir / "rebalance_report.csv"
+    if report_path.exists():
+        with report_path.open(newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                for key in breaches:
+                    try:
+                        breaches[key] += int(float(row.get(key, 0) or 0))
+                    except (TypeError, ValueError):
+                        continue
+    combined = dict(base_mapping)
+    combined.update(params)
+    summary: Dict[str, Any] = {
+        "run": run_dir.name,
+        "out_dir": str(run_dir),
+        "objective": combined.get("objective"),
+        "cov_model": combined.get("cov_model"),
+    }
+    for field in ("sharpe", "ann_return", "ann_vol", "max_drawdown"):
+        summary[field] = _maybe_float(metrics.get(field))
+    summary.update(breaches)
+    for key, value in params.items():
+        summary[f"param_{key}"] = value
+    return summary
+
+
+def _main_sweep(argv: Sequence[str]) -> None:
+    sweep_parser = argparse.ArgumentParser(
+        prog="neuro-ant-backtest sweep",
+        description="Run multiple backtests across hyper-parameter sweeps",
+    )
+    sweep_parser.add_argument("--config", type=str, default=None, help="Sweep config YAML/JSON")
+    sweep_parser.add_argument(
+        "--out",
+        type=str,
+        default="sweep_runs",
+        help="Directory to store sweep outputs",
+    )
+    sweep_parser.add_argument(
+        "--grid",
+        action="append",
+        default=[],
+        metavar="KEY=V1,V2",
+        help="Grid search specification (repeatable)",
+    )
+    sweep_parser.add_argument(
+        "--random",
+        action="append",
+        default=[],
+        metavar="KEY=V1,V2",
+        help="Random sweep specification (repeatable)",
+    )
+    sweep_parser.add_argument(
+        "--samples",
+        type=int,
+        default=0,
+        help="Random samples per grid point (defaults to 1 when random sweeps are used)",
+    )
+    sweep_parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=0,
+        help="Seed for random sweeps",
+    )
+
+    argv_list = list(argv)
+    sweep_args, base_args = sweep_parser.parse_known_args(argv_list)
+
+    base_cli_args: List[str] = list(base_args)
+    grid_map: Dict[str, List[str]] = {}
+    random_map: Dict[str, List[str]] = {}
+    samples = sweep_args.samples
+    cfg_out: Optional[str] = None
+
+    if sweep_args.config:
+        cfg = _load_sweep_config(Path(sweep_args.config))
+        base_section = cfg.get("base")
+        if isinstance(base_section, Mapping):
+            base_cli_args = _mapping_to_cli(base_section) + base_cli_args
+        elif isinstance(base_section, Sequence) and not isinstance(base_section, (str, bytes)):
+            base_cli_args = [str(item) for item in base_section] + base_cli_args
+        grid_section = cfg.get("grid")
+        if isinstance(grid_section, Mapping):
+            for key, value in grid_section.items():
+                values = _normalize_sweep_values(value)
+                if not values:
+                    raise ValueError(f"Grid parameter '{key}' must contain values")
+                grid_map[str(key).replace("-", "_")] = values
+        random_section = cfg.get("random")
+        if isinstance(random_section, Mapping):
+            for key, value in random_section.items():
+                values = _normalize_sweep_values(value)
+                if not values:
+                    raise ValueError(f"Random parameter '{key}' must contain values")
+                random_map[str(key).replace("-", "_")] = values
+        if "samples" in cfg and samples == 0:
+            try:
+                samples = int(cfg["samples"])
+            except (TypeError, ValueError):
+                samples = sweep_args.samples
+        out_value = cfg.get("out")
+        if isinstance(out_value, str):
+            cfg_out = out_value
+
+    if sweep_args.grid:
+        grid_map.update(_parse_assignment_list(sweep_args.grid))
+    if sweep_args.random:
+        random_map.update(_parse_assignment_list(sweep_args.random))
+
+    base_cli_args, inline_out = _strip_out_arg(base_cli_args)
+    cli_out_override: Optional[str] = None
+    for idx, token in enumerate(argv_list):
+        if token == "--out" and idx + 1 < len(argv_list):
+            cli_out_override = argv_list[idx + 1]
+            break
+
+    base_out = sweep_args.out
+    default_out = sweep_parser.get_default("out")
+    if cli_out_override is not None:
+        base_out = cli_out_override
+    else:
+        if cfg_out is not None and base_out == default_out:
+            base_out = cfg_out
+        if inline_out is not None and base_out == default_out:
+            base_out = inline_out
+
+    base_mapping = _args_to_mapping(base_cli_args)
+
+    if grid_map:
+        grid_keys = sorted(grid_map.keys())
+        grid_values = [grid_map[key] for key in grid_keys]
+        grid_specs = [dict(zip(grid_keys, combo)) for combo in itertools.product(*grid_values)]
+    else:
+        grid_specs = [{}]
+
+    final_specs: List[Dict[str, Any]] = []
+    if random_map:
+        rng = np.random.default_rng(sweep_args.random_seed)
+        random_count = samples if samples > 0 else 1
+        for base_spec in grid_specs:
+            for _ in range(random_count):
+                sampled = {key: rng.choice(values) for key, values in random_map.items()}
+                merged = dict(base_spec)
+                merged.update(sampled)
+                final_specs.append(merged)
+    else:
+        final_specs = [dict(spec) for spec in grid_specs]
+
+    if not final_specs:
+        final_specs = [{}]
+
+    out_dir = Path(base_out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows: List[Dict[str, Any]] = []
+    for idx, params in enumerate(final_specs):
+        run_name = _format_run_name(idx, params)
+        run_dir = out_dir / run_name
+        run_args = list(base_cli_args)
+        run_args.extend(_mapping_to_cli(params))
+        run_args.extend(["--out", str(run_dir)])
+        cmd = [sys.executable, "-m", "neuro_ant_optimizer.backtest.backtest", *run_args]
+        print(f"Running {run_name} -> {run_dir}")
+        subprocess.run(cmd, check=True)
+        summary_rows.append(_collect_sweep_summary(run_dir, params, base_mapping))
+
+    param_columns = sorted({key for row in summary_rows for key in row.keys() if key.startswith("param_")})
+    metric_columns = ["sharpe", "ann_return", "ann_vol", "max_drawdown"]
+    breach_columns = [
+        "sector_breaches",
+        "active_breaches",
+        "group_breaches",
+        "factor_bound_breaches",
+    ]
+    header = ["run", "out_dir", "objective", "cov_model"] + param_columns + metric_columns + breach_columns
+    summary_path = out_dir / "sweep_results.csv"
+    with summary_path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow({field: row.get(field) for field in header})
+    print(f"Wrote {summary_path}")
 
 
 @dataclass
@@ -303,6 +642,21 @@ def _load_run_config(path: Path) -> Dict[str, Any]:
     return normalized
 
 
+def _load_sweep_config(path: Path) -> Mapping[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    suffix = path.suffix.lower()
+    data: Any
+    if suffix in {".yaml", ".yml"} and yaml is not None:
+        data = yaml.safe_load(text)
+    elif suffix == ".json":
+        data = json.loads(text)
+    else:
+        raise ValueError("Sweep config must be YAML or JSON")
+    if not isinstance(data, Mapping):
+        raise ValueError("Sweep config must evaluate to a mapping")
+    return data
+
+
 if _PYDANTIC_AVAILABLE:
 
     class RunConfig(BaseModel):
@@ -315,19 +669,8 @@ if _PYDANTIC_AVAILABLE:
         out: str = "bt_out"
         lookback: int = Field(ge=1, default=252)
         step: int = Field(ge=1, default=21)
-        objective: Literal[
-            "sharpe",
-            "max_return",
-            "min_variance",
-            "risk_parity",
-            "min_cvar",
-            "tracking_error",
-            "min_tracking_error",
-            "info_ratio",
-            "te_target",
-            "multi_term",
-        ] = "sharpe"
-        cov_model: Literal["sample", "ewma", "lw", "oas"] = "sample"
+        objective: str = "sharpe"
+        cov_model: str = "sample"
         ewma_span: Optional[int] = Field(default=None, ge=2)
         seed: int = 7
         tx_cost_bps: float = Field(ge=0.0, default=0.0)
@@ -365,7 +708,17 @@ if _PYDANTIC_AVAILABLE:
 
         @model_validator(mode="after")
         def check_covariance_deps(self) -> "RunConfig":
-            if self.cov_model != "ewma":
+            try:
+                _resolve_objective(self.objective)
+            except ValueError as exc:  # pragma: no cover - validation surface
+                raise ValueError(str(exc)) from exc
+
+            try:
+                _resolve_cov_model(self.cov_model)
+            except ValueError as exc:  # pragma: no cover - validation surface
+                raise ValueError(str(exc)) from exc
+
+            if str(self.cov_model).lower() != "ewma":
                 object.__setattr__(self, "ewma_span", None)
             return self
 
@@ -420,20 +773,6 @@ else:
             "decay": 0.0,
         }
 
-        _objective_choices = {
-            "sharpe",
-            "max_return",
-            "min_variance",
-            "risk_parity",
-            "min_cvar",
-            "tracking_error",
-            "min_tracking_error",
-            "info_ratio",
-            "te_target",
-            "multi_term",
-        }
-
-        _cov_choices = {"sample", "ewma", "lw", "oas"}
         _tx_cost_modes = {"none", "upfront", "amortized", "posthoc"}
         _warm_align = {"by_date", "last_row"}
         _factor_align = {"strict", "subset"}
@@ -553,17 +892,19 @@ else:
 
             if "objective" in raw:
                 obj = str(raw["objective"]).strip()
-                if obj not in cls._objective_choices:
-                    errors.append({"loc": ("objective",), "msg": "Input should be a valid objective"})
-                else:
+                try:
+                    _resolve_objective(obj)
                     data["objective"] = obj
+                except ValueError as exc:
+                    errors.append({"loc": ("objective",), "msg": str(exc)})
 
             if "cov_model" in raw:
                 cov = str(raw["cov_model"]).strip()
-                if cov not in cls._cov_choices:
-                    errors.append({"loc": ("cov_model",), "msg": "Input should be one of sample, ewma, lw, oas"})
-                else:
+                try:
+                    _resolve_cov_model(cov)
                     data["cov_model"] = cov
+                except ValueError as exc:
+                    errors.append({"loc": ("cov_model",), "msg": str(exc)})
 
             if "ewma_span" in raw and raw["ewma_span"] is not None:
                 span = cls._int(raw["ewma_span"], "ewma_span", errors, ge=2)
@@ -663,7 +1004,7 @@ else:
             if errors:
                 raise ValidationError(errors)
 
-            if data["cov_model"] != "ewma":
+            if str(data["cov_model"]).lower() != "ewma":
                 data["ewma_span"] = None
 
             return cls(data)
@@ -1589,6 +1930,19 @@ def _oas_cov(returns: np.ndarray) -> np.ndarray:
     return 0.5 * (Sigma + Sigma.T)
 
 
+register_cov_model("sample", lambda returns, **_: _sample_cov(np.asarray(returns, dtype=float)))
+register_cov_model("lw", lambda returns, **_: _lw_cov(np.asarray(returns, dtype=float)))
+register_cov_model("oas", lambda returns, **_: _oas_cov(np.asarray(returns, dtype=float)))
+
+
+def _ewma_adapter(returns: np.ndarray, *, span: Optional[int] = None, **_: Any) -> np.ndarray:
+    span_value = 60 if span is None else int(span)
+    return ewma_cov(np.asarray(returns, dtype=float), span=span_value)
+
+
+register_cov_model("ewma", _ewma_adapter)
+
+
 def turnover(previous: Optional[np.ndarray], current: np.ndarray) -> float:
     """Compute the L1 turnover between two weight vectors."""
 
@@ -1611,6 +1965,79 @@ def max_drawdown(equity_curve: np.ndarray) -> float:
         where=running_peak > 0,
     )
     return float(np.max(drawdown))
+
+
+def compute_drawdown_events(equity: np.ndarray, dates: Sequence[Any]) -> List[Dict[str, Any]]:
+    curve = np.asarray(equity, dtype=float)
+    if curve.size == 0:
+        return []
+    if len(dates) != curve.size:
+        raise ValueError("Dates length must match equity length")
+    running_peak = np.maximum.accumulate(curve)
+    drawdown = 1.0 - np.divide(
+        curve,
+        running_peak,
+        out=np.ones_like(curve),
+        where=running_peak > 0,
+    )
+    events: List[Dict[str, Any]] = []
+    in_drawdown = False
+    peak_idx = 0
+    trough_idx = 0
+    trough_depth = 0.0
+    peak_value = running_peak[0]
+    for idx, depth in enumerate(drawdown):
+        if depth > 1e-12:
+            if not in_drawdown:
+                in_drawdown = True
+                peak_value = running_peak[idx]
+                peak_idx = idx
+                for back in range(idx, -1, -1):
+                    if abs(curve[back] - peak_value) <= max(1e-12, 1e-9 * abs(peak_value)):
+                        peak_idx = back
+                        break
+                trough_idx = idx
+                trough_depth = float(depth)
+            elif depth > trough_depth + 1e-12:
+                trough_depth = float(depth)
+                trough_idx = idx
+        elif in_drawdown:
+            recovery_idx = idx
+            peak = dates[peak_idx]
+            trough = dates[trough_idx]
+            recovery = dates[recovery_idx]
+            peak_val = running_peak[peak_idx]
+            trough_val = curve[trough_idx]
+            depth_val = 0.0 if peak_val <= 0 else float(1.0 - (trough_val / peak_val))
+            length = recovery_idx - peak_idx
+            events.append(
+                {
+                    "peak": peak,
+                    "trough": trough,
+                    "recovery": recovery,
+                    "depth": depth_val,
+                    "length": int(length),
+                }
+            )
+            in_drawdown = False
+            trough_depth = 0.0
+    if in_drawdown:
+        peak = dates[peak_idx]
+        trough = dates[trough_idx]
+        peak_val = running_peak[peak_idx]
+        trough_val = curve[trough_idx]
+        depth_val = 0.0 if peak_val <= 0 else float(1.0 - (trough_val / peak_val))
+        length = len(curve) - peak_idx
+        events.append(
+            {
+                "peak": peak,
+                "trough": trough,
+                "recovery": None,
+                "depth": depth_val,
+                "length": int(length),
+            }
+        )
+    return events
 
 
 def _build_optimizer(
@@ -1762,8 +2189,67 @@ _OBJECTIVE_MAP: Dict[str, OptimizationObjective] = {
     "multi_term": OptimizationObjective.MULTI_TERM,
 }
 
+def _import_callable(target: str, kind: str) -> Callable[..., Any]:
+    if ":" not in target:
+        raise ValueError(
+            f"Custom {kind} must be provided as '<module>:<callable>'"
+        )
+    module_name, attr_name = target.split(":", 1)
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise ValueError(f"Failed to import {kind} '{target}': {exc}") from exc
+    try:
+        fn = getattr(module, attr_name)
+    except AttributeError as exc:
+        raise ValueError(
+            f"Module '{module_name}' does not define {kind} '{attr_name}'"
+        ) from exc
+    if not callable(fn):
+        raise ValueError(f"Resolved {kind} '{target}' is not callable")
+    return fn
 
-_COV_MODELS = {"sample", "ewma", "lw", "oas"}
+
+def _resolve_objective(name: str) -> ObjectiveLike:
+    raw = str(name).strip()
+    if not raw:
+        raise ValueError("Objective must be a non-empty string")
+    lower = raw.lower()
+    if lower in _OBJECTIVE_MAP:
+        return _OBJECTIVE_MAP[lower]
+    if lower in _CUSTOM_OBJECTIVE_REGISTRY:
+        return _CUSTOM_OBJECTIVE_REGISTRY[lower]
+    if raw.startswith("custom:"):
+        parts = raw.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                "Custom objective must be specified as 'custom:<module>:<callable>'"
+            )
+        target = f"{parts[1]}:{parts[2]}"
+        return _import_callable(target, "custom objective")
+    raise ValueError(
+        f"Unknown objective '{name}' (available: {sorted(_OBJECTIVE_MAP)} + {get_registered_objectives()})"
+    )
+
+
+def _resolve_cov_model(name: str) -> CovarianceFunction:
+    raw = str(name).strip()
+    if not raw:
+        raise ValueError("cov_model must be a non-empty string")
+    lower = raw.lower()
+    if lower in _COVARIANCE_REGISTRY:
+        return _COVARIANCE_REGISTRY[lower]
+    if raw.startswith("custom:"):
+        parts = raw.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                "Custom cov_model must be specified as 'custom:<module>:<callable>'"
+            )
+        target = f"{parts[1]}:{parts[2]}"
+        return _import_callable(target, "covariance model")
+    raise ValueError(
+        f"Unknown cov_model '{name}' (available: {get_available_cov_models()})"
+    )
 
 
 def backtest(
@@ -1810,14 +2296,14 @@ def backtest(
         raise ValueError("lookback and step must be positive integers")
     if refine_every <= 0:
         raise ValueError("refine_every must be positive")
-    if objective not in _OBJECTIVE_MAP:
-        raise ValueError(f"Unknown objective '{objective}'")
-    cov_model = str(cov_model).lower()
-    if cov_model not in _COV_MODELS:
-        raise ValueError(
-            f"Unknown cov_model '{cov_model}' (choose from {sorted(_COV_MODELS)})"
-        )
-    if cov_model != "ewma":
+    objective_spec = _resolve_objective(objective)
+    cov_model_name = str(cov_model)
+    cov_callable = _resolve_cov_model(cov_model_name)
+    cov_is_custom = cov_model_name.startswith("custom:")
+    cov_model_lower = cov_model_name.lower()
+    cov_cache_name = cov_model_name if cov_is_custom else cov_model_lower
+    cov_model_label = cov_model_name if cov_is_custom else cov_model_lower
+    if cov_model_lower != "ewma":
         ewma_span = None
     else:
         if ewma_span is None:
@@ -1886,17 +2372,17 @@ def backtest(
         if benchmark_series.size != n_periods:
             raise ValueError("Benchmark length must match returns length")
 
-    objective_enum = _OBJECTIVE_MAP[objective]
-    if (
-        objective_enum
+    objective_needs_benchmark = (
+        isinstance(objective_spec, OptimizationObjective)
+        and objective_spec
         in {
             OptimizationObjective.TRACKING_ERROR_MIN,
             OptimizationObjective.INFO_RATIO_MAX,
             OptimizationObjective.TRACKING_ERROR_TARGET,
             OptimizationObjective.MULTI_TERM,
         }
-        and benchmark_series is None
-    ):
+    )
+    if objective_needs_benchmark and benchmark_series is None:
         raise ValueError(
             "Benchmark series required for tracking_error/info_ratio/te_target/multi_term objectives"
         )
@@ -2097,7 +2583,7 @@ def backtest(
             "weights": np.empty((0, n_assets), dtype=float_dtype),
             "rebalance_dates": [],
             "asset_names": asset_names,
-            "cov_model": cov_model,
+            "cov_model": cov_model_label,
             "benchmark_returns": benchmark_returns,
             "sharpe": 0.0,
             "ann_return": 0.0,
@@ -2144,6 +2630,7 @@ def backtest(
     cov_cache_hits = 0
     cov_cache_misses = 0
     cov_cache_evictions = 0
+    block_contributions: List[Dict[str, Any]] = []
 
     if progress_callback is not None:
         progress_callback(0, n_windows)
@@ -2169,9 +2656,9 @@ def backtest(
                 variance=max(variance, 0.0),
                 cov_vector=cov_vector,
             )
-        span = ewma_span if cov_model == "ewma" and ewma_span is not None else None
+        span = ewma_span if cov_model_lower == "ewma" and ewma_span is not None else None
         window_hash = _hash_returns_window(train)
-        cov_key: Optional[Tuple[Any, ...]] = (cov_model, span, window_hash)
+        cov_key: Optional[Tuple[Any, ...]] = (cov_cache_name, span, window_hash)
         cov_elapsed_ms = 0.0
         cov: Optional[np.ndarray] = None
         cached_cov = (
@@ -2184,15 +2671,10 @@ def backtest(
             cov_cache_hits += 1
         if cov is None:
             cov_start = time.perf_counter()
-            if cov_model == "ewma":
-                assert span is not None
-                cov_raw = ewma_cov(train, span=span)
-            elif cov_model == "lw":
-                cov_raw = _lw_cov(train)
-            elif cov_model == "oas":
-                cov_raw = _oas_cov(train)
-            else:
-                cov_raw = _sample_cov(train)
+            cov_kwargs: Dict[str, Any] = {}
+            if span is not None:
+                cov_kwargs["span"] = span
+            cov_raw = np.asarray(cov_callable(train, **cov_kwargs), dtype=float)
             if optimizer.cfg.use_shrinkage:
                 cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
             cov = nearest_psd(cov_raw)
@@ -2245,7 +2727,7 @@ def backtest(
             mu,
             cov,
             constraints,
-            objective=objective_enum,
+            objective=objective_spec,
             refine=should_refine,
             benchmark=bench_stats,
         )
@@ -2267,6 +2749,20 @@ def backtest(
         idx_slice = slice(cursor, cursor + block_len)
         gross_returns_arr[idx_slice] = gross_block_returns
         length = max(1, block_len)
+        contrib_vals = np.zeros_like(w, dtype=float)
+        if test.size:
+            contrib_vals = np.asarray(test, dtype=float) * np.asarray(w, dtype=float)
+            contrib_vals = contrib_vals.sum(axis=0)
+        block_total = float(gross_block_returns.sum())
+        for asset_name, contrib_val in zip(asset_names, contrib_vals):
+            block_contributions.append(
+                {
+                    "date": rebalance_date,
+                    "asset": asset_name,
+                    "contribution": float(contrib_val),
+                    "block_return": block_total,
+                }
+            )
 
         turnovers_arr[window_idx] = float(turn)
         turnover_violation = False
@@ -2526,7 +3022,7 @@ def backtest(
                 "date": _stringify(rebalance_date),
                 "seed": int(seed),
                 "objective": str(objective),
-                "cov_model": str(cov_model),
+                "cov_model": cov_model_label,
                 "costs": {
                     "tx": float(tx_cost_value),
                     "slippage": float(slip_cost),
@@ -2570,6 +3066,7 @@ def backtest(
     else:
         benchmark_returns_arr = np.array([])
     equity = np.cumprod(1.0 + realized_returns_arr, dtype=float_dtype)
+    drawdown_events = compute_drawdown_events(equity, realized_dates)
     slippage_costs_arr = slippage_costs[: len(weights)] if n_windows else np.array([])
     avg_slippage_bps = (
         float(slippage_costs_arr.mean() * 1e4) if slippage_costs_arr.size else 0.0
@@ -2644,7 +3141,7 @@ def backtest(
         "weights": np.asarray(weights, dtype=float_dtype),
         "rebalance_dates": rebalance_dates,
         "asset_names": asset_names,
-        "cov_model": cov_model,
+        "cov_model": cov_model_label,
         "benchmark_returns": benchmark_returns_arr if benchmark_returns_arr.size else None,
         "sharpe": sharpe,
         "ann_return": ann_return,
@@ -2671,6 +3168,8 @@ def backtest(
         "rebalance_records": rebalance_records,
         "rebalance_feasible": feasible_flags,
         "projection_iterations": projection_iters,
+        "drawdowns": drawdown_events,
+        "contributions": block_contributions,
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
         "warnings": warnings_list,
@@ -2859,6 +3358,40 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         for record in records or []:
             row = {key: record.get(key) for key in header}
             writer.writerow(row)
+
+
+def _write_drawdowns(path: Path, results: Dict[str, Any]) -> None:
+    events: Sequence[Dict[str, Any]] = results.get("drawdowns", [])  # type: ignore[assignment]
+    header = ["peak", "trough", "recovery", "depth", "length"]
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        for event in events:
+            row = {
+                "peak": _stringify(event.get("peak")) if event.get("peak") is not None else None,
+                "trough": _stringify(event.get("trough")) if event.get("trough") is not None else None,
+                "recovery": _stringify(event.get("recovery")) if event.get("recovery") is not None else None,
+                "depth": event.get("depth"),
+                "length": event.get("length"),
+            }
+            writer.writerow(row)
+
+
+def _write_contributions(path: Path, results: Dict[str, Any]) -> None:
+    records: Sequence[Dict[str, Any]] = results.get("contributions", [])  # type: ignore[assignment]
+    header = ["date", "asset", "contribution", "block_return"]
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {
+                    "date": _stringify(record.get("date")) if record.get("date") is not None else None,
+                    "asset": record.get("asset"),
+                    "contribution": record.get("contribution"),
+                    "block_return": record.get("block_return"),
+                }
+            )
 
 
 def _maybe_write_parquet(out_dir: Path, args: argparse.Namespace) -> None:
@@ -3153,14 +3686,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cov-model",
-        choices=sorted(_COV_MODELS),
+        type=str,
         default="sample",
-        help="Covariance backend: sample|ewma|lw|oas",
+        help="Covariance backend (sample|ewma|lw|oas or custom:<module>:<callable>)",
     )
     parser.add_argument(
         "--objective",
-        choices=sorted(_OBJECTIVE_MAP.keys()),
+        type=str,
         default="sharpe",
+        help="Optimization objective name or custom:<module>:<callable>",
     )
     parser.add_argument(
         "--te-target",
@@ -3325,9 +3859,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(args: Optional[Iterable[str]] = None) -> None:
+    argv = list(args) if args is not None else sys.argv[1:]
+    if argv and argv[0] == "sweep":
+        _main_sweep(argv[1:])
+        return
+
     parser = build_parser()
 
-    preliminary, _ = parser.parse_known_args(args=args)
+    preliminary, _ = parser.parse_known_args(args=argv)
     config_path: Optional[Path] = None
     cfg_validated = False
     cfg_blob: Dict[str, Any] = {}
@@ -3348,7 +3887,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         cfg_blob.pop("config", None)
         parser.set_defaults(**cfg_blob)
 
-    parsed = parser.parse_args(args=args)
+    parsed = parser.parse_args(args=argv)
     if not parsed.csv:
         raise ValueError("--csv must be provided via CLI or config")
 
@@ -3514,6 +4053,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
 
     _write_metrics(out_dir / "metrics.csv", results)
     _write_rebalance_report(out_dir / "rebalance_report.csv", results)
+    _write_drawdowns(out_dir / "drawdowns.csv", results)
+    _write_contributions(out_dir / "contrib.csv", results)
     _write_equity(out_dir / "equity.csv", results)
     if baseline_series_full is not None and baseline_label is not None:
         baseline_equity_path = out_dir / f"equity_baseline_{baseline_label}.csv"
