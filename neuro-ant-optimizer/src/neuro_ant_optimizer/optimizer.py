@@ -159,6 +159,7 @@ class OptimizationObjective(Enum):
     MAX_RETURN = "max_return"
     MIN_VARIANCE = "min_variance"
     RISK_PARITY = "risk_parity"
+    HRP = "hrp"
     MIN_CVAR = "min_cvar"
     TRACKING_ERROR_MIN = "tracking_error_min"
     INFO_RATIO_MAX = "info_ratio_max"
@@ -420,6 +421,8 @@ class NeuroAntPortfolioOptimizer:
             rc = rc / total
             equal = np.ones_like(rc) / len(rc)
             return -float(np.linalg.norm(rc - equal))
+        if objective == OptimizationObjective.HRP:
+            return self._sharpe(weights, mu, cov)
         if objective == OptimizationObjective.MIN_CVAR:
             cvar = self._cvar_normal(weights, mu, cov, self.cfg.cvar_alpha)
             return -cvar

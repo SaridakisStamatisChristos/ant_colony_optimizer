@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from importlib import import_module
 
 
@@ -18,7 +19,10 @@ def test_cov_backends_psd_and_shapes():
     E = bt.ewma_cov(X, span=20)
     LW = bt._lw_cov(X)
     OAS = bt._oas_cov(X)
-    for M in (S, E, LW, OAS):
+    RIDGE = bt._ridge_cov(X, alpha=0.1)
+    GL = bt._glasso_cov(X, alpha=0.02, max_iter=50)
+    BAYES = bt._bayesian_cov(X)
+    for M in (S, E, LW, OAS, RIDGE, GL, BAYES):
         assert M.shape == (8, 8)
         assert _is_psd(M)
 
@@ -47,7 +51,29 @@ def test_backtest_cov_model_routes():
             return self._c
 
     F = _Frame(ret, dates)
-    for model in ("sample", "ewma", "lw", "oas"):
+    models = (
+        "sample",
+        "ewma",
+        "lw",
+        "oas",
+        "ridge:alpha=0.15",
+        "glasso:alpha=0.05:max_iter=40",
+        "bayesian:nu=6",
+    )
+    for model in models:
         res = bt.backtest(F, lookback=10, step=5, cov_model=model, ewma_span=5, seed=7)
         assert res["cov_model"] == model
         assert len(res["equity"]) > 0
+
+
+def test_resolve_cov_model_with_params():
+    spec = bt._resolve_cov_model("glasso:alpha=0.03:tol=1e-3")
+    assert spec.base == "glasso"
+    assert spec.params["alpha"] == 0.03
+    assert spec.params["tol"] == 0.001
+    assert spec.label == "glasso:alpha=0.03:tol=1e-3"
+
+
+def test_resolve_cov_model_invalid_param():
+    with pytest.raises(ValueError):
+        bt._resolve_cov_model("glasso:alpha")
