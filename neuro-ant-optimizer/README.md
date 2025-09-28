@@ -80,6 +80,35 @@ Behavior summary
 
 Outputs metrics.csv, equity.csv, factor_diagnostics.json and (if matplotlib is present) equity.png.
 
+### Verifying CLI outputs
+
+The CLI writes every artifact into the directory passed via `--out`. After a run, list
+the folder to confirm `rebalance_report.csv` and the other CSVs were written:
+
+```
+ls -l /tmp/te
+```
+
+Common files include:
+
+* `metrics.csv` — summary Sharpe, drawdown, turnover, etc.
+* `equity.csv` — gross equity curve
+* `equity_net_of_tc.csv` — equity net of transaction costs (when `tx_cost_mode=posthoc`)
+* `rebalance_report.csv` — per-block turnover, costs, and realized returns
+* `run_config.json` — CLI arguments, resolved constraints, and package metadata
+
+Preview the contents with `head` to make sure data was recorded:
+
+```
+head -n 5 /tmp/te/rebalance_report.csv
+head -n 20 /tmp/te/metrics.csv
+```
+
+If the rebalance report is missing after a successful run, the most common reason is that
+no rebalances were executed (e.g., the dataset is shorter than the `--lookback` window).
+Decrease the lookback or supply a longer history so the optimizer can evaluate at least
+one block.
+
 ## Factor inputs
 
 Factor panels can be supplied as CSV (wide or multi-index), parquet, or YAML. The loader
