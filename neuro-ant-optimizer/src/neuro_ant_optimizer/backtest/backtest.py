@@ -8,7 +8,7 @@ import importlib
 import itertools
 import hashlib
 import json
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -29,6 +29,7 @@ from typing import (
     Tuple,
     Union,
     Literal,
+    MutableMapping,
 )
 
 import numpy as np
@@ -533,6 +534,37 @@ class FactorDiagnostics:
         }
 
 
+_STANDARD_METRIC_KEYS: Tuple[str, ...] = (
+    "sharpe",
+    "ann_return",
+    "ann_vol",
+    "max_drawdown",
+    "avg_turnover",
+    "avg_slippage_bps",
+    "downside_vol",
+    "sortino",
+    "realized_cvar",
+    "tracking_error",
+    "info_ratio",
+    "te_target",
+    "lambda_te",
+    "gamma_turnover",
+    "cov_cache_size",
+    "cov_cache_hits",
+    "cov_cache_misses",
+    "cov_cache_evictions",
+)
+
+_BASELINE_METRIC_KEYS: Tuple[str, ...] = (
+    "baseline_sharpe",
+    "baseline_info_ratio",
+    "alpha_vs_baseline",
+    "hit_rate_vs_baseline",
+)
+
+_CI_METRIC_KEYS: Tuple[str, ...] = _STANDARD_METRIC_KEYS + _BASELINE_METRIC_KEYS
+
+
 @dataclass
 class SlippageConfig:
     model: str
@@ -723,6 +755,10 @@ if _PYDANTIC_AVAILABLE:
         warm_align: Literal["by_date", "last_row"] = "last_row"
         decay: float = Field(ge=0.0, le=1.0, default=0.0)
         scenarios: Optional[Any] = None
+        bootstrap: int = Field(ge=0, default=0)
+        bootstrap_method: Literal["stationary", "circular"] = "stationary"
+        block: int = Field(ge=1, default=21)
+        cv: Optional[str] = None
 
         @model_validator(mode="after")
         def check_covariance_deps(self) -> "RunConfig":
@@ -792,6 +828,10 @@ else:
             "warm_align": "last_row",
             "decay": 0.0,
             "scenarios": None,
+            "bootstrap": 0,
+            "bootstrap_method": "stationary",
+            "block": 21,
+            "cv": None,
         }
 
         _tx_cost_modes = {"none", "upfront", "amortized", "posthoc"}
@@ -799,6 +839,7 @@ else:
         _factor_align = {"strict", "subset"}
         _baseline_modes = {"equal", "cap"}
         _out_formats = {"csv", "parquet"}
+        _bootstrap_methods = {"stationary", "circular"}
 
         def __init__(self, data: Dict[str, Any]) -> None:
             self._data = data
@@ -882,6 +923,7 @@ else:
                 "log_json",
                 "slippage",
                 "warm_start",
+                "cv",
             ]
             for field in optional_str_fields:
                 if field in raw:
@@ -911,6 +953,16 @@ else:
                     if result is not None:
                         data[field] = result
 
+            if "bootstrap" in raw:
+                result = cls._int(raw["bootstrap"], "bootstrap", errors, ge=0)
+                if result is not None:
+                    data["bootstrap"] = result
+
+            if "block" in raw:
+                result = cls._int(raw["block"], "block", errors, ge=1)
+                if result is not None:
+                    data["block"] = result
+
             if "objective" in raw:
                 obj = str(raw["objective"]).strip()
                 try:
@@ -926,6 +978,13 @@ else:
                     data["cov_model"] = cov
                 except ValueError as exc:
                     errors.append({"loc": ("cov_model",), "msg": str(exc)})
+
+            if "bootstrap_method" in raw:
+                method = str(raw["bootstrap_method"]).strip().lower()
+                if method not in cls._bootstrap_methods:
+                    errors.append({"loc": ("bootstrap_method",), "msg": "Input should be 'stationary' or 'circular'"})
+                else:
+                    data["bootstrap_method"] = method
 
             if "ewma_span" in raw and raw["ewma_span"] is not None:
                 span = cls._int(raw["ewma_span"], "ewma_span", errors, ge=2)
@@ -3293,38 +3352,236 @@ def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
     with metrics_path.open("w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["metric", "value"])
-        standard_metrics = [
-            "sharpe",
-            "ann_return",
-            "ann_vol",
-            "max_drawdown",
-            "avg_turnover",
-            "avg_slippage_bps",
-            "downside_vol",
-            "sortino",
-            "realized_cvar",
-            "tracking_error",
-            "info_ratio",
-            "te_target",
-            "lambda_te",
-            "gamma_turnover",
-            "cov_cache_size",
-            "cov_cache_hits",
-            "cov_cache_misses",
-            "cov_cache_evictions",
-        ]
-        for key in standard_metrics:
+        for key in _STANDARD_METRIC_KEYS:
             writer.writerow([key, results.get(key)])
 
-        baseline_metrics = [
-            "baseline_sharpe",
-            "baseline_info_ratio",
-            "alpha_vs_baseline",
-            "hit_rate_vs_baseline",
-        ]
-        for key in baseline_metrics:
+        for key in _BASELINE_METRIC_KEYS:
             if key in results:
                 writer.writerow([key, results.get(key)])
+
+
+def _slice_frame(frame: Any, indices: Sequence[int], *, reset_index: bool) -> Any:
+    if frame is None:
+        return None
+    index_list = [int(idx) for idx in indices]
+    if hasattr(frame, "iloc"):
+        subset = frame.iloc[index_list].copy()
+        if reset_index and pd is not None and hasattr(subset, "index"):
+            subset.index = pd.RangeIndex(len(subset))
+        return subset
+    arr = _frame_to_numpy(frame)
+    arr = np.asarray(arr)
+    return arr[index_list]
+
+
+def _slice_factor_panel(
+    panel: Optional[FactorPanel],
+    indices: Sequence[int],
+    *,
+    reset_index: bool,
+) -> Optional[FactorPanel]:
+    if panel is None:
+        return None
+    idx_list = [int(idx) for idx in indices]
+    if not idx_list:
+        empty = np.zeros((0, panel.loadings.shape[1], panel.loadings.shape[2]), dtype=panel.loadings.dtype)
+        dates: List[Any] = []
+        return FactorPanel(dates, list(panel.assets), empty, list(panel.factor_names))
+    selected = panel.loadings[idx_list, :, :]
+    if reset_index:
+        dates = list(range(len(idx_list)))
+    else:
+        dates = [panel.dates[i] for i in idx_list]
+    return FactorPanel(dates, list(panel.assets), selected, list(panel.factor_names))
+
+
+def _stationary_bootstrap_indices(n: int, block_length: int, rng: np.random.Generator) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=int)
+    block = max(1, int(block_length))
+    p = 1.0 / float(block)
+    indices: List[int] = []
+    while len(indices) < n:
+        start = int(rng.integers(0, n))
+        block_len = int(rng.geometric(p))
+        for offset in range(block_len):
+            indices.append((start + offset) % n)
+            if len(indices) >= n:
+                break
+    return np.asarray(indices[:n], dtype=int)
+
+
+def _circular_bootstrap_indices(n: int, block_length: int, rng: np.random.Generator) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=int)
+    block = max(1, int(block_length))
+    indices: List[int] = []
+    while len(indices) < n:
+        start = int(rng.integers(0, n))
+        for offset in range(block):
+            indices.append((start + offset) % n)
+            if len(indices) >= n:
+                break
+    return np.asarray(indices[:n], dtype=int)
+
+
+def _bootstrap_indices(
+    n: int, block_length: int, method: str, rng: np.random.Generator
+) -> np.ndarray:
+    mode = method.lower()
+    if mode == "stationary":
+        return _stationary_bootstrap_indices(n, block_length, rng)
+    if mode == "circular":
+        return _circular_bootstrap_indices(n, block_length, rng)
+    raise ValueError(f"Unknown bootstrap method '{method}'")
+
+
+def _compute_confidence_intervals(
+    samples: Mapping[str, Sequence[float]], *, alpha: float = 0.05
+) -> Dict[str, Dict[str, float]]:
+    if alpha <= 0.0 or alpha >= 1.0:
+        raise ValueError("alpha must be between 0 and 1")
+    z_score = 1.959963984540054  # two-sided 95% normal quantile
+    results: Dict[str, Dict[str, float]] = {}
+    for key, values in samples.items():
+        arr = np.asarray(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            continue
+        mean = float(arr.mean())
+        if arr.size > 1:
+            std = float(arr.std(ddof=1))
+        else:
+            std = 0.0
+        margin = float(z_score * std / math.sqrt(arr.size)) if arr.size else 0.0
+        results[key] = {
+            "mean": mean,
+            "lower": mean - margin,
+            "upper": mean + margin,
+            "n": int(arr.size),
+        }
+    return results
+
+
+def _parse_cv_spec(spec: Optional[str]) -> int:
+    if spec is None:
+        return 0
+    text = str(spec).strip()
+    if not text:
+        return 0
+    if "=" in text:
+        key, value = text.split("=", 1)
+        if key.strip().lower() not in {"k", "folds", "n"}:
+            raise ValueError("--cv must be provided as an integer or k=<folds>")
+        text = value
+    try:
+        folds = int(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--cv must be an integer (e.g. k=5)") from exc
+    if folds <= 1:
+        raise ValueError("--cv requires at least two folds")
+    return folds
+
+
+def _run_bootstrap_evaluations(
+    *,
+    df: Any,
+    benchmark: Optional[Any],
+    factor_panel: Optional[FactorPanel],
+    backtest_kwargs: Mapping[str, Any],
+    bootstrap: int,
+    block_length: int,
+    method: str,
+    seed: int,
+    alpha: float,
+) -> Dict[str, Dict[str, float]]:
+    if bootstrap <= 0:
+        return {}
+    arr = _frame_to_numpy(df)
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        n_periods = arr.shape[0]
+    else:
+        n_periods = arr.shape[0]
+    if n_periods == 0:
+        return {}
+    rng = np.random.default_rng(int(seed))
+    samples: MutableMapping[str, List[float]] = defaultdict(list)
+    eval_kwargs = dict(backtest_kwargs)
+    for _ in range(int(bootstrap)):
+        draw = _bootstrap_indices(n_periods, block_length, method, rng)
+        boot_df = _slice_frame(df, draw, reset_index=True)
+        boot_benchmark = (
+            _slice_frame(benchmark, draw, reset_index=True) if benchmark is not None else None
+        )
+        boot_panel = _slice_factor_panel(factor_panel, draw, reset_index=True)
+        res = backtest(
+            boot_df,
+            benchmark=boot_benchmark,
+            factors=boot_panel,
+            progress_callback=None,
+            rebalance_callback=None,
+            **eval_kwargs,
+        )
+        for key in _CI_METRIC_KEYS:
+            if key not in res:
+                continue
+            value = res.get(key)
+            if isinstance(value, (float, int, np.floating, np.integer)) and np.isfinite(value):
+                samples[key].append(float(value))
+    return _compute_confidence_intervals(samples, alpha=alpha)
+
+
+def _run_cross_validation(
+    *,
+    df: Any,
+    benchmark: Optional[Any],
+    factor_panel: Optional[FactorPanel],
+    backtest_kwargs: Mapping[str, Any],
+    folds: int,
+    lookback: int,
+    dates: Sequence[Any],
+) -> List[Dict[str, Any]]:
+    if folds <= 1:
+        return []
+    n_periods = len(dates)
+    if n_periods == 0:
+        return []
+    splits = np.array_split(np.arange(n_periods), folds)
+    records: List[Dict[str, Any]] = []
+    eval_kwargs = dict(backtest_kwargs)
+    for fold_idx, fold in enumerate(splits, start=1):
+        fold_indices = np.asarray(fold, dtype=int)
+        if fold_indices.size == 0 or fold_indices.size <= lookback:
+            continue
+        subset_df = _slice_frame(df, fold_indices, reset_index=False)
+        subset_benchmark = (
+            _slice_frame(benchmark, fold_indices, reset_index=False) if benchmark is not None else None
+        )
+        subset_panel = _slice_factor_panel(factor_panel, fold_indices, reset_index=False)
+        res = backtest(
+            subset_df,
+            benchmark=subset_benchmark,
+            factors=subset_panel,
+            progress_callback=None,
+            rebalance_callback=None,
+            **eval_kwargs,
+        )
+        record: Dict[str, Any] = {
+            "fold": fold_idx,
+            "start": _stringify(dates[int(fold_indices[0])]),
+            "end": _stringify(dates[int(fold_indices[-1])]),
+        }
+        for key in _CI_METRIC_KEYS:
+            if key not in res:
+                continue
+            value = res.get(key)
+            if isinstance(value, (float, int, np.floating, np.integer)):
+                record[key] = float(value)
+            elif value is None:
+                record[key] = None
+        records.append(record)
+    return records
 
 
 def _write_equity(equity_path: Path, results: Dict[str, Any]) -> None:
@@ -4348,6 +4605,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Run SLSQP refinement every k rebalances",
     )
+    parser.add_argument(
+        "--bootstrap",
+        type=int,
+        default=0,
+        help="Number of block bootstrap resamples to evaluate (0 disables)",
+    )
+    parser.add_argument(
+        "--bootstrap-method",
+        choices=["stationary", "circular"],
+        default="stationary",
+        help="Block bootstrap method to use for confidence intervals",
+    )
+    parser.add_argument(
+        "--block",
+        type=int,
+        default=21,
+        help="Average block length used for bootstrap resampling",
+    )
+    parser.add_argument(
+        "--cv",
+        type=str,
+        default=None,
+        help="Walk-forward cross-validation specification (e.g. k=5)",
+    )
 
     return parser
 
@@ -4385,6 +4666,15 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     if not parsed.csv:
         raise ValueError("--csv must be provided via CLI or config")
 
+    cv_folds = _parse_cv_spec(parsed.cv) if parsed.cv else 0
+    bootstrap_count = int(parsed.bootstrap)
+    if bootstrap_count < 0:
+        raise ValueError("--bootstrap must be non-negative")
+    block_length = int(parsed.block)
+    if block_length <= 0:
+        raise ValueError("--block must be a positive integer")
+    bootstrap_method = str(parsed.bootstrap_method or "stationary")
+
     float_dtype = np.float32 if parsed.float32 else np.float64
     df = _read_csv(Path(parsed.csv))
     df, returns_preview, date_index = _sanitize_frame(
@@ -4398,6 +4688,12 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         if factor_panel is None:
             raise ValueError("Factor targets provided without factor loadings")
         factor_target_vec = load_factor_targets(Path(parsed.factor_targets), factor_panel.factor_names)
+
+    factor_panel_prepared = factor_panel
+    if factor_panel_prepared is not None:
+        factor_panel_prepared, _ = validate_factor_panel(
+            factor_panel_prepared, df, align=parsed.factor_align
+        )
 
     benchmark_weights_spec = getattr(parsed, "benchmark_weights", None)
     active_group_spec = parsed.active_group_caps or None
@@ -4422,6 +4718,50 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             cap_weights_path=Path(parsed.cap_weights) if parsed.cap_weights else None,
         )
 
+    shared_backtest_kwargs: Dict[str, Any] = dict(
+        lookback=parsed.lookback,
+        step=parsed.step,
+        ewma_span=parsed.ewma_span,
+        objective=parsed.objective,
+        seed=parsed.seed,
+        tx_cost_bps=tx_cost_bps,
+        tx_cost_mode=parsed.tx_cost_mode,
+        metric_alpha=parsed.metric_alpha,
+        factor_targets=factor_target_vec,
+        factor_tolerance=parsed.factor_tolerance,
+        factor_align=parsed.factor_align,
+        factors_required=parsed.factors_required,
+        slippage=slippage_cfg,
+        refine_every=parsed.refine_every,
+        cov_model=parsed.cov_model,
+        benchmark_weights=benchmark_weights_spec,
+        active_min=parsed.active_min,
+        active_max=parsed.active_max,
+        active_group_caps=active_group_spec,
+        factor_bounds=factor_bounds_spec,
+        te_target=parsed.te_target,
+        lambda_te=parsed.lambda_te,
+        gamma_turnover=parsed.gamma_turnover,
+        risk_free_rate=float(parsed.rf_bps) / 1e4,
+        trading_days=parsed.trading_days,
+        dtype=float_dtype,
+        cov_cache_size=parsed.cache_cov,
+        max_workers=parsed.max_workers,
+        decay=parsed.decay,
+        drop_duplicates=parsed.drop_duplicates,
+        deterministic=parsed.deterministic,
+    )
+    base_backtest_kwargs = dict(shared_backtest_kwargs)
+    base_backtest_kwargs.update(
+        warm_start=parsed.warm_start,
+        warm_align=parsed.warm_align,
+    )
+    eval_backtest_kwargs = dict(shared_backtest_kwargs)
+    eval_backtest_kwargs.update(
+        warm_start=None,
+        warm_align=parsed.warm_align,
+    )
+
     jsonl_writer: Optional[_JsonlWriter] = None
     progress_printer: Optional[_ProgressPrinter] = None
     try:
@@ -4434,43 +4774,11 @@ def main(args: Optional[Iterable[str]] = None) -> None:
 
         results = backtest(
             df,
-            lookback=parsed.lookback,
-            step=parsed.step,
-            ewma_span=parsed.ewma_span,
-            objective=parsed.objective,
-            seed=parsed.seed,
-            tx_cost_bps=tx_cost_bps,
-            tx_cost_mode=parsed.tx_cost_mode,
-            metric_alpha=parsed.metric_alpha,
-            factors=factor_panel,
-            factor_targets=factor_target_vec,
-            factor_tolerance=parsed.factor_tolerance,
-            factor_align=parsed.factor_align,
-            factors_required=parsed.factors_required,
-            slippage=slippage_cfg,
-            refine_every=parsed.refine_every,
-            cov_model=parsed.cov_model,
             benchmark=benchmark_df,
-            benchmark_weights=benchmark_weights_spec,
-            active_min=parsed.active_min,
-            active_max=parsed.active_max,
-            active_group_caps=active_group_spec,
-            factor_bounds=factor_bounds_spec,
-            te_target=parsed.te_target,
-            lambda_te=parsed.lambda_te,
-            gamma_turnover=parsed.gamma_turnover,
-            risk_free_rate=float(parsed.rf_bps) / 1e4,
-            trading_days=parsed.trading_days,
+            factors=factor_panel_prepared,
             progress_callback=progress_printer,
             rebalance_callback=jsonl_writer.write if jsonl_writer else None,
-            dtype=float_dtype,
-            cov_cache_size=parsed.cache_cov,
-            max_workers=parsed.max_workers,
-            warm_start=parsed.warm_start,
-            warm_align=parsed.warm_align,
-            decay=parsed.decay,
-            drop_duplicates=parsed.drop_duplicates,
-            deterministic=parsed.deterministic,
+            **base_backtest_kwargs,
         )
     finally:
         if progress_printer is not None:
@@ -4549,11 +4857,52 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         )
         return
 
+    bootstrap_cis: Dict[str, Dict[str, float]] = {}
+    cv_records: List[Dict[str, Any]] = []
+    if bootstrap_count:
+        bootstrap_cis = _run_bootstrap_evaluations(
+            df=df,
+            benchmark=benchmark_df,
+            factor_panel=factor_panel_prepared,
+            backtest_kwargs=eval_backtest_kwargs,
+            bootstrap=bootstrap_count,
+            block_length=block_length,
+            method=bootstrap_method,
+            seed=parsed.seed,
+            alpha=0.05,
+        )
+    if cv_folds:
+        cv_records = _run_cross_validation(
+            df=df,
+            benchmark=benchmark_df,
+            factor_panel=factor_panel_prepared,
+            backtest_kwargs=eval_backtest_kwargs,
+            folds=cv_folds,
+            lookback=parsed.lookback,
+            dates=all_dates,
+        )
+
     _write_metrics(out_dir / "metrics.csv", results)
     _write_rebalance_report(out_dir / "rebalance_report.csv", results)
     _write_drawdowns(out_dir / "drawdowns.csv", results)
     _write_contributions(out_dir / "contrib.csv", results)
     _write_equity(out_dir / "equity.csv", results)
+    if bootstrap_count:
+        ci_path = out_dir / "metrics_ci.json"
+        with ci_path.open("w", encoding="utf-8") as fh:
+            json.dump(bootstrap_cis, fh, indent=2, sort_keys=True)
+    if cv_folds:
+        cv_path = out_dir / "cv_results.csv"
+        metric_columns = [
+            key for key in _CI_METRIC_KEYS if any(key in record for record in cv_records)
+        ]
+        with cv_path.open("w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["fold", "start", "end", *metric_columns])
+            for record in cv_records:
+                row = [record.get("fold"), record.get("start"), record.get("end")]
+                row.extend(record.get(col) for col in metric_columns)
+                writer.writerow(row)
     if baseline_series_full is not None and baseline_label is not None:
         baseline_equity_path = out_dir / f"equity_baseline_{baseline_label}.csv"
         _write_equity(
