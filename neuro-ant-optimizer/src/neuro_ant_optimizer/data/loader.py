@@ -262,7 +262,9 @@ def load_returns(
         last_dt = aligned_index[-1]
         tzinfo = normalize_timezone(tz)
         now_val = datetime.now(tzinfo)
-        now_cmp = np.datetime64(now_val.astimezone(UTC))
+        # Represent as UTC epoch nanoseconds to avoid timezone-aware -> naive warnings
+        _ns = int(now_val.astimezone(UTC).timestamp() * 1e9)
+        now_cmp = np.datetime64(_ns, "ns")
         if np.datetime64(last_dt) > now_cmp:
             raise PITViolationError(
                 f"Last observation {last_dt} is in the future relative to timezone {tz or 'UTC'}"
