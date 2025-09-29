@@ -44,6 +44,15 @@ from scipy.spatial.distance import squareform
 
 from neuro_ant_optimizer import __version__
 from neuro_ant_optimizer.constraints import PortfolioConstraints
+from neuro_ant_optimizer.constraints.validators import (
+    build_limit_evaluator,
+    post_trade_check,
+    pre_trade_check,
+    summarize_breaches,
+)
+from neuro_ant_optimizer.attribution.brinson import compute_brinson_attribution
+from neuro_ant_optimizer.attribution.factors import compute_factor_contributions
+from neuro_ant_optimizer.risk.limits import LimitBreach
 from neuro_ant_optimizer.data import (
     CalendarAlignmentError,
     LoaderError,
@@ -3409,6 +3418,7 @@ def backtest(
     active_max: Optional[Any] = None,
     active_group_caps: Optional[Any] = None,
     factor_bounds: Optional[Any] = None,
+    limits: Optional[Any] = None,
     te_target: float = 0.0,
     lambda_te: float = 0.0,
     gamma_turnover: float = 0.0,
@@ -3681,6 +3691,17 @@ def backtest(
         constraints.benchmark_mask = None
     if effective_sector_map is not None:
         constraints.sector_map = list(effective_sector_map)
+    sector_display_lookup: Dict[str, str] = {}
+    if effective_sector_map is not None:
+        for idx, sec_id in enumerate(effective_sector_map):
+            if sec_id is None:
+                continue
+            if sector_name_map and sec_id in sector_name_map:
+                label = str(sector_name_map[sec_id])
+            else:
+                label = str(sec_id)
+            asset = asset_names[idx] if idx < len(asset_names) else str(idx)
+            sector_display_lookup[asset] = label
     if sector_name_map:
         constraints.sector_name_map = dict(sector_name_map)
     else:
@@ -3707,11 +3728,29 @@ def backtest(
         factor_upper_arr = factor_upper_arr.astype(float_dtype, copy=False)
         constraints.factor_upper_bounds = factor_upper_arr
 
+    limit_spec_mapping = _maybe_load_structure(limits) if limits is not None else None
+    if limit_spec_mapping is not None and not isinstance(limit_spec_mapping, Mapping):
+        raise TypeError("Risk limit specification must be a mapping or file path")
+    limit_evaluator = build_limit_evaluator(
+        limit_spec_mapping,
+        assets=asset_names,
+        sector_lookup=sector_display_lookup if sector_display_lookup else None,
+    )
+    limit_manifest: Mapping[str, object] = {}
+    if limit_evaluator is not None:
+        limit_manifest = dict(limit_evaluator.manifest)
+    constraint_manifest["risk_limits"] = limit_manifest
+
     weights: List[np.ndarray] = []
     rebalance_dates: List[Any] = []
     realized_dates: List[Any] = []
     feasible_flags: List[bool] = []
     projection_iters: List[int] = []
+    limit_breach_log: List[Dict[str, Any]] = []
+    all_limit_breaches: List[LimitBreach] = []
+    benchmark_weight_history: List[np.ndarray] = []
+    period_asset_returns: List[np.ndarray] = []
+    period_dates_for_brinson: List[Any] = []
     prev_weights: Optional[np.ndarray] = None
     prev_weights_is_warm = False
     warm_applied_count = 0
@@ -4056,6 +4095,11 @@ def backtest(
         if nt_band_value > 0.0:
             w_target, nt_band_hits = _apply_no_trade_band(w_target, prev_weights, nt_band_value)
             w_target = np.asarray(w_target, dtype=float_dtype)
+        pre_trade_ok = True
+        pre_trade_reasons: List[str] = []
+        pre_trade_breaches: List[LimitBreach] = []
+        if limit_evaluator is not None:
+            pre_trade_ok, pre_trade_reasons, pre_trade_breaches = pre_trade_check(w_target, limit_evaluator)
         w = w_target
         if prev_weights is not None and decay_value > 0.0:
             w = (1.0 - decay_value) * w_target + decay_value * prev_weights
@@ -4064,12 +4108,26 @@ def backtest(
             participation_cap = slippage.params.get("participation")
         w, participation_breaches = _apply_participation_cap(prev_weights, w, participation_cap)
         w = np.asarray(w, dtype=float_dtype)
+        post_trade_ok = True
+        post_trade_reasons: List[str] = []
+        post_trade_breaches: List[LimitBreach] = []
+        if limit_evaluator is not None:
+            post_trade_ok, post_trade_reasons, post_trade_breaches = post_trade_check(w, limit_evaluator)
         turn_val, penalty_val, _ = _turnover_penalty_components(
             prev_weights,
             w,
             gamma=turnover_gamma_array,
             out=turnover_buffer,
         )
+        limit_breach_log.append(
+            {
+                "date": _stringify(rebalance_date),
+                "pre": [breach.to_dict() for breach in pre_trade_breaches],
+                "post": [breach.to_dict() for breach in post_trade_breaches],
+            }
+        )
+        all_limit_breaches.extend(pre_trade_breaches)
+        all_limit_breaches.extend(post_trade_breaches)
         turn = float(turn_val)
         sector_penalty_val = float(penalty_val)
         weights.append(w)
@@ -4095,6 +4153,8 @@ def backtest(
                 }
             )
 
+        period_asset_returns.append(np.asarray(block_asset_returns, dtype=float))
+        period_dates_for_brinson.append(rebalance_date)
         if compute_factor_attr and current_factor_snapshot is not None:
             block_asset_returns = np.prod(1.0 + np.asarray(test, dtype=float), axis=0) - 1.0
             attr_row = _compute_factor_attr_row(
@@ -4209,6 +4269,7 @@ def backtest(
             else:
                 bench_mask_arr = np.ones_like(bench_arr, dtype=bool)
             active = w - bench_arr
+            benchmark_weight_history.append(np.asarray(bench_arr, dtype=float))
             if np.isfinite(constraints.min_active_weight):
                 violations = np.logical_and(
                     bench_mask_arr,
@@ -4303,6 +4364,8 @@ def backtest(
             first_violation = "SECTOR_CAP"
         elif turnover_violation:
             first_violation = "TURNOVER"
+        if post_trade_breaches and not first_violation:
+            first_violation = post_trade_breaches[0].reason()
 
         block_info_ratio: Optional[float] = None
         block_tracking_error: Optional[float] = None
@@ -4363,6 +4426,13 @@ def backtest(
                 "block_sortino": block_sortino,
                 "block_info_ratio": block_info_ratio,
                 "block_tracking_error": block_tracking_error,
+                "pre_trade_ok": bool(pre_trade_ok),
+                "pre_trade_breach_count": int(len(pre_trade_breaches)),
+                "post_trade_breach_count": int(len(post_trade_breaches)),
+                "breach_count": int(len(post_trade_breaches)),
+                "first_breach": post_trade_breaches[0].reason() if post_trade_breaches else None,
+                "pre_trade_reasons": "|".join(pre_trade_reasons),
+                "post_trade_reasons": "|".join(post_trade_reasons),
                 "warm_applied": bool(warm_applied_flag),
                 "decay": float(decay_value),
             }
@@ -4388,6 +4458,10 @@ def backtest(
                     "group": int(group_breaches),
                     "factor": int(factor_bound_breaches),
                     "sector": int(sector_breaches),
+                },
+                "limits": {
+                    "pre": [breach.to_dict() for breach in pre_trade_breaches],
+                    "post": [breach.to_dict() for breach in post_trade_breaches],
                 },
                 "sector_penalty": float(sector_penalty_val),
                 "block": {
@@ -4500,7 +4574,7 @@ def backtest(
 
     warnings_list = list(dict.fromkeys(warm_warnings))
 
-    return {
+    results = {
         "dates": realized_dates,
         "returns": realized_returns_arr,
         "gross_returns": gross_returns_arr,
@@ -4550,6 +4624,9 @@ def backtest(
         "factor_attr": factor_attr_records,
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
+        "limit_breaches": limit_breach_log,
+        "limit_breach_summary": summarize_breaches(all_limit_breaches),
+        "limit_manifest": limit_manifest,
         "sector_name_map": sector_name_map,
         "warnings": warnings_list,
         "cov_cache_size": int(max_cov_cache),
@@ -4563,6 +4640,50 @@ def backtest(
         "warm_align": warm_align_mode,
         "warm_applied_count": int(warm_applied_count),
     }
+
+    if (
+        benchmark_weight_history
+        and period_asset_returns
+        and len(benchmark_weight_history) == len(weights)
+        and len(period_asset_returns) == len(weights)
+    ):
+        try:
+            sector_labels = [sector_display_lookup.get(name, "UNCLASSIFIED") for name in asset_names]
+            brinson = compute_brinson_attribution(
+                weights,
+                benchmark_weight_history,
+                period_asset_returns,
+                sector_labels,
+                period_dates_for_brinson,
+            )
+            results["brinson_allocation"] = brinson.allocation_rows()
+            results["brinson_selection"] = brinson.selection_rows()
+            results["brinson_total"] = brinson.total_rows()
+            results["brinson_active"] = dict(brinson.active_returns)
+        except Exception:
+            results["brinson_allocation"] = []
+            results["brinson_selection"] = []
+            results["brinson_total"] = []
+            results["brinson_active"] = {}
+    else:
+        results["brinson_allocation"] = []
+        results["brinson_selection"] = []
+        results["brinson_total"] = []
+        results["brinson_active"] = {}
+
+    if factor_names and factor_attr_records and factor_records:
+        factor_attr = compute_factor_contributions(
+            factor_attr_records,
+            factor_records,
+            factor_names,
+        )
+        results["factor_contribution_rows"] = factor_attr.contribution_rows()
+        results["factor_cumulative_rows"] = factor_attr.cumulative_rows()
+    else:
+        results["factor_contribution_rows"] = []
+        results["factor_cumulative_rows"] = []
+
+    return results
 
 
 def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
@@ -5441,6 +5562,13 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "block_sortino",
         "block_info_ratio",
         "block_tracking_error",
+        "pre_trade_ok",
+        "pre_trade_breach_count",
+        "post_trade_breach_count",
+        "breach_count",
+        "first_breach",
+        "pre_trade_reasons",
+        "post_trade_reasons",
         "warm_applied",
         "decay",
     ]
@@ -5484,6 +5612,64 @@ def _write_contributions(path: Path, results: Dict[str, Any]) -> None:
                     "block_return": record.get("block_return"),
                 }
             )
+
+
+def _write_breaches(path: Path, results: Dict[str, Any]) -> None:
+    records: Sequence[Mapping[str, Any]] = results.get("limit_breaches", [])  # type: ignore[assignment]
+    summary: Sequence[Mapping[str, Any]] = results.get("limit_breach_summary", [])  # type: ignore[assignment]
+    if not records and not summary:
+        return
+    payload = {
+        "dates": [
+            {
+                "date": record.get("date"),
+                "pre": record.get("pre", []),
+                "post": record.get("post", []),
+            }
+            for record in records
+        ],
+        "summary": list(summary),
+    }
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+
+
+def _write_brinson_reports(out_dir: Path, results: Dict[str, Any]) -> None:
+    allocation: Sequence[Mapping[str, Any]] = results.get("brinson_allocation", [])  # type: ignore[assignment]
+    selection: Sequence[Mapping[str, Any]] = results.get("brinson_selection", [])  # type: ignore[assignment]
+    total: Sequence[Mapping[str, Any]] = results.get("brinson_total", [])  # type: ignore[assignment]
+    files = [
+        ("brinson_allocation.csv", allocation),
+        ("brinson_selection.csv", selection),
+        ("brinson_total.csv", total),
+    ]
+    for name, rows in files:
+        if not rows:
+            continue
+        fieldnames = list(rows[0].keys())
+        with (out_dir / name).open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+
+def _write_factor_contrib_reports(out_dir: Path, results: Dict[str, Any]) -> None:
+    contrib_rows: Sequence[Mapping[str, Any]] = results.get("factor_contribution_rows", [])  # type: ignore[assignment]
+    cumulative_rows: Sequence[Mapping[str, Any]] = results.get("factor_cumulative_rows", [])  # type: ignore[assignment]
+    if contrib_rows:
+        with (out_dir / "factor_contrib.csv").open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["date", "factor", "contribution"])
+            writer.writeheader()
+            for row in contrib_rows:
+                writer.writerow(row)
+    if cumulative_rows:
+        fieldnames = list(cumulative_rows[0].keys())
+        with (out_dir / "factor_cumulative.csv").open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in cumulative_rows:
+                writer.writerow(row)
 
 
 def _maybe_write_parquet(out_dir: Path, args: argparse.Namespace) -> None:
@@ -5711,6 +5897,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="YAML/JSON file describing factor exposure bounds",
+    )
+    parser.add_argument(
+        "--limit-file",
+        type=str,
+        default=None,
+        help="YAML/JSON file describing risk and compliance limits",
     )
     parser.add_argument(
         "--attr",
@@ -6172,6 +6364,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     benchmark_weights_spec = getattr(parsed, "benchmark_weights", None)
     active_group_spec = parsed.active_group_caps or None
     factor_bounds_spec = parsed.factor_bounds or None
+    limit_spec = parsed.limit_file or None
+    if limit_spec is not None:
+        limit_spec = _maybe_load_structure(limit_spec)
 
     tx_cost_bps = float(parsed.tx_cost_bps) if parsed.tx_cost_mode != "none" else 0.0
     returns_arr_for_baseline = np.atleast_2d(returns_preview.astype(float_dtype))
@@ -6219,6 +6414,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         active_max=parsed.active_max,
         active_group_caps=active_group_spec,
         factor_bounds=factor_bounds_spec,
+        limits=limit_spec,
         te_target=parsed.te_target,
         lambda_te=parsed.lambda_te,
         gamma_turnover=parsed.gamma_turnover,
@@ -6372,6 +6568,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     _write_rebalance_report(out_dir / "rebalance_report.csv", results)
     _write_drawdowns(out_dir / "drawdowns.csv", results)
     _write_contributions(out_dir / "contrib.csv", results)
+    _write_breaches(out_dir / "breaches.json", results)
+    _write_brinson_reports(out_dir, results)
+    _write_factor_contrib_reports(out_dir, results)
     _write_equity(out_dir / "equity.csv", results)
     if bootstrap_count:
         ci_path = out_dir / "metrics_ci.json"
