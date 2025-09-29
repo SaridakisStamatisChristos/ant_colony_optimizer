@@ -13,6 +13,7 @@ class _ResponseWrapper:
         self._response = response
         self.status_code = response.status_code
         self.content = response.content
+        self.headers = response.headers
 
     def json(self) -> Any:
         return self._response.json()

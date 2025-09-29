@@ -11,6 +11,8 @@ from typing import Any, Dict
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 
+from service import metrics
+
 from neuro_ant_optimizer.runid import compute_run_id
 
 
@@ -39,12 +41,14 @@ def _require_token(request: Request) -> None:
 def _safe_run_dir(run_id: str, root: Path) -> Path:
     candidate = (root / run_id).resolve()
     if not str(candidate).startswith(str(root)):
+        metrics.mark_run_failed()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
     return candidate
 
 
 def _load_manifest(path: Path) -> Dict[str, Any]:
     if not path.exists():
+        metrics.mark_run_failed()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manifest not found")
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -60,6 +64,7 @@ def _load_urls(path: Path) -> Dict[str, str]:
 
 def create_app() -> FastAPI:
     app = FastAPI()
+    metrics.configure_optional_tracing(app)
 
     @app.post("/backtest", status_code=status.HTTP_202_ACCEPTED)
     async def submit_backtest(
@@ -72,6 +77,7 @@ def create_app() -> FastAPI:
         if "git_sha" in params:
             manifest_seed["git_sha"] = params["git_sha"]
         run_id = compute_run_id(manifest_seed, [])
+        metrics.mark_run_started()
         return {"run_id": run_id, "status": "accepted"}
 
     @app.get("/runs/{run_id}")
@@ -87,6 +93,13 @@ def create_app() -> FastAPI:
             manifest["artifact_index_entries"] = json.loads(
                 index_path.read_text(encoding="utf-8")
             )
+        metrics.mark_run_succeeded()
+        window_duration = manifest.get("window_duration_seconds")
+        if isinstance(window_duration, (int, float)):
+            metrics.observe_window_duration(float(window_duration))
+        total_runtime = manifest.get("total_runtime_seconds")
+        if isinstance(total_runtime, (int, float)):
+            metrics.observe_total_runtime(float(total_runtime))
         return manifest
 
     @app.get("/artifacts/{run_id}/{artifact_path:path}")
@@ -106,6 +119,43 @@ def create_app() -> FastAPI:
             return JSONResponse({"location": urls[artifact_path]})
 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+
+    @app.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        content = metrics.render_latest()
+        headers = {"content-type": metrics.CONTENT_TYPE_LATEST}
+        return Response(content=content, headers=headers)
+
+    @app.get("/healthz")
+    async def healthz() -> Dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        checks: Dict[str, Any] = {}
+        disk_ok = False
+        try:
+            root = _runs_root()
+            probe = root / ".readyz"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            checks["runs_dir"] = {"ok": True, "path": str(root)}
+            disk_ok = True
+        except Exception as exc:  # pragma: no cover - defensive guard
+            checks["runs_dir"] = {"ok": False, "error": str(exc)}
+
+        registry_url = os.getenv("REGISTRY_URL")
+        registry_ok = bool(registry_url)
+        registry_info: Dict[str, Any] = {"ok": registry_ok}
+        if registry_url:
+            registry_info["url"] = registry_url
+        else:
+            registry_info["error"] = "REGISTRY_URL is not configured"
+        checks["registry_url"] = registry_info
+
+        status_code = status.HTTP_200_OK if disk_ok and registry_ok else status.HTTP_503_SERVICE_UNAVAILABLE
+        body: Dict[str, Any] = {"status": "ok" if status_code == status.HTTP_200_OK else "unavailable", "checks": checks}
+        return JSONResponse(body, status_code=status_code)
 
     return app
 
