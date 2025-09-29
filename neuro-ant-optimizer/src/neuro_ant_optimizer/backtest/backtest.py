@@ -66,6 +66,8 @@ from neuro_ant_optimizer.optimizer import (
     OptimizerConfig,
 )
 from neuro_ant_optimizer.portfolio.baselines import compute_baseline
+from neuro_ant_optimizer.registry import RegistryError, upload_artifacts
+from neuro_ant_optimizer.runid import compute_run_id
 from neuro_ant_optimizer.utils import nearest_psd, set_seed, shrink_covariance
 
 try:  # pragma: no cover - optional dependency
@@ -1989,6 +1991,26 @@ def _write_run_manifest(
     *,
     validated: bool = False,
 ) -> None:
+    def _collect_artifacts(directory: Path) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        for candidate in sorted(directory.rglob("*")):
+            if not candidate.is_file():
+                continue
+            rel = candidate.relative_to(directory).as_posix()
+            if rel in {"run_config.json", "artifact_index.json"}:
+                continue
+            blob = candidate.read_bytes()
+            records.append(
+                {
+                    "name": rel,
+                    "sha256": hashlib.sha256(blob).hexdigest(),
+                    "size": len(blob),
+                }
+            )
+        return records
+
+    artifact_records = _collect_artifacts(out_dir)
+
     manifest: Dict[str, Any] = {
         "args": _serialize_args(args),
         "schema_version": SCHEMA_VERSION,
@@ -2017,6 +2039,8 @@ def _write_run_manifest(
     if git_sha:
         manifest["git_sha"] = git_sha
 
+    manifest.setdefault("timestamp", datetime.now(UTC).replace(microsecond=0).isoformat())
+
     if results is not None:
         warnings = results.get("warnings")
         if warnings:
@@ -2029,9 +2053,59 @@ def _write_run_manifest(
         manifest["warm_align"] = results.get("warm_align")
         manifest["warm_applied_count"] = results.get("warm_applied_count", 0)
 
-    (out_dir / "run_config.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    manifest["artifact_index"] = "artifact_index.json"
+
+    base_signatures: Dict[str, Dict[str, Any]] = {
+        record["name"]: {"sha256": record["sha256"], "size": int(record["size"])}
+        for record in artifact_records
+    }
+
+    manifest_for_hash = {key: value for key, value in manifest.items() if key != "run_id"}
+    run_id = compute_run_id(manifest_for_hash, artifact_records)
+    manifest["run_id"] = run_id
+    setattr(args, "run_id", run_id)
+
+    manifest_payload = dict(manifest)
+    manifest_payload["signatures"] = dict(base_signatures)
+
+    while True:
+        run_config_bytes = json.dumps(
+            manifest_payload, indent=2, sort_keys=True
+        ).encode("utf-8")
+        run_config_entry = {
+            "name": "run_config.json",
+            "sha256": hashlib.sha256(run_config_bytes).hexdigest(),
+            "size": len(run_config_bytes),
+        }
+        artifact_entries = artifact_records + [run_config_entry]
+        artifact_index_bytes = json.dumps(
+            sorted(artifact_entries, key=lambda item: item["name"]), indent=2
+        ).encode("utf-8")
+        artifact_index_entry = {
+            "name": "artifact_index.json",
+            "sha256": hashlib.sha256(artifact_index_bytes).hexdigest(),
+            "size": len(artifact_index_bytes),
+        }
+
+        updated_signatures = dict(base_signatures)
+        updated_signatures["run_config.json"] = {
+            "sha256": run_config_entry["sha256"],
+            "size": run_config_entry["size"],
+        }
+        updated_signatures["artifact_index.json"] = {
+            "sha256": artifact_index_entry["sha256"],
+            "size": artifact_index_entry["size"],
+        }
+
+        if manifest_payload.get("signatures") == updated_signatures:
+            break
+
+        manifest_payload["signatures"] = updated_signatures
+
+    manifest_payload["signatures"] = updated_signatures
+
+    (out_dir / "run_config.json").write_bytes(run_config_bytes)
+    (out_dir / "artifact_index.json").write_bytes(artifact_index_bytes)
 
 
 def _coerce_date(value: Any) -> Any:
@@ -6036,6 +6110,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to store zipped run artifacts when tracking",
     )
     parser.add_argument(
+        "--upload",
+        action="store_true",
+        help="Upload run artifacts to the configured registry",
+    )
+    parser.add_argument(
         "--log-json",
         type=str,
         default=None,
@@ -6673,6 +6752,12 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         extras=constraint_manifest,
         validated=cfg_validated,
     )
+
+    if getattr(parsed, "upload", False):
+        try:
+            upload_artifacts(out_dir)
+        except RegistryError as exc:
+            raise SystemExit(f"Failed to upload artifacts: {exc}") from exc
 
     tracker_path = getattr(parsed, "runs_csv", None)
     if tracker_path:
