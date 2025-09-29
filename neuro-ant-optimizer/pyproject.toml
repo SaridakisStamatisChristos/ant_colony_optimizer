@@ -56,6 +56,7 @@ dev = [
   "mutmut>=2.4",
 ]
 backtest = ["pandas>=2.0", "matplotlib>=3.7", "pydantic>=2.7"]
+dashboard = ["pandas>=2.0", "streamlit>=1.32"]
 docs = ["mkdocs>=1.5"]
 
 [project.scripts]

@@ -96,6 +96,23 @@ notebooks to explore the generated metrics.
 
 ---
 
+## Streamlit artifact dashboard
+
+Explore the contents of a `bt_out/` directory without leaving your browser by launching the
+bundled Streamlit app. Install the optional dependencies and run:
+
+```bash
+python -m pip install "neuro-ant-optimizer[dashboard]"
+streamlit run streamlit_bt_dashboard.py
+```
+
+Point the uploader at the CSV files written by the backtest (you can drag multiple files or
+drop a zipped archive produced by `--archive-runs`). The dashboard summarises the headline
+metrics, overlays the gross and net equity curves, lists drawdown episodes, and visualises
+scenario weight deltas alongside any breaches reported in `scenarios_report.csv`.
+
+---
+
 ## QA hardening
 
 Property-based tests powered by [Hypothesis](https://hypothesis.readthedocs.io/) now
