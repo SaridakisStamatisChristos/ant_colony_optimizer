@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from neuro_ant_optimizer.backtest.backtest import main as backtest_main
+
+pytestmark = pytest.mark.slow
 
 
 def _run_cli(out_dir: Path) -> None:

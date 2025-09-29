@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+- Covariance model extensions, benchmark objective tweaks, and risk-free handling refinements.
+- Expanded rebalance report schema with stability checks and fixture coverage.
+- Factor diagnostics polish plus parquet export path hardening.
+- Reproducibility tooling (manifest replayer, safety rails, CLI entry point) and determinism audits.
+- CI improvements with optional `[backtest]` leg, slow-test gating, and docs/code sync guards.
+
 ## 0.4.0
 - MkDocs documentation with quickstart, configuration reference, artifact schema, and reproducibility guide.
 - Deterministic CLI flag (`--deterministic`) with manifest tracking and strict Torch enforcement.

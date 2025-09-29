@@ -157,6 +157,16 @@ The command writes artifacts to `quickstart_artifacts/`, appends to `runs.csv`, 
 a zipped copy under `quickstart_archives/`. Inspect the outputs or open the example
 notebooks to explore the generated metrics.
 
+### Run the full test suite
+
+```bash
+pip install "neuro-ant-optimizer[backtest]"  # pulls pandas/mpl
+make test-all
+```
+
+> Some tests are skipped without pandas; installing the backtest extras enables those
+> scenarios locally.
+
 ---
 
 ## Streamlit artifact dashboard
