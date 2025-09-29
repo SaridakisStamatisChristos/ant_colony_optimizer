@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 bt = import_module("neuro_ant_optimizer.backtest.backtest")
-from tests.conftest import _EXPECTED_REBALANCE_HEADER
+from conftest import _EXPECTED_REBALANCE_HEADER
 
 
 class _Frame:
