@@ -595,6 +595,10 @@ _STANDARD_METRIC_KEYS: Tuple[str, ...] = (
     "realized_cvar",
     "tracking_error",
     "info_ratio",
+    "turnover_adj_sharpe",
+    "calmar_ratio",
+    "pain_ratio",
+    "hit_rate",
     "te_target",
     "lambda_te",
     "gamma_turnover",
@@ -2045,6 +2049,115 @@ def _compute_factor_snapshot(
     return snapshot
 
 
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    n = arr.size
+    if n == 0:
+        return np.array([], dtype=float)
+    order = np.argsort(arr, kind="mergesort")
+    ranks = np.empty(n, dtype=float)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and arr[order[j + 1]] == arr[order[i]]:
+            j += 1
+        avg_rank = 0.5 * (i + j) + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _spearman_ic(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    n = x.size
+    if n < 3:
+        return 0.0, 0.0
+    rx = _rankdata(x)
+    ry = _rankdata(y)
+    rx_mean = rx.mean()
+    ry_mean = ry.mean()
+    cov = float(np.dot(rx - rx_mean, ry - ry_mean))
+    denom = float(np.linalg.norm(rx - rx_mean) * np.linalg.norm(ry - ry_mean))
+    if denom <= 1e-12:
+        return 0.0, 0.0
+    corr = float(np.clip(cov / denom, -1.0, 1.0))
+    if abs(corr) >= 1.0:
+        return corr, 0.0
+    t_stat = corr * math.sqrt((n - 2) / max(1e-12, 1.0 - corr**2))
+    return corr, float(t_stat)
+
+
+def _ols_factor_returns(
+    exposures: np.ndarray, returns: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(exposures, dtype=float)
+    y = np.asarray(returns, dtype=float).reshape(-1)
+    if x.ndim != 2 or y.ndim != 1:
+        raise ValueError("Invalid exposure or return dimensions for attribution")
+    if x.shape[0] != y.shape[0]:
+        raise ValueError("Exposure and return length mismatch")
+    n_obs, n_fac = x.shape
+    if n_obs <= n_fac:
+        return np.zeros(n_fac, dtype=float), np.zeros(n_fac, dtype=float)
+    design = np.column_stack([np.ones(n_obs, dtype=float), x])
+    beta, *_ = np.linalg.lstsq(design, y, rcond=None)
+    fitted = design @ beta
+    residuals = y - fitted
+    dof = max(n_obs - design.shape[1], 1)
+    sigma2 = float(np.dot(residuals, residuals) / dof)
+    xtx = design.T @ design
+    xtx_inv = np.linalg.pinv(xtx)
+    variances = np.diag(xtx_inv) * sigma2
+    std_err = np.sqrt(np.maximum(variances[1:], 0.0))
+    factor_returns = beta[1:]
+    t_stats = np.divide(
+        factor_returns,
+        std_err,
+        out=np.zeros_like(factor_returns),
+        where=std_err > 1e-12,
+    )
+    return factor_returns.astype(float), t_stats.astype(float)
+
+
+def _compute_factor_attr_row(
+    date: Any,
+    exposures: np.ndarray,
+    asset_returns: np.ndarray,
+    factor_names: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    exp_arr = np.asarray(exposures, dtype=float)
+    ret_arr = np.asarray(asset_returns, dtype=float)
+    if exp_arr.ndim != 2 or ret_arr.ndim != 1:
+        return None
+    if exp_arr.shape[0] != ret_arr.shape[0]:
+        return None
+    mask = np.isfinite(ret_arr)
+    if exp_arr.size:
+        mask = mask & np.all(np.isfinite(exp_arr), axis=1)
+    if not np.any(mask):
+        return None
+    filtered_exposures = exp_arr[mask]
+    filtered_returns = ret_arr[mask]
+    if filtered_exposures.shape[0] <= filtered_exposures.shape[1]:
+        return None
+    factor_returns, t_stats = _ols_factor_returns(filtered_exposures, filtered_returns)
+    if factor_returns.size != len(factor_names):
+        return None
+    row: Dict[str, Any] = {"date": _stringify(date)}
+    for idx, name in enumerate(factor_names):
+        corr, ic_t = _spearman_ic(filtered_exposures[:, idx], filtered_returns)
+        row[f"{name}_return"] = float(factor_returns[idx])
+        row[f"{name}_return_t"] = float(t_stats[idx])
+        row[f"{name}_ic"] = float(corr)
+        row[f"{name}_ic_t"] = float(ic_t)
+    return row
+
+
 def _compute_slippage_cost(
     cfg: Optional[SlippageConfig],
     delta: Optional[np.ndarray],
@@ -2472,6 +2585,20 @@ def max_drawdown(equity_curve: np.ndarray) -> float:
     return float(np.max(drawdown))
 
 
+def _pain_index(equity_curve: np.ndarray) -> float:
+    equity = np.asarray(equity_curve, dtype=float)
+    if equity.size == 0:
+        return 0.0
+    running_peak = np.maximum.accumulate(equity)
+    drawdown = 1.0 - np.divide(
+        equity,
+        running_peak,
+        out=np.ones_like(equity),
+        where=running_peak > 0,
+    )
+    return float(drawdown.mean())
+
+
 def compute_drawdown_events(equity: np.ndarray, dates: Sequence[Any]) -> List[Dict[str, Any]]:
     curve = np.asarray(equity, dtype=float)
     if curve.size == 0:
@@ -2875,6 +3002,7 @@ def backtest(
     decay: float = 0.0,
     drop_duplicates: bool = False,
     deterministic: bool = False,
+    compute_factor_attr: bool = False,
 ) -> Dict[str, Any]:
     """Run a rolling-window backtest on a return dataframe."""
 
@@ -3122,6 +3250,7 @@ def backtest(
     tc = float(tx_cost_bps) / 1e4
     missing_factor_logged: Set[Any] = set()
     factor_records: List[Dict[str, Any]] = []
+    factor_attr_records: List[Dict[str, Any]] = []
     rebalance_records: List[Dict[str, Any]] = []
     walk_windows: List[Tuple[int, int]] = []
 
@@ -3395,6 +3524,17 @@ def backtest(
                     "block_return": block_total,
                 }
             )
+
+        if compute_factor_attr and current_factor_snapshot is not None:
+            block_asset_returns = np.prod(1.0 + np.asarray(test, dtype=float), axis=0) - 1.0
+            attr_row = _compute_factor_attr_row(
+                rebalance_date,
+                current_factor_snapshot,
+                block_asset_returns,
+                factor_names,
+            )
+            if attr_row is not None:
+                factor_attr_records.append(attr_row)
 
         turnovers_arr[window_idx] = float(turn)
         turnover_violation = False
@@ -3749,6 +3889,16 @@ def backtest(
         realized_cvar = 0.0
     mdd = max_drawdown(equity)
     avg_turn = float(turnovers_used.mean()) if turnovers_used.size else 0.0
+    pain_idx = _pain_index(equity)
+    calmar_ratio = float(ann_return / mdd) if mdd > 1e-12 else 0.0
+    pain_ratio = float(ann_return / pain_idx) if pain_idx > 1e-12 else 0.0
+    turnover_adj_sharpe = (
+        float(sharpe / (1.0 + avg_turn)) if (1.0 + avg_turn) > 1e-12 else 0.0
+    )
+    if realized_returns_arr.size:
+        hit_rate = float(np.count_nonzero(realized_returns_arr > 0) / realized_returns_arr.size)
+    else:
+        hit_rate = 0.0
 
     tracking_error = None
     info_ratio = None
@@ -3791,6 +3941,10 @@ def backtest(
         "realized_cvar": realized_cvar,
         "tracking_error": tracking_error,
         "info_ratio": info_ratio,
+        "turnover_adj_sharpe": turnover_adj_sharpe,
+        "calmar_ratio": calmar_ratio,
+        "pain_ratio": pain_ratio,
+        "hit_rate": hit_rate,
         "te_target": float(optimizer.cfg.te_target),
         "lambda_te": float(optimizer.cfg.lambda_te),
         "gamma_turnover": float(optimizer.cfg.gamma_turnover),
@@ -3808,6 +3962,7 @@ def backtest(
         "projection_iterations": projection_iters,
         "drawdowns": drawdown_events,
         "contributions": block_contributions,
+        "factor_attr": factor_attr_records,
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
         "warnings": warnings_list,
@@ -3834,6 +3989,126 @@ def _write_metrics(metrics_path: Path, results: Dict[str, Any]) -> None:
         for key in _BASELINE_METRIC_KEYS:
             if key in results:
                 writer.writerow([key, results.get(key)])
+
+
+def _window_turnover(
+    start: int, end: int, windows: Sequence[Tuple[int, int]], turnovers: Sequence[float]
+) -> float:
+    if not windows or not turnovers:
+        return 0.0
+    values: List[float] = []
+    limit = min(len(windows), len(turnovers))
+    for idx in range(limit):
+        win_start, win_end = windows[idx]
+        if win_end <= start or win_start >= end:
+            continue
+        values.append(float(turnovers[idx]))
+    if not values:
+        return 0.0
+    return float(np.mean(values))
+
+
+def _compute_rolling_metrics_rows(
+    returns: np.ndarray,
+    dates: Sequence[Any],
+    periodic_rf: float,
+    trading_days: int,
+    window: int,
+    walk_windows: Sequence[Tuple[int, int]],
+    turnovers: Sequence[float],
+) -> List[Dict[str, Any]]:
+    returns_arr = np.asarray(returns, dtype=float)
+    if window <= 1 or returns_arr.size < window:
+        return []
+    ann_factor = math.sqrt(trading_days)
+    rows: List[Dict[str, Any]] = []
+    for end_idx in range(window, returns_arr.size + 1):
+        start_idx = end_idx - window
+        window_returns = returns_arr[start_idx:end_idx]
+        equity = np.cumprod(1.0 + window_returns, dtype=float)
+        ann_return = float(window_returns.mean() * trading_days)
+        ann_vol = float(np.std(window_returns) * ann_factor)
+        excess = window_returns - periodic_rf
+        excess_mean = float(excess.mean() * trading_days)
+        sharpe = float(excess_mean / ann_vol) if ann_vol > 1e-12 else 0.0
+        negatives = excess[excess < 0]
+        downside_vol = float(negatives.std() * ann_factor) if negatives.size else 0.0
+        sortino = float(excess_mean / downside_vol) if downside_vol > 1e-12 else 0.0
+        mdd = max_drawdown(equity)
+        pain_idx = _pain_index(equity)
+        calmar_ratio = float(ann_return / mdd) if mdd > 1e-12 else 0.0
+        pain_ratio = float(ann_return / pain_idx) if pain_idx > 1e-12 else 0.0
+        hit_rate = (
+            float(np.count_nonzero(window_returns > 0) / window_returns.size)
+            if window_returns.size
+            else 0.0
+        )
+        avg_turnover = _window_turnover(start_idx, end_idx, walk_windows, turnovers)
+        turnover_adj_sharpe = (
+            float(sharpe / (1.0 + avg_turnover))
+            if (1.0 + avg_turnover) > 1e-12
+            else 0.0
+        )
+        row = {
+            "start": _stringify(dates[start_idx]) if dates else start_idx,
+            "end": _stringify(dates[end_idx - 1]) if dates else end_idx - 1,
+            "ann_return": ann_return,
+            "ann_vol": ann_vol,
+            "sharpe": sharpe,
+            "sortino": sortino,
+            "turnover_adj_sharpe": turnover_adj_sharpe,
+            "calmar_ratio": calmar_ratio,
+            "pain_ratio": pain_ratio,
+            "hit_rate": hit_rate,
+            "max_drawdown": mdd,
+        }
+        rows.append(row)
+    return rows
+
+
+def _write_rolling_metrics(
+    path: Path, results: Dict[str, Any], window: int
+) -> None:
+    returns = results.get("returns")
+    dates = results.get("dates")
+    if not isinstance(returns, np.ndarray) or returns.size == 0:
+        return
+    if not isinstance(window, int) or window <= 1:
+        return
+    periodic_rf = float(results.get("periodic_risk_free", 0.0))
+    trading_days = int(results.get("trading_days", 252))
+    walk_windows: Sequence[Tuple[int, int]] = results.get("walk_windows", [])  # type: ignore[assignment]
+    rebalance_records: Sequence[Mapping[str, Any]] = results.get("rebalance_records", [])  # type: ignore[assignment]
+    turnovers = [float(record.get("turnover", 0.0)) for record in rebalance_records]
+    rows = _compute_rolling_metrics_rows(
+        returns,
+        dates or [],
+        periodic_rf,
+        trading_days,
+        window,
+        walk_windows,
+        turnovers,
+    )
+    if not rows:
+        return
+    header = [
+        "start",
+        "end",
+        "ann_return",
+        "ann_vol",
+        "sharpe",
+        "sortino",
+        "turnover_adj_sharpe",
+        "calmar_ratio",
+        "pain_ratio",
+        "hit_rate",
+        "max_drawdown",
+    ]
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def _slice_frame(frame: Any, indices: Sequence[int], *, reset_index: bool) -> Any:
@@ -4530,6 +4805,28 @@ def _write_factor_constraints(path: Path, results: Dict[str, Any]) -> None:
             writer.writerow(row)
 
 
+def _write_factor_attr(path: Path, results: Dict[str, Any]) -> None:
+    rows: Sequence[Dict[str, Any]] = results.get("factor_attr", [])  # type: ignore[assignment]
+    factor_names: Sequence[str] = results.get("factor_names", [])  # type: ignore[assignment]
+    if not rows or not factor_names:
+        return
+    header = ["date"]
+    for name in factor_names:
+        header.extend(
+            [
+                f"{name}_return",
+                f"{name}_return_t",
+                f"{name}_ic",
+                f"{name}_ic_t",
+            ]
+        )
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key) for key in header})
+
+
 def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
     records: Sequence[Dict[str, Any]] = results.get("rebalance_records", [])  # type: ignore[assignment]
     header = [
@@ -4890,6 +5187,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="YAML/JSON file describing factor exposure bounds",
     )
     parser.add_argument(
+        "--attr",
+        action="store_true",
+        help="Compute factor attribution diagnostics (factor returns and IC)",
+    )
+    parser.add_argument(
         "--scenarios",
         type=str,
         default=None,
@@ -5105,6 +5407,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Block bootstrap method to use for confidence intervals",
     )
     parser.add_argument(
+        "--rolling-window",
+        type=int,
+        default=0,
+        help="Window length (in periods) for rolling performance metrics (0 disables)",
+    )
+    parser.add_argument(
         "--block",
         type=int,
         default=21,
@@ -5188,6 +5496,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         factor_panel_prepared, _ = validate_factor_panel(
             factor_panel_prepared, df, align=parsed.factor_align
         )
+    if parsed.attr and factor_panel_prepared is None:
+        raise ValueError("--attr requires factor loadings (--factors)")
 
     benchmark_weights_spec = getattr(parsed, "benchmark_weights", None)
     active_group_spec = parsed.active_group_caps or None
@@ -5245,6 +5555,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         decay=parsed.decay,
         drop_duplicates=parsed.drop_duplicates,
         deterministic=parsed.deterministic,
+        compute_factor_attr=parsed.attr,
     )
     base_backtest_kwargs = dict(shared_backtest_kwargs)
     base_backtest_kwargs.update(
@@ -5423,8 +5734,16 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     if parsed.factors:
         _write_factor_constraints(out_dir / "factor_constraints.csv", results)
         _write_exposures(out_dir / "exposures.csv", results)
+        if parsed.attr:
+            _write_factor_attr(out_dir / "factor_attr.csv", results)
+    elif parsed.attr:
+        _write_factor_attr(out_dir / "factor_attr.csv", results)
     if parsed.save_weights:
         _write_weights(out_dir / "weights.csv", results)
+    if getattr(parsed, "rolling_window", 0):
+        _write_rolling_metrics(
+            out_dir / "rolling_metrics.csv", results, int(parsed.rolling_window)
+        )
 
     scenario_spec = getattr(parsed, "scenarios", None)
     if scenario_spec:
