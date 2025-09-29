@@ -9,10 +9,24 @@ A hybrid ant-colony + neural policy portfolio optimizer with:
 
 ---
 
-## Install (minimal)
+## Install
+
+### Minimal core
 
 ```bash
 python -m pip install numpy scipy torch pytest
+```
+
+### Backtest + data extras
+
+The CLI leans on pandas/pyarrow for I/O and optionally Polars for the fast path. Install
+the curated extras to pull everything in one go:
+
+```bash
+python -m pip install "neuro-ant-optimizer[backtest,io]"
+
+# Enable the Polars + Arrow accelerated loaders
+python -m pip install "neuro-ant-optimizer[polars,arrow]"
 ```
 
 ---
@@ -52,10 +66,11 @@ Backtest runs can now be tracked automatically by appending metadata to a CSV le
 ```bash
 python -m neuro_ant_optimizer.backtest.backtest \
   --config src/neuro_ant_optimizer/examples/configs/minimal.yaml \
-  --runs-csv runs.csv --track-artifacts run_archives
+  --runs-csv runs.csv --track-artifacts run_archives \
+  --io-backend auto --workers 4 --prefetch 4
 ```
 
-Each run receives a generated ID (or respect a custom `--run-id`), captures the git
+Each run receives a generated ID (or respects a custom `--run-id`), captures the git
 SHA, CLI arguments, and top-line metrics, and optionally archives the artifact folder
 as a zip under `run_archives/`. The manifest embeds the run ID so you can replay a
 specific experiment with:
@@ -64,7 +79,55 @@ specific experiment with:
 python -m neuro_ant_optimizer.backtest.reproduce --run-id <run_id> --runs-csv runs.csv --out replay_dir
 ```
 
-The helper resolves `run_config.json` from the tracker and rebuilds the CLI invocation.
+The helper resolves `run_config.json` from the tracker, loader hints (frequency,
+timezone, PIT enforcement), and rebuilds the CLI invocation.
+
+### Data ingestion shortcuts
+
+The new point-in-time (PIT) aware loader powers both the Python API and CLI. It
+validates timestamp alignment, rejects duplicate rows, and guarantees that the most
+recent observation never sits in the future relative to the requested timezone. To
+hydrate a pandas dataframe directly:
+
+```python
+from neuro_ant_optimizer.data import load_returns
+
+frame = load_returns(
+    "examples/data/returns_daily.csv",
+    freq="B",
+    tz="America/New_York",
+    pit=True,
+    backend="polars",  # falls back to pandas/basic if unavailable
+    dropna="any",
+    columns=["AAPL", "MSFT", "GOOGL"],
+)
+```
+
+The helper accepts CSV or Parquet files, optional rename maps, and asset filters.
+See the cookbook section below for a full walkthrough from raw CSVs to aligned equity
+curves.
+
+### Baseline overlays and transaction costs
+
+Backtests can emit convex baselines alongside the ant optimizer with a configurable
+transaction-cost penalty:
+
+```bash
+neuro-ant-backtest --config examples/configs/daily_ewma.yaml \
+  --baseline riskparity --lambda-tc 2.5
+```
+
+The overlay solver supports min-variance, max-return, and risk-parity modes. A higher
+`--lambda-tc` shrinks turnover monotonically by penalising deviations from the prior
+weights while keeping the solution on the simplex.
+
+### Performance switches
+
+The CLI now exposes deterministic multiprocessing for rolling-window evaluation. Use
+`--workers` to fan out covariance calculations, `--prefetch` to tune queue depth, and
+`--io-backend` to toggle the pandas/Polars readers. Combine them with `--progress` to
+stream window counts and `--cache-cov` to reuse expensive shrinkage calls. All fast
+paths retain deterministic outputs when run with `--deterministic` and a fixed seed.
 
 ---
 
@@ -132,7 +195,10 @@ python -m pip install mkdocs
 mkdocs serve
 ```
 
-The site covers a complete flag reference, artifact schemas, and reproducibility guidance. The published structure mirrors the packaged examples (see `neuro_ant_optimizer.examples.iter_configs()` for programmatic access).
+The site covers a complete flag reference, artifact schemas, cookbooks for PIT-safe
+ingestion and Polars fast paths, plus reproducibility guidance. The published structure
+mirrors the packaged examples (see `neuro_ant_optimizer.examples.iter_configs()` for
+programmatic access).
 
 ---
 
@@ -172,9 +238,10 @@ On the sample workload, the optimized loop (batched risk net + cached PSD repair
 Install optional deps then run:
 
 ```bash
-python -m pip install "neuro-ant-optimizer[backtest]"
+python -m pip install "neuro-ant-optimizer[backtest,io]"
 neuro-ant-backtest --csv path/to/returns.csv --lookback 252 --step 21 \
-  --objective sharpe --cov-model lw --out bt_out \
+  --objective sharpe --cov-model lw --baseline minvar --lambda-tc 1.0 \
+  --io-backend auto --workers 4 --prefetch 4 --out bt_out \
   --save-weights --tx-cost-bps 5 --tx-cost-mode upfront \
   --factor-align strict --factors path/to/factors.csv \
   --rf-bps 25 --trading-days 260

@@ -1,0 +1,15 @@
+# Daily sample covariance using the Polars fast path and multiprocessing
+csv: data/returns_daily.csv
+lookback: 126
+step: 21
+cov_model: sample
+objective: sharpe
+baseline: maxret
+lambda_tc: 0.5
+io_backend: polars
+workers: 4
+prefetch: 6
+cache_cov: 6
+progress: true
+deterministic: true
+out: runs/daily_polars_fast

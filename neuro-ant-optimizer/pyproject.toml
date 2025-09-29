@@ -58,12 +58,18 @@ dev = [
 backtest = ["pandas>=2.0", "matplotlib>=3.7", "pydantic>=2.7"]
 dashboard = ["pandas>=2.0", "streamlit>=1.32"]
 docs = ["mkdocs>=1.5"]
+io = ["pandas>=2.0", "pyarrow>=15.0"]
+polars = ["polars>=0.20"]
+arrow = ["pyarrow>=15.0"]
 
 [project.scripts]
 neuro-ant-backtest = "neuro_ant_optimizer.backtest.backtest:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"
+markers = [
+  "slow: tests that cover multiprocessing or longer running behaviour",
+]
 
 [tool.ruff]
 line-length = 100

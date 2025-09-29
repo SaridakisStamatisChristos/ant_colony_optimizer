@@ -4,6 +4,7 @@ nav:
   - Configuration: config.md
   - Artifacts: artifacts.md
   - Reproducibility: reproducibility.md
+  - Cookbooks: cookbook.md
 theme:
   name: readthedocs
 repo_url: https://github.com/quantresearch/neuro-ant-optimizer

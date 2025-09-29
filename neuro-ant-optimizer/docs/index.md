@@ -73,6 +73,7 @@ Each configuration resolves paths relative to the working directory. Update the 
 - Read the [configuration reference](config.md) for every CLI option and config-file key.
 - Inspect [artifact schemas](artifacts.md) to integrate metrics, rebalance logs, and factor exposures into downstream workflows.
 - Follow the [reproducibility playbook](reproducibility.md) to lock down determinism, manifests, and replays.
+- Walk through the [cookbook recipes](cookbook.md) for PIT ingestion, multiprocessing tips, and Polars-enabled runs.
 
 ## Project layout
 

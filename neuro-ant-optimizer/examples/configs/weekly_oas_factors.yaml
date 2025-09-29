@@ -1,0 +1,23 @@
+# Weekly OAS shrinkage with strict factor alignment and TC-aware baseline
+csv: data/returns_weekly.csv
+benchmark_csv: data/benchmark.csv
+factors: data/factors_weekly.csv
+lookback: 104
+step: 13
+cov_model: oas
+objective: sharpe
+baseline: riskparity
+lambda_tc: 2.0
+factor_align: strict
+factors_required: true
+factor_tolerance: 1e-5
+workers: 2
+prefetch: 4
+io_backend: auto
+data_freq: W
+data_tz: UTC
+tx_cost_bps: 2
+tx_cost_mode: amortized
+slippage: proportional:5
+progress: true
+out: runs/weekly_oas_factors

@@ -1,0 +1,17 @@
+# Daily EWMA covariance with baseline overlay and PIT loader hints
+csv: data/returns_daily.csv
+benchmark_csv: data/benchmark_sp500.csv
+lookback: 252
+step: 21
+cov_model: ewma
+ewma_span: 63
+objective: sharpe
+baseline: minvar
+lambda_tc: 1.5
+io_backend: pandas
+prefetch: 2
+workers: 2
+dropna: any
+tx_cost_bps: 3
+tx_cost_mode: posthoc
+out: runs/daily_ewma
