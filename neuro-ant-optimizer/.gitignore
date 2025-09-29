@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+quickstart_data/
+quickstart_artifacts/
+quickstart_archives/
+quickstart_config.json
+runs.csv

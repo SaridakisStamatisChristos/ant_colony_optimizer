@@ -8,28 +8,31 @@ import importlib
 import itertools
 import hashlib
 import json
-from collections import Counter, OrderedDict, defaultdict
-from dataclasses import dataclass, field
 import math
-from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
+import uuid
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import (
     Any,
     Callable,
     Dict,
     Iterable,
     List,
+    Literal,
     Mapping,
+    MutableMapping,
     Optional,
     Sequence,
     Set,
     TextIO,
     Tuple,
     Union,
-    Literal,
-    MutableMapping,
 )
 from types import SimpleNamespace
 
@@ -628,6 +631,14 @@ _BASELINE_METRIC_KEYS: Tuple[str, ...] = (
 )
 
 _CI_METRIC_KEYS: Tuple[str, ...] = _STANDARD_METRIC_KEYS + _BASELINE_METRIC_KEYS
+
+RUN_TRACKER_METRICS: Tuple[str, ...] = (
+    "sharpe",
+    "ann_return",
+    "max_drawdown",
+    "tracking_error",
+    "info_ratio",
+)
 
 
 @dataclass
@@ -1818,6 +1829,53 @@ def _resolve_git_sha() -> Optional[str]:
         return None
 
 
+def _generate_run_id(seed: Optional[str] = None) -> str:
+    if seed:
+        return str(seed)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    return f"run-{timestamp}-{suffix}"
+
+
+def compute_tracking_error(active_returns: np.ndarray, trading_days: int) -> float:
+    arr = np.asarray(active_returns, dtype=float)
+    if arr.size == 0:
+        return 0.0
+    trading = max(1, int(trading_days))
+    te = float(np.std(arr) * math.sqrt(trading))
+    return float(te if te >= 0.0 else 0.0)
+
+
+def _archive_run_artifacts(out_dir: Path, artifact_dir: Path, run_id: str) -> Path:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    archive_base = artifact_dir / run_id
+    archive_path = shutil.make_archive(str(archive_base), "zip", root_dir=out_dir)
+    return Path(archive_path)
+
+
+def _append_run_tracker(path: Path, record: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "run_id",
+        "timestamp",
+        "git_sha",
+        "out_dir",
+        "manifest",
+        "config",
+        "objective",
+        "artifact",
+        "args_json",
+        *RUN_TRACKER_METRICS,
+    ]
+    row = {key: record.get(key) for key in header}
+    exists = path.exists()
+    with path.open("a", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def _write_run_manifest(
     out_dir: Path,
     args: argparse.Namespace,
@@ -1834,6 +1892,8 @@ def _write_run_manifest(
         "python_version": sys.version,
         "validated": bool(validated),
     }
+    if getattr(args, "run_id", None):
+        manifest["run_id"] = str(args.run_id)
     manifest["deterministic_torch"] = bool(getattr(args, "deterministic", False))
     if config_path is not None:
         manifest["config_path"] = str(config_path)
@@ -4061,9 +4121,7 @@ def backtest(
         if benchmark_series is not None:
             active_block = block_returns - benchmark_series[start:end]
             if active_block.size:
-                block_tracking_error = float(
-                    np.std(active_block) * math.sqrt(trading_days)
-                )
+                block_tracking_error = compute_tracking_error(active_block, trading_days)
                 active_mean = float(active_block.mean() * trading_days)
                 if block_tracking_error <= 1e-12:
                     if abs(active_mean) <= 1e-12:
@@ -4240,7 +4298,7 @@ def backtest(
     info_ratio = None
     if benchmark_returns_arr.size == realized_returns_arr.size and realized_returns_arr.size:
         active = realized_returns_arr - benchmark_returns_arr
-        te = float(np.std(active) * ann_factor)
+        te = compute_tracking_error(active, trading_days)
         tracking_error = te
         active_mean = float(active.mean() * trading_days)
         if te <= 1e-12:
@@ -4944,7 +5002,7 @@ def _compute_scenario_metrics(
         bench = np.asarray(benchmark_returns, dtype=float)
         if bench.size == realized_arr.size and realized_arr.size:
             active = realized_arr - bench
-            te = float(np.std(active) * ann_factor)
+            te = compute_tracking_error(active, trading_days)
             tracking_error = te
             active_mean = float(active.mean() * trading_days)
             if te <= 1e-12:
@@ -5671,6 +5729,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default="bt_out")
     parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Optional run identifier override when tracking runs",
+    )
+    parser.add_argument(
+        "--runs-csv",
+        type=str,
+        default=None,
+        help="Append run metadata to the specified CSV tracker",
+    )
+    parser.add_argument(
+        "--track-artifacts",
+        type=str,
+        default=None,
+        help="Directory to store zipped run artifacts when tracking",
+    )
+    parser.add_argument(
         "--log-json",
         type=str,
         default=None,
@@ -5848,6 +5924,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         parser.set_defaults(**cfg_blob)
 
     parsed = parser.parse_args(args=argv)
+    parsed.run_id = _generate_run_id(getattr(parsed, "run_id", None))
     if not parsed.csv:
         raise ValueError("--csv must be provided via CLI or config")
 
@@ -5977,6 +6054,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
             rebalance_callback=jsonl_writer.write if jsonl_writer else None,
             **base_backtest_kwargs,
         )
+        results["run_id"] = parsed.run_id
     finally:
         if progress_printer is not None:
             progress_printer.close()
@@ -6014,7 +6092,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         baseline_info_ratio: Optional[float] = None
         if isinstance(benchmark_returns, np.ndarray) and benchmark_returns.size == baseline_arr.size:
             active_baseline = baseline_arr - benchmark_returns
-            te = float(np.std(active_baseline) * ann_factor)
+            te = compute_tracking_error(active_baseline, trading_days)
             active_mean = float(active_baseline.mean() * trading_days)
             if te <= 1e-12:
                 if abs(active_mean) <= 1e-12:
@@ -6185,6 +6263,43 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         extras=constraint_manifest,
         validated=cfg_validated,
     )
+
+    tracker_path = getattr(parsed, "runs_csv", None)
+    if tracker_path:
+        tracker_file = Path(tracker_path)
+        artifact_path: Optional[Path] = None
+        artifact_dir = getattr(parsed, "track_artifacts", None)
+        if artifact_dir:
+            try:
+                artifact_path = _archive_run_artifacts(out_dir, Path(artifact_dir), parsed.run_id)
+            except Exception as exc:  # pragma: no cover - artifact packaging best-effort
+                print(f"Failed to archive artifacts: {exc}", file=sys.stderr)
+                artifact_path = None
+        args_json = json.dumps(_serialize_args(parsed), sort_keys=True)
+        tracker_record: Dict[str, Any] = {
+            "run_id": parsed.run_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "git_sha": _resolve_git_sha(),
+            "out_dir": str(out_dir),
+            "manifest": str(out_dir / "run_config.json"),
+            "config": str(config_path) if config_path else "",
+            "objective": str(parsed.objective),
+            "artifact": str(artifact_path) if artifact_path else "",
+            "args_json": args_json,
+        }
+        for key in RUN_TRACKER_METRICS:
+            value = results.get(key)
+            if value is None:
+                tracker_record[key] = None
+            else:
+                try:
+                    tracker_record[key] = float(value)
+                except Exception:
+                    tracker_record[key] = value
+        try:
+            _append_run_tracker(tracker_file, tracker_record)
+        except Exception as exc:  # pragma: no cover - tracker best-effort
+            print(f"Failed to append run tracker: {exc}", file=sys.stderr)
 
     if not parsed.skip_plot:
         try:
