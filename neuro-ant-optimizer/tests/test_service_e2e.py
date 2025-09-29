@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 
 from service.app import create_app
 
+pytestmark = pytest.mark.slow
+
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):

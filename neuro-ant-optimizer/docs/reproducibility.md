@@ -34,5 +34,5 @@ Replay a run with `python -m neuro_ant_optimizer.backtest.reproduce --manifest r
 
 ## Optional test dependencies
 
-- `tests/test_drop_duplicates.py` imports pandas with `pytest.importorskip`, so the whole module is skipped when pandas is unavailable.【F:tests/test_drop_duplicates.py†L3-L58】
-- `tests/test_perf_parallel.py` exercises the multiprocessing backtest path only when pandas is installed; each test explicitly skips with a "pandas is required" message if the dependency is missing.【F:tests/test_perf_parallel.py†L1-L90】
+- `tests/test_drop_duplicates.py` imports pandas with `pytest.importorskip`, so the whole module is skipped when pandas is unavailable.
+- `tests/test_perf_parallel.py` exercises the multiprocessing backtest path only when pandas is installed; each test explicitly skips with a "pandas is required" message if the dependency is missing.

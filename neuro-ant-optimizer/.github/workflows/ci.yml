@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy scipy torch pandas matplotlib pytest
       - name: Run determinism audit
-        run: pytest tests/test_backtest_cli_determinism.py
+        run: pytest -m slow
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -33,6 +33,11 @@ jobs:
       matrix:
         os: ["ubuntu-latest", "macos-latest"]
         python-version: ["3.9", "3.10", "3.11", "3.12"]
+        extras: [""]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+            extras: "backtest"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -51,32 +56,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy scipy torch pytest pytest-cov build
           pip install ruff mypy pre-commit
-          # optional extras for CLI smoke
-          pip install pandas matplotlib
+          if [ "${{ matrix.extras }}" = "backtest" ]; then
+            pip install ".[backtest]"
+          else
+            pip install pandas matplotlib
+          fi
       - name: Pre-commit
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         run: pre-commit run --all-files --show-diff-on-failure
       - name: Run tests
         run: |
           if [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.python-version }}" = "3.11" ]; then
-            pytest --cov=neuro_ant_optimizer --cov-report=xml --cov-report=html --cov-fail-under=85
+            pytest --cov=neuro_ant_optimizer --cov-report=xml --cov-report=html --cov-fail-under=85 -m "not slow"
           else
-            pytest -q
+            pytest -q -m "not slow"
           fi
       - name: Upload coverage HTML
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && matrix.extras == ''
         uses: actions/upload-artifact@v4
         with:
           name: coverage-html-${{ matrix.python-version }}-${{ matrix.os }}
           path: htmlcov
       - name: mypy (types)
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && matrix.extras == ''
         env:
           MYPYPATH: neuro-ant-optimizer/src
         run: |
           mypy neuro-ant-optimizer/src
       - name: CLI smoke (backtest)
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && matrix.extras == ''
         run: |
           neuro-ant-optimizer/src/neuro_ant_optimizer/backtest/backtest.py >/dev/null 2>&1 || true
           python -c "import sys,subprocess; subprocess.check_call(['neuro-ant-backtest','--csv','neuro-ant-optimizer/backtest/sample_returns.csv','--lookback','5','--step','2','--ewma_span','3','--objective','sharpe','--out','neuro-ant-optimizer/backtest/out_ci'])"

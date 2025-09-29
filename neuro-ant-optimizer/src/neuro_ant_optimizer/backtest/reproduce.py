@@ -6,9 +6,24 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import List, Mapping, MutableMapping, Sequence
+from typing import Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .backtest import build_parser, main as backtest_main
+
+
+_PATH_KEYS: Tuple[str, ...] = (
+    "csv",
+    "benchmark_csv",
+    "active_group_caps",
+    "factor_bounds",
+    "limit_file",
+    "gamma_by_sector",
+    "warm_start",
+    "factors",
+    "factor_targets",
+    "scenarios",
+    "column_map",
+)
 
 
 def _ensure_mapping(data: Mapping[str, object]) -> MutableMapping[str, object]:
@@ -89,6 +104,26 @@ def _build_cli_from_manifest(
     return cli
 
 
+def _check_manifest_inputs(
+    manifest_args: Mapping[str, object],
+    manifest_path: Path,
+) -> Iterable[Tuple[str, Path]]:
+    base_dir = manifest_path.parent
+    for key in _PATH_KEYS:
+        value = manifest_args.get(key)
+        if not value:
+            continue
+        candidate = Path(str(value))
+        candidates = [candidate]
+        if not candidate.is_absolute():
+            candidates = [
+                (base_dir / candidate).resolve(),
+                candidate.resolve(),
+            ]
+        if not any(path.exists() for path in candidates):
+            yield key, candidates[0]
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Replay a backtest run from its manifest")
     parser.add_argument("--manifest", type=Path, help="Path to run_config.json")
@@ -114,6 +149,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     manifest_args = manifest["args"]  # type: ignore[index]
     assert isinstance(manifest_args, Mapping)
+
+    missing_inputs = list(_check_manifest_inputs(manifest_args, manifest_path))
+    if missing_inputs:
+        missing_blob = ", ".join(f"{key}={path}" for key, path in missing_inputs)
+        raise SystemExit(f"Manifest references missing inputs: {missing_blob}")
 
     backtest_parser = build_parser()
     cli_args = _build_cli_from_manifest(backtest_parser, manifest_args, parsed.out)

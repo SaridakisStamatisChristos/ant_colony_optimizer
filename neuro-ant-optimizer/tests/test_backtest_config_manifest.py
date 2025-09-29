@@ -25,7 +25,9 @@ class _StubOptimizer:
         return _Result(self.weight)
 
 
-def test_config_overrides_and_manifest(tmp_path: Path, monkeypatch) -> None:
+def test_config_overrides_and_manifest(
+    tmp_path: Path, monkeypatch, assert_backtest_artifacts
+) -> None:
     returns_path = tmp_path / "returns.csv"
     returns_path.write_text(
         "date,A,B\n"
@@ -77,3 +79,5 @@ def test_config_overrides_and_manifest(tmp_path: Path, monkeypatch) -> None:
     assert manifest["warm_start"] is None
     assert manifest["warm_align"] == "last_row"
     assert manifest["warm_applied_count"] == 0
+
+    assert_backtest_artifacts(out_dir)

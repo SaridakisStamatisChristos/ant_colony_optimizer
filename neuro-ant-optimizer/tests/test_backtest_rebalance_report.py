@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 bt = import_module("neuro_ant_optimizer.backtest.backtest")
+from tests.conftest import _EXPECTED_REBALANCE_HEADER
 
 
 class _Frame:
@@ -162,44 +163,7 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     report_path = tmp_path / "rebalance_report.csv"
     bt._write_rebalance_report(report_path, results)
     text = report_path.read_text().splitlines()
-    expected_header = ",".join(
-        [
-            "date",
-            "gross_ret",
-            "net_tx_ret",
-            "net_slip_ret",
-            "turnover",
-            "turnover_pre_decay",
-            "turnover_post_decay",
-            "tx_cost",
-            "slippage_cost",
-            "nt_band_hits",
-            "participation_breaches",
-            "sector_breaches",
-            "sector_penalty",
-            "active_breaches",
-            "group_breaches",
-            "factor_bound_breaches",
-            "factor_inf_norm",
-            "factor_missing",
-            "first_violation",
-            "feasible",
-            "projection_iterations",
-            "block_sharpe",
-            "block_sortino",
-            "block_info_ratio",
-            "block_tracking_error",
-            "pre_trade_ok",
-            "pre_trade_breach_count",
-            "post_trade_breach_count",
-            "breach_count",
-            "first_breach",
-            "pre_trade_reasons",
-            "post_trade_reasons",
-            "warm_applied",
-            "decay",
-        ]
-    )
+    expected_header = ",".join(_EXPECTED_REBALANCE_HEADER)
     assert text[0] == expected_header
 
 

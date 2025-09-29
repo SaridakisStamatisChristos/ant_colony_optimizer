@@ -6,7 +6,11 @@ from pathlib import Path
 import json
 from importlib import import_module
 
+import pytest
+
 bt = import_module("neuro_ant_optimizer.backtest.backtest")
+
+pytestmark = pytest.mark.slow
 
 
 def _write_returns(path: Path) -> None:

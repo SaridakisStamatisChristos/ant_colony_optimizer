@@ -5938,7 +5938,13 @@ def _extract_asset_names(frame: Any, n_assets: int) -> List[str]:
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for the backtest CLI."""
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        epilog=(
+            "If no rebalance windows remain after lookback/step alignment, the CLI "
+            "writes header-only reports and a 'no_rebalances' warning—adjust your "
+            "window length or input coverage to generate trades."
+        )
+    )
     parser.add_argument(
         "--config",
         type=str,
@@ -6018,8 +6024,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="sample",
         help=(
-            "Covariance backend (sample|ewma|lw|oas|ridge|glasso|bayesian"
-            " or custom:<module>:<callable>; optional :param=value suffixes allowed)"
+            "Covariance estimator (sample|ewma|lw|oas|ridge|glasso|bayesian "
+            "or custom:module:callable[:param=value])"
         ),
     )
     parser.add_argument(
@@ -6145,13 +6151,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--out-format",
         choices=["csv", "parquet"],
         default="csv",
-        help="Emit parquet artifacts alongside CSV outputs",
+        help="Artifact format to write (csv or parquet)",
     )
     parser.add_argument(
         "--rf-bps",
         type=float,
         default=0.0,
-        help="Annualized risk-free rate in basis points (default: 0)",
+        help="Annualised risk-free rate in basis points",
     )
     parser.add_argument(
         "--trading-days",
@@ -6260,7 +6266,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--factor-align",
         choices=["strict", "subset"],
         default="strict",
-        help="How to align factor panel dates with returns",
+        help="Align factor panel dates strictly or allow subset overlap",
     )
     parser.add_argument(
         "--factors-required",
