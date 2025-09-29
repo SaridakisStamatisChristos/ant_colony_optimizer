@@ -1,68 +1,99 @@
 # Configuration reference
 
-The CLI and YAML/JSON configs expose the same knobs. The table below lists every flag available on `neuro-ant-backtest`. Boolean flags default to `False` unless noted.
+`neuro-ant-backtest` accepts the same options via CLI flags or YAML/JSON files (replace
+CLI dashes with underscores in config files). The tables below group the most frequently
+used parameters by category. Refer to `neuro-ant-backtest --help` for an exhaustive list
+including esoteric research toggles.
+
+## Data ingestion
 
 | Flag(s) | Default | Description |
 | --- | --- | --- |
-| `--config` | `None` | Load run parameters from a YAML/JSON file. Values override CLI defaults. |
-| `--csv` | `None` | CSV of asset returns (date index in the first column). |
-| `--benchmark-csv` | `None` | Optional CSV of benchmark returns (single column). Must share the returns index. |
-| `--baseline` | `None` | Add an equity baseline (`equal` or `cap`). Writes baseline metrics alongside the strategy. |
-| `--cap-weights` | `None` | Cap-weight CSV required when `--baseline=cap`. |
-| `--active-min` / `--active-max` | `None` | Per-asset active bounds relative to the benchmark weights. |
-| `--active-group-caps` | `None` | YAML/JSON file describing sector/group active bounds. |
-| `--factor-bounds` | `None` | YAML/JSON file defining factor exposure bounds. |
-| `--lookback` | `252` | Rolling window size in periods. |
-| `--step` | `21` | Step size between rebalances (in periods). |
-| `--ewma_span` | `60` | EWMA span (used only when `--cov-model=ewma`). |
-| `--cov-model` | `sample` | Covariance backend (`sample`, `ewma`, `lw`, `oas`, or `custom:module:callable`). |
-| `--objective` | `sharpe` | Optimization objective (`sharpe`, `max_return`, `min_variance`, `risk_parity`, `min_cvar`, `tracking_error`, `info_ratio`, `te_target`, `multi_term`, or `custom:module:callable`). |
-| `--te-target` | `0.0` | Target tracking-error level for the `te_target` objective. |
-| `--lambda-te` | `0.0` | Tracking-error penalty weight for `multi_term`. |
-| `--gamma-turnover` | `0.0` | Turnover penalty weight for `multi_term`. |
-| `--float32` | `False` | Downcast all NumPy calculations to `float32`. |
-| `--deterministic` | `False` | Force `torch.use_deterministic_algorithms(True)` (raises if unavailable). Also recorded in the manifest. |
-| `--cache-cov` | `8` | Max number of covariance matrices cached per run (0 disables caching). |
-| `--max-workers` | `None` | Maximum threads/processes for async objective evaluation (backend-specific). |
-| `--warm-start` | `None` | Path to `weights.csv` from a prior run for warm starts. |
-| `--warm-align` | `last_row` | Align warm-start weights to the first rebalance (`by_date`) or use the last row. |
-| `--decay` | `0.0` | Blend between prior allocations and the optimizer proposal (0 disables). |
-| `--seed` | `7` | Global RNG seed (NumPy + Torch). |
-| `--out` | `bt_out` | Output directory for artifacts. |
-| `--log-json` | `None` | Append JSON records per rebalance (one line per window). |
-| `--progress` | `False` | Stream textual progress updates to stderr. |
-| `--out-format` | `csv` | Artifact format (`csv` or `parquet`). Parquet files mirror the CSV outputs. |
-| `--rf-bps` | `0.0` | Annualized risk-free rate in basis points used for Sharpe/Sortino reporting. |
-| `--trading-days` | `252` | Periods per year for annualization. |
-| `--save-weights` | `False` | Write `weights.csv` with per-rebalance allocations. |
-| `--skip-plot` | `False` | Skip generating the equity chart (useful for headless environments). |
-| `--dry-run` | `False` | Validate configuration and write `run_config.json` without running the optimizer. |
-| `--drop-duplicates` | `False` | Drop duplicate dates (keeping the last) from returns/benchmark inputs instead of erroring. |
-| `--tx-cost-bps` | `0.0` | Transaction cost in basis points applied per rebalance. |
+| `--csv` | `None` | CSV/Parquet of asset returns. First column must be a timestamp. |
+| `--benchmark-csv` | `None` | Optional benchmark series aligned to the returns index. |
+| `--io-backend` | `auto` | Dataframe engine (`auto`, `pandas`, `polars`, or the built-in minimal reader). |
+| `--data-freq` | `B` | Expected calendar (`B`, `D`, `W`, `M`, etc.) enforced during ingestion. |
+| `--data-tz` | `UTC` | Timezone applied before PIT validation and calendar alignment. |
+| `--dropna` | `none` | Row-drop policy (`none`, `any`, `all`) before calendar checks. |
+| `--columns` | `None` | Optional asset filters. Accepts `SRC` or `SRC:ALIAS` tokens. |
+| `--column-map` | `None` | YAML/JSON mapping applied to column names prior to alignment. |
+| `--no-pit` | `False` | Disable the future-date guard (enabled by default). |
+| `--factors` | `None` | Factor loadings panel (CSV, Parquet, or YAML bundle). |
+| `--factor-align` | `strict` | Alignment policy for factor timestamps (`strict`/`subset`). |
+| `--factors-required` | `False` | Fail when any window lacks factor data (even in `subset` mode). |
+| `--factor-targets` | `None` | Optional factor target vector to enforce neutrality. |
+| `--factor-tolerance` | `1e-6` | Infinity-norm tolerance for factor neutrality residuals. |
+
+## Baselines, penalties, and overlays
+
+| Flag(s) | Default | Description |
+| --- | --- | --- |
+| `--baseline` | `none` | Convex overlay to report alongside the strategy (`minvar`, `maxret`, `riskparity`). |
+| `--lambda-tc` | `0.0` | Turnover penalty applied to baseline weights (higher shrinks turnover). |
+| `--tx-cost-bps` | `0.0` | Transaction cost per rebalance, in basis points. |
 | `--tx-cost-mode` | `posthoc` | When to apply transaction costs (`none`, `upfront`, `amortized`, `posthoc`). |
-| `--metric-alpha` | `0.05` | Tail probability used when reporting realized CVaR. |
-| `--factors` | `None` | Path to factor loadings (CSV, Parquet, or YAML). |
-| `--factor-tolerance` | `1e-6` | Infinity-norm tolerance for factor neutrality. |
-| `--factor-targets` | `None` | CSV/Parquet/YAML vector of factor targets. |
-| `--factor-align` | `strict` | Factor alignment policy (`strict` requires full coverage, `subset` allows gaps). |
-| `--factors-required` | `False` | Fail if any rebalance window lacks factor data (even in `subset` mode). |
-| `--slippage` | `None` | Slippage model spec (e.g. `impact:k=25,alpha=1.5,spread=2bps`). |
-| `--nt-band` | `0` | No-trade band around the previous weights (accepts decimals, `%`, or `bps`). |
-| `--refine-every` | `1` | Run SLSQP refinement every *k* rebalances. |
+| `--nt-band` | `0` | No-trade band width around previous weights (accepts raw, `%`, or `bps`). |
+| `--slippage` | `None` | Slippage model spec (e.g. `proportional:5`, `impact:k=25,alpha=1.5`). |
+| `--active-min` / `--active-max` | `None` | Scalar active bounds relative to the benchmark. |
+| `--active-group-caps` | `None` | YAML/JSON structure defining sector or group active caps. |
+| `--factor-bounds` | `None` | YAML/JSON file containing factor exposure bounds. |
+| `--benchmark-weights` | `None` | Reference weights when evaluating active constraints. |
+| `--te-target` | `0.0` | Tracking-error target for the `te_target` objective. |
+| `--lambda-te` | `0.0` | Tracking-error penalty weight in multi-term objectives. |
+| `--gamma-turnover` | `0.0` | Turnover penalty applied inside the optimizer objective. |
+
+## Optimizer controls
+
+| Flag(s) | Default | Description |
+| --- | --- | --- |
+| `--lookback` | `252` | Rolling window size in periods. |
+| `--step` | `21` | Step size between rebalances. |
+| `--cov-model` | `sample` | Covariance backend (`sample`, `ewma`, `oas`, `lw`, `ridge`, etc.). |
+| `--ewma-span` | `60` | Span used when `--cov-model=ewma`. |
+| `--objective` | `sharpe` | Objective (`sharpe`, `max_return`, `min_variance`, `risk_parity`, `min_cvar`, ...). |
+| `--refine-every` | `1` | Apply SLSQP refinement every *k* rebalances. |
+| `--seed` | `7` | Global RNG seed (NumPy + Torch). |
+| `--deterministic` | `False` | Enable deterministic Torch kernels (raises when unsupported). |
+| `--float32` | `False` | Downcast NumPy operations to `float32`. |
+| `--warm-start` | `None` | Path to `weights.csv` from a prior run. |
+| `--warm-align` | `last_row` | Align warm-start weights by date or use the last row. |
+| `--decay` | `0.0` | Blend between previous and proposed weights (0 disables). |
+| `--rf-bps` | `0.0` | Annual risk-free rate (basis points) used for reporting. |
+| `--trading-days` | `252` | Trading periods per year for annualisation. |
+| `--metric-alpha` | `0.05` | Tail probability used for realized CVaR reporting. |
+
+## Performance & outputs
+
+| Flag(s) | Default | Description |
+| --- | --- | --- |
+| `--workers` | `None` | Number of processes for parallel window evaluation (`None` auto-detects). |
+| `--prefetch` | `2` | Number of rebalance windows queued for multiprocessing. |
+| `--cache-cov` | `8` | Covariance cache size (set to 0 to disable). |
+| `--progress` | `False` | Stream progress updates to stderr. |
+| `--out` | `bt_out` | Directory for run artifacts. |
+| `--out-format` | `csv` | Artifact format (`csv` or `parquet`). |
+| `--save-weights` | `False` | Write `weights.csv` with per-window allocations. |
+| `--skip-plot` | `False` | Skip equity plot generation. |
+| `--dry-run` | `False` | Validate configuration without running the optimizer. |
+| `--log-json` | `None` | Append JSON lines per rebalance. |
+| `--runs-csv` | `None` | Append summary stats to a tracking ledger. |
+| `--track-artifacts` | `None` | Directory where zipped artifacts are archived per run. |
 
 ## Configuration files
 
-YAML/JSON configs use the same keys as the CLI flags (replace dashes with underscores). A minimal template looks like:
+Embed any flag inside a YAML/JSON config by replacing dashes with underscores:
 
 ```yaml
-csv: data/returns.csv
-out: runs/minimal
-lookback: 252
-step: 21
-cov_model: lw
-objective: sharpe
-save_weights: true
-skip_plot: true
+csv: data/returns_daily.csv
+cov_model: ewma
+ewma_span: 63
+baseline: minvar
+lambda_tc: 1.5
+workers: 4
+prefetch: 4
+io_backend: polars
+out: runs/daily_ewma
 ```
 
-You can override any CLI option inside the config file. Command-line flags still win if both are provided. See the bundled templates in `examples/configs/` (also exposed via `neuro_ant_optimizer.examples.iter_configs`) for end-to-end setups covering active constraints, factor bounds, and transaction-cost scenarios.
+The packaged templates in `neuro_ant_optimizer.examples.iter_configs()` cover daily
+and weekly workflows, factor-aware runs, and Polars-enabled fast paths.

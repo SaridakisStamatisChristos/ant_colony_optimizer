@@ -14,7 +14,8 @@ import subprocess
 import sys
 import time
 import uuid
-from collections import Counter, OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from typing import (
     List,
     Literal,
     Mapping,
+    Deque,
     MutableMapping,
     Optional,
     Sequence,
@@ -42,12 +44,19 @@ from scipy.spatial.distance import squareform
 
 from neuro_ant_optimizer import __version__
 from neuro_ant_optimizer.constraints import PortfolioConstraints
+from neuro_ant_optimizer.data import (
+    CalendarAlignmentError,
+    LoaderError,
+    PITViolationError,
+    load_returns,
+)
 from neuro_ant_optimizer.optimizer import (
     BenchmarkStats,
     NeuroAntPortfolioOptimizer,
     OptimizationObjective,
     OptimizerConfig,
 )
+from neuro_ant_optimizer.portfolio.baselines import compute_baseline
 from neuro_ant_optimizer.utils import nearest_psd, set_seed, shrink_covariance
 
 try:  # pragma: no cover - optional dependency
@@ -546,6 +555,25 @@ def _hash_returns_window(window: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _covariance_worker(
+    payload: Tuple[
+        np.ndarray,
+        Callable[[np.ndarray], np.ndarray],
+        Mapping[str, Any],
+        bool,
+        float,
+    ],
+) -> Tuple[np.ndarray, float]:
+    train, cov_callable, cov_kwargs, use_shrinkage, shrinkage_delta = payload
+    start = time.perf_counter()
+    cov_raw = np.asarray(cov_callable(train, **cov_kwargs), dtype=float)
+    if use_shrinkage:
+        cov_raw = shrink_covariance(cov_raw, delta=shrinkage_delta)
+    cov = nearest_psd(cov_raw)
+    elapsed = (time.perf_counter() - start) * 1000.0
+    return cov, float(elapsed)
+
+
 @dataclass
 class FactorDiagnostics:
     align_mode: str
@@ -813,8 +841,7 @@ if _PYDANTIC_AVAILABLE:
 
         csv: str
         benchmark_csv: Optional[str] = None
-        baseline: Optional[Literal["equal", "cap"]] = None
-        cap_weights: Optional[str] = None
+        baseline: Optional[Literal["none", "minvar", "maxret", "riskparity"]] = "none"
         out: str = "bt_out"
         lookback: int = Field(ge=1, default=252)
         step: int = Field(ge=1, default=21)
@@ -826,6 +853,13 @@ if _PYDANTIC_AVAILABLE:
         tx_cost_mode: Literal["none", "upfront", "amortized", "posthoc"] = "posthoc"
         rf_bps: float = 0.0
         trading_days: int = Field(ge=1, default=252)
+        data_freq: str = "B"
+        data_tz: str = "UTC"
+        pit: bool = True
+        dropna: Literal["none", "any", "all"] = "none"
+        columns: Optional[Sequence[str]] = None
+        rename: Optional[Mapping[str, str]] = None
+        io_backend: Literal["auto", "pandas", "polars"] = "auto"
         factors: Optional[str] = None
         factor_align: Literal["strict", "subset"] = "strict"
         factors_required: bool = False
@@ -838,6 +872,7 @@ if _PYDANTIC_AVAILABLE:
         factor_bounds: Optional[Any] = None
         te_target: float = Field(ge=0.0, default=0.0)
         lambda_te: float = Field(ge=0.0, default=0.0)
+        lambda_tc: float = Field(ge=0.0, default=0.0)
         gamma_turnover: float = Field(ge=0.0, default=0.0)
         gamma_by_sector: Optional[Any] = None
         refine_every: int = Field(ge=1, default=1)
@@ -849,7 +884,8 @@ if _PYDANTIC_AVAILABLE:
         drop_duplicates: bool = False
         float32: bool = False
         cache_cov: int = Field(ge=0, default=8)
-        max_workers: Optional[int] = Field(default=None, ge=1)
+        workers: Optional[int] = Field(default=None, ge=1)
+        prefetch: int = Field(ge=1, default=2)
         log_json: Optional[str] = None
         progress: bool = False
         slippage: Optional[str] = None
@@ -888,8 +924,7 @@ else:
         _defaults: Dict[str, Any] = {
             "csv": None,
             "benchmark_csv": None,
-            "baseline": None,
-            "cap_weights": None,
+            "baseline": "none",
             "out": "bt_out",
             "lookback": 252,
             "step": 21,
@@ -901,6 +936,13 @@ else:
             "tx_cost_mode": "posthoc",
             "rf_bps": 0.0,
             "trading_days": 252,
+            "data_freq": "B",
+            "data_tz": "UTC",
+            "pit": True,
+            "dropna": "none",
+            "columns": None,
+            "rename": None,
+            "io_backend": "auto",
             "factors": None,
             "factor_align": "strict",
             "factors_required": False,
@@ -913,6 +955,7 @@ else:
             "factor_bounds": None,
             "te_target": 0.0,
             "lambda_te": 0.0,
+            "lambda_tc": 0.0,
             "gamma_turnover": 0.0,
             "gamma_by_sector": None,
             "refine_every": 1,
@@ -924,7 +967,8 @@ else:
             "drop_duplicates": False,
             "float32": False,
             "cache_cov": 8,
-            "max_workers": None,
+            "workers": None,
+            "prefetch": 2,
             "log_json": None,
             "progress": False,
             "slippage": None,
@@ -943,7 +987,7 @@ else:
         _tx_cost_modes = {"none", "upfront", "amortized", "posthoc"}
         _warm_align = {"by_date", "last_row"}
         _factor_align = {"strict", "subset"}
-        _baseline_modes = {"equal", "cap"}
+        _baseline_modes = {"none", "minvar", "maxret", "riskparity"}
         _out_formats = {"csv", "parquet"}
         _bootstrap_methods = {"stationary", "circular"}
 
@@ -1022,7 +1066,6 @@ else:
 
             optional_str_fields = [
                 "benchmark_csv",
-                "cap_weights",
                 "out",
                 "factors",
                 "factor_targets",
@@ -1030,6 +1073,9 @@ else:
                 "slippage",
                 "warm_start",
                 "cv",
+                "data_freq",
+                "data_tz",
+                "io_backend",
             ]
             for field in optional_str_fields:
                 if field in raw:
@@ -1042,11 +1088,16 @@ else:
             if "baseline" in raw:
                 value = raw["baseline"]
                 if value is None:
-                    data["baseline"] = None
+                    data["baseline"] = "none"
                 else:
-                    choice = str(value).strip()
+                    choice = str(value).strip().lower()
                     if choice not in cls._baseline_modes:
-                        errors.append({"loc": ("baseline",), "msg": "Input should be 'equal' or 'cap'"})
+                        errors.append(
+                            {
+                                "loc": ("baseline",),
+                                "msg": "Input should be one of none|minvar|maxret|riskparity",
+                            }
+                        )
                     else:
                         data["baseline"] = choice
 
@@ -1110,6 +1161,7 @@ else:
                 "rf_bps": (None, None),
                 "te_target": (0.0, None),
                 "lambda_te": (0.0, None),
+                "lambda_tc": (0.0, None),
                 "gamma_turnover": (0.0, None),
                 "metric_alpha": (0.0, 1.0),
                 "factor_tolerance": (0.0, None),
@@ -1132,10 +1184,50 @@ else:
                 if result is not None:
                     data["cache_cov"] = result
 
-            if "max_workers" in raw and raw["max_workers"] is not None:
+            if "workers" in raw and raw["workers"] is not None:
+                result = cls._int(raw["workers"], "workers", errors, ge=1)
+                if result is not None:
+                    data["workers"] = result
+            elif "max_workers" in raw and raw["max_workers"] is not None:
                 result = cls._int(raw["max_workers"], "max_workers", errors, ge=1)
                 if result is not None:
-                    data["max_workers"] = result
+                    data["workers"] = result
+
+            if "prefetch" in raw:
+                result = cls._int(raw["prefetch"], "prefetch", errors, ge=1)
+                if result is not None:
+                    data["prefetch"] = result
+
+            if "dropna" in raw and raw["dropna"] is not None:
+                choice = str(raw["dropna"]).strip().lower()
+                if choice not in {"none", "any", "all"}:
+                    errors.append({"loc": ("dropna",), "msg": "Input should be one of none|any|all"})
+                else:
+                    data["dropna"] = choice
+
+            if "columns" in raw:
+                value = raw["columns"]
+                if value is None:
+                    data["columns"] = None
+                elif isinstance(value, str):
+                    split = [item.strip() for item in value.split(",") if item.strip()]
+                    data["columns"] = split or None
+                elif isinstance(value, (list, tuple)):
+                    data["columns"] = [str(item).strip() for item in value]
+
+            if "rename" in raw and raw["rename"] is not None:
+                mapping = raw["rename"]
+                if isinstance(mapping, dict):
+                    data["rename"] = {str(k): str(v) for k, v in mapping.items()}
+                else:
+                    errors.append({"loc": ("rename",), "msg": "rename must be a mapping"})
+
+            if "io_backend" in raw and raw["io_backend"] is not None:
+                backend = str(raw["io_backend"]).strip().lower()
+                if backend not in {"auto", "pandas", "polars"}:
+                    errors.append({"loc": ("io_backend",), "msg": "Input should be one of auto|pandas|polars"})
+                else:
+                    data["io_backend"] = backend
 
             bool_fields = [
                 "factors_required",
@@ -1144,6 +1236,9 @@ else:
                 "dry_run",
                 "float32",
                 "progress",
+                "deterministic",
+                "drop_duplicates",
+                "pit",
             ]
             for field in bool_fields:
                 if field in raw:
@@ -3400,9 +3495,14 @@ def backtest(
     float_dtype = np.dtype(dtype)
     if float_dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
         float_dtype = np.dtype(np.float64)
-    max_workers_value = None if max_workers is None else int(max_workers)
-    if max_workers_value is not None and max_workers_value <= 0:
-        raise ValueError("max_workers must be positive when provided")
+    workers_value: Optional[int] = None
+    if workers is not None:
+        workers_value = int(workers)
+    elif max_workers is not None:
+        workers_value = int(max_workers)
+    if workers_value is not None and workers_value <= 0:
+        raise ValueError("workers must be positive when provided")
+    prefetch_chunks = max(1, int(prefetch))
 
     df, returns_arr, dates = _sanitize_frame(
         df, drop_duplicates=drop_duplicates, label="returns"
@@ -3554,8 +3654,8 @@ def backtest(
     constraint_manifest["factor_bounds"] = factor_bounds_manifest
 
     optimizer = _build_optimizer(returns.shape[1], seed, risk_free_rate=periodic_rf)
-    if max_workers_value is not None:
-        setattr(optimizer.cfg, "max_workers", max_workers_value)
+    if workers_value is not None:
+        setattr(optimizer.cfg, "max_workers", workers_value)
     if te_target < 0.0:
         raise ValueError("te_target must be non-negative")
     if lambda_te < 0.0:
@@ -3726,7 +3826,7 @@ def backtest(
             "cov_cache_hits": 0,
             "cov_cache_misses": 0,
             "cov_cache_evictions": 0,
-            "max_workers": max_workers_value,
+            "workers": workers_value,
             "dtype": float_dtype.name,
             "decay": decay_value,
             "warm_start": str(warm_path_obj) if warm_path_obj is not None else None,
@@ -3741,65 +3841,153 @@ def backtest(
     cov_cache_evictions = 0
     block_contributions: List[Dict[str, Any]] = []
 
+    def _window_iterator() -> Iterable[Dict[str, Any]]:
+        nonlocal cov_cache_hits, cov_cache_misses, cov_cache_evictions
+        pending: Deque[Dict[str, Any]] = deque()
+        next_idx = 0
+        executor: Optional[ProcessPoolExecutor] = None
+        if workers_value is not None and workers_value > 1:
+            executor = ProcessPoolExecutor(max_workers=workers_value)
+
+        def submit(index: int) -> None:
+            start_idx = rebalance_points[index]
+            end_idx = min(start_idx + step, n_periods)
+            train_window = returns[start_idx - lookback : start_idx]
+            test_window = returns[start_idx:end_idx]
+            walk_windows.append((int(start_idx), int(end_idx)))
+            mu_vec = train_window.mean(axis=0)
+            bench_stats_local: Optional[BenchmarkStats] = None
+            if benchmark_series is not None:
+                bench_train = benchmark_series[start_idx - lookback : start_idx]
+                if bench_train.shape[0] != train_window.shape[0]:
+                    raise ValueError("Benchmark lookback does not match returns lookback")
+                bench_mean = float(bench_train.mean())
+                centered_b = bench_train - bench_mean
+                centered_assets = train_window - mu_vec
+                denom = max(1, centered_b.shape[0] - 1)
+                cov_vector = centered_assets.T @ centered_b / denom
+                variance = float(np.dot(centered_b, centered_b) / denom)
+                bench_stats_local = BenchmarkStats(
+                    mean=bench_mean,
+                    variance=max(variance, 0.0),
+                    cov_vector=cov_vector,
+                )
+            span_val = ewma_span if cov_model_lower == "ewma" and ewma_span is not None else None
+            window_hash = _hash_returns_window(train_window)
+            cov_key_local: Optional[Tuple[Any, ...]] = (
+                cov_cache_base,
+                cov_param_items,
+                span_val,
+                window_hash,
+            )
+            cov_matrix: Optional[np.ndarray] = None
+            elapsed_ms = 0.0
+            future: Optional[Any] = None
+            cov_kwargs: Dict[str, Any] = dict(cov_params)
+            if span_val is not None:
+                cov_kwargs["span"] = span_val
+            if cov_key_local is not None and max_cov_cache > 0:
+                cached_cov = cov_cache.get(cov_key_local)
+                if cached_cov is not None:
+                    cov_matrix = cached_cov.copy()
+                    cov_cache_hits += 1
+            if cov_matrix is None:
+                if executor is not None:
+                    future = executor.submit(
+                        _covariance_worker,
+                        (
+                            train_window,
+                            cov_callable,
+                            cov_kwargs,
+                            optimizer.cfg.use_shrinkage,
+                            optimizer.cfg.shrinkage_delta,
+                        ),
+                    )
+                else:
+                    cov_matrix, elapsed_ms = _covariance_worker(
+                        (
+                            train_window,
+                            cov_callable,
+                            cov_kwargs,
+                            optimizer.cfg.use_shrinkage,
+                            optimizer.cfg.shrinkage_delta,
+                        )
+                    )
+                    cov_cache_misses += 1
+                    if cov_key_local is not None and max_cov_cache > 0:
+                        cov_cache[cov_key_local] = cov_matrix.copy()
+                        while len(cov_cache) > max_cov_cache:
+                            cov_cache.popitem(last=False)
+                            cov_cache_evictions += 1
+            pending.append(
+                {
+                    "window_idx": index,
+                    "start": start_idx,
+                    "end": end_idx,
+                    "mu": mu_vec,
+                    "test": test_window,
+                    "bench_stats": bench_stats_local,
+                    "cov": cov_matrix,
+                    "cov_key": cov_key_local,
+                    "cov_elapsed_ms": elapsed_ms,
+                    "future": future,
+                    "cov_kwargs": cov_kwargs if future is not None else None,
+                }
+            )
+
+        try:
+            while next_idx < n_windows or pending:
+                while next_idx < n_windows and len(pending) < prefetch_chunks:
+                    submit(next_idx)
+                    next_idx += 1
+                if not pending:
+                    break
+                spec = pending.popleft()
+                future = spec.pop("future", None)
+                if future is not None:
+                    try:
+                        cov_val, elapsed_ms = future.result()
+                    except Exception:
+                        cov_kwargs_local = spec.get("cov_kwargs") or {}
+                        payload = (
+                            returns[spec["start"] - lookback : spec["start"]],
+                            cov_callable,
+                            cov_kwargs_local,
+                            optimizer.cfg.use_shrinkage,
+                            optimizer.cfg.shrinkage_delta,
+                        )
+                        cov_val, elapsed_ms = _covariance_worker(payload)
+                        if executor is not None:
+                            executor.shutdown(cancel_futures=True)
+                            executor = None
+                    cov_cache_misses += 1
+                    cov_key_local = spec["cov_key"]
+                    if cov_key_local is not None and max_cov_cache > 0:
+                        cov_cache[cov_key_local] = cov_val.copy()
+                        while len(cov_cache) > max_cov_cache:
+                            cov_cache.popitem(last=False)
+                            cov_cache_evictions += 1
+                    spec["cov"] = cov_val
+                    spec["cov_elapsed_ms"] = elapsed_ms
+                yield spec
+        finally:
+            if executor is not None:
+                executor.shutdown()
+
     if progress_callback is not None:
         progress_callback(0, n_windows)
 
-    for window_idx, start in enumerate(rebalance_points):
-        end = min(start + step, n_periods)
-        train = returns[start - lookback : start]
-        test = returns[start:end]
-        walk_windows.append((int(start), int(end)))
-        mu = train.mean(axis=0)
-        bench_stats: Optional[BenchmarkStats] = None
-        if benchmark_series is not None:
-            bench_train = benchmark_series[start - lookback : start]
-            if bench_train.shape[0] != train.shape[0]:
-                raise ValueError("Benchmark lookback does not match returns lookback")
-            bench_mean = float(bench_train.mean())
-            centered_b = bench_train - bench_mean
-            centered_assets = train - mu
-            denom = max(1, centered_b.shape[0] - 1)
-            cov_vector = centered_assets.T @ centered_b / denom
-            variance = float(np.dot(centered_b, centered_b) / denom)
-            bench_stats = BenchmarkStats(
-                mean=bench_mean,
-                variance=max(variance, 0.0),
-                cov_vector=cov_vector,
-            )
-        span = ewma_span if cov_model_lower == "ewma" and ewma_span is not None else None
-        window_hash = _hash_returns_window(train)
-        cov_key: Optional[Tuple[Any, ...]] = (
-            cov_cache_base,
-            cov_param_items,
-            span,
-            window_hash,
-        )
-        cov_elapsed_ms = 0.0
-        cov: Optional[np.ndarray] = None
-        cached_cov = (
-            cov_cache.get(cov_key) if (cov_key is not None and max_cov_cache > 0) else None
-        )
-        if cached_cov is not None:
-            cov_start = time.perf_counter()
-            cov = cached_cov.copy()
-            cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
-            cov_cache_hits += 1
+    for spec in _window_iterator():
+        window_idx = spec["window_idx"]
+        start = spec["start"]
+        end = spec["end"]
+        mu = spec["mu"]
+        test = spec["test"]
+        bench_stats = spec["bench_stats"]
+        cov = spec["cov"]
+        cov_elapsed_ms = float(spec.get("cov_elapsed_ms", 0.0))
         if cov is None:
-            cov_start = time.perf_counter()
-            cov_kwargs: Dict[str, Any] = dict(cov_params)
-            if span is not None:
-                cov_kwargs["span"] = span
-            cov_raw = np.asarray(cov_callable(train, **cov_kwargs), dtype=float)
-            if optimizer.cfg.use_shrinkage:
-                cov_raw = shrink_covariance(cov_raw, delta=optimizer.cfg.shrinkage_delta)
-            cov = nearest_psd(cov_raw)
-            cov_elapsed_ms = (time.perf_counter() - cov_start) * 1000.0
-            if cov_key is not None and max_cov_cache > 0:
-                cov_cache[cov_key] = cov.copy()
-                while len(cov_cache) > max_cov_cache:
-                    cov_cache.popitem(last=False)
-                    cov_cache_evictions += 1
-            cov_cache_misses += 1
+            raise ValueError("Covariance computation failed for rebalance window")
 
         rebalance_date = dates[start]
         factors_missing = False
@@ -4368,7 +4556,7 @@ def backtest(
         "cov_cache_hits": int(cov_cache_hits),
         "cov_cache_misses": int(cov_cache_misses),
         "cov_cache_evictions": int(cov_cache_evictions),
-        "max_workers": max_workers_value,
+        "workers": workers_value,
         "dtype": float_dtype.name,
         "decay": decay_value,
         "warm_start": str(warm_path_obj) if warm_path_obj is not None else None,
@@ -5471,110 +5659,6 @@ def _extract_asset_names(frame: Any, n_assets: int) -> List[str]:
     return [f"A{i}" for i in range(n_assets)]
 
 
-def _load_cap_weight_vector(path: Path, asset_names: Sequence[str]) -> np.ndarray:
-    if not path.exists():
-        raise FileNotFoundError(f"Cap weights file not found: {path}")
-
-    weights_map: Dict[str, float] = {}
-    if pd is not None:
-        frame = pd.read_csv(path)
-        lower_cols = {str(col).lower() for col in frame.columns}
-        if {"asset", "weight"}.issubset(lower_cols):
-            # Normalize column names without mutating original dataframe ordering
-            name_col = next(col for col in frame.columns if str(col).lower() == "asset")
-            weight_col = next(col for col in frame.columns if str(col).lower() == "weight")
-            for _, row in frame.iterrows():
-                asset = str(row[name_col])
-                weight = float(row[weight_col])
-                if not math.isfinite(weight):
-                    raise ValueError("Cap weight entries must be finite")
-                weights_map[asset] = weight
-        elif not frame.empty:
-            first_row = frame.iloc[0]
-            for col in frame.columns:
-                weight = float(first_row[col])
-                if not math.isfinite(weight):
-                    raise ValueError("Cap weight entries must be finite")
-                weights_map[str(col)] = weight
-    if not weights_map:
-        with path.open("r", encoding="utf-8", newline="") as fh:
-            reader = csv.reader(fh)
-            rows = [row for row in reader if any(cell.strip() for cell in row)]
-        if not rows:
-            raise ValueError("Cap weights file is empty")
-        header = [cell.strip() for cell in rows[0]]
-        if header and header[0].lower() in {"asset", "name"} and len(header) >= 2:
-            for row in rows[1:]:
-                if len(row) < 2:
-                    continue
-                asset = row[0].strip()
-                if not asset:
-                    continue
-                weight = float(row[1])
-                if not math.isfinite(weight):
-                    raise ValueError("Cap weight entries must be finite")
-                weights_map[asset] = weight
-        elif len(rows) >= 2:
-            for idx, col in enumerate(header):
-                if idx >= len(rows[1]):
-                    break
-                weight = float(rows[1][idx])
-                if not math.isfinite(weight):
-                    raise ValueError("Cap weight entries must be finite")
-                weights_map[col or f"A{idx}"] = weight
-        else:
-            raise ValueError("Cap weights file must contain at least one row of weights")
-
-    if not weights_map:
-        raise ValueError("Unable to parse cap weights file")
-
-    weights = np.zeros(len(asset_names), dtype=float)
-    found = 0
-    for idx, name in enumerate(asset_names):
-        weight = weights_map.get(name)
-        if weight is None:
-            raise ValueError(f"Missing cap weight for asset '{name}'")
-        weights[idx] = weight
-        found += 1
-
-    if found == 0:
-        raise ValueError("No overlapping assets found in cap weights file")
-    total = float(weights.sum())
-    if total <= 0:
-        raise ValueError("Cap weights must sum to a positive value")
-    weights /= total
-    return weights
-
-
-def _compute_baseline_returns(
-    baseline: str,
-    returns_arr: np.ndarray,
-    asset_names: Sequence[str],
-    *,
-    cap_weights_path: Optional[Path] = None,
-) -> Tuple[str, np.ndarray, np.ndarray]:
-    if returns_arr.ndim != 2:
-        raise ValueError("Returns array must be two dimensional for baseline computation")
-    n_assets = returns_arr.shape[1]
-    if n_assets == 0:
-        raise ValueError("Cannot compute baseline with zero assets")
-
-    mode = str(baseline).lower()
-    if mode == "equal":
-        weights = np.full(n_assets, 1.0 / n_assets, dtype=float)
-        label = "equal"
-    elif mode == "cap":
-        if cap_weights_path is None:
-            raise ValueError("--cap-weights must be provided when --baseline=cap")
-        weights = _load_cap_weight_vector(cap_weights_path, asset_names)
-        label = "cap"
-    else:
-        raise ValueError(f"Unknown baseline mode '{baseline}'")
-
-    returns = returns_arr @ weights
-    return label, returns.astype(float, copy=False), weights
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for the backtest CLI."""
 
@@ -5594,15 +5678,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--baseline",
-        choices=["equal", "cap"],
-        default=None,
-        help="Include baseline overlay and metrics (equal or cap)",
+        choices=["none", "minvar", "maxret", "riskparity"],
+        default="none",
+        help="Baseline overlay to compute alongside the strategy",
     )
     parser.add_argument(
-        "--cap-weights",
-        type=str,
-        default=None,
-        help="CSV file containing cap weights (required when --baseline=cap)",
+        "--lambda-tc",
+        type=float,
+        default=0.0,
+        help="Transaction-cost penalty applied to baseline weights",
     )
     parser.add_argument(
         "--active-min",
@@ -5691,10 +5775,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of covariance matrices to cache",
     )
     parser.add_argument(
-        "--max-workers",
+        "--workers",
         type=int,
         default=None,
-        help="Maximum number of parallel workers to use (if supported)",
+        help="ProcessPool workers for covariance preparation",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        dest="legacy_max_workers",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--prefetch",
+        type=int,
+        default=2,
+        help="Number of rebalance windows to prefetch for multiprocessing",
     )
     parser.add_argument(
         "--gamma-turnover",
@@ -5814,6 +5911,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tail probability (alpha) for realized CVaR metric",
     )
     parser.add_argument(
+        "--io-backend",
+        choices=["auto", "pandas", "polars"],
+        default="auto",
+        help="Dataframe backend for I/O (auto detects polars when available)",
+    )
+    parser.add_argument(
+        "--data-freq",
+        type=str,
+        default="B",
+        help="Expected calendar frequency for the returns index (e.g. B, D, W)",
+    )
+    parser.add_argument(
+        "--data-tz",
+        type=str,
+        default="UTC",
+        help="Timezone to interpret timestamps in the returns files",
+    )
+    parser.add_argument(
+        "--dropna",
+        choices=["none", "any", "all"],
+        default="none",
+        help="Row drop policy applied before ingestion",
+    )
+    parser.add_argument(
+        "--columns",
+        type=str,
+        nargs="*",
+        help="Optional asset filters (use SRC or SRC:ALIAS tokens)",
+    )
+    parser.add_argument(
+        "--column-map",
+        type=str,
+        default=None,
+        help="YAML/JSON file describing column rename mapping",
+    )
+    parser.add_argument(
+        "--no-pit",
+        action="store_true",
+        help="Disable point-in-time future date guard when ingesting",
+    )
+    parser.add_argument(
         "--factors",
         type=str,
         default=None,
@@ -5928,6 +6066,9 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     if not parsed.csv:
         raise ValueError("--csv must be provided via CLI or config")
 
+    if getattr(parsed, "legacy_max_workers", None) is not None and parsed.workers is None:
+        parsed.workers = parsed.legacy_max_workers
+
     cv_folds = _parse_cv_spec(parsed.cv) if parsed.cv else 0
     bootstrap_count = int(parsed.bootstrap)
     if bootstrap_count < 0:
@@ -5938,11 +6079,73 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     bootstrap_method = str(parsed.bootstrap_method or "stationary")
 
     float_dtype = np.float32 if parsed.float32 else np.float64
-    df = _read_csv(Path(parsed.csv))
+
+    if int(parsed.prefetch) <= 0:
+        raise ValueError("--prefetch must be a positive integer")
+
+    column_tokens = list(parsed.columns or [])
+    rename_map: Dict[str, str] = {}
+    filter_cols: List[str] = []
+    for token in column_tokens:
+        token_str = str(token).strip()
+        if not token_str:
+            continue
+        if ":" in token_str:
+            src, alias = token_str.split(":", 1)
+            src = src.strip()
+            alias = alias.strip()
+            if src:
+                filter_cols.append(src)
+                if alias:
+                    rename_map[src] = alias
+        else:
+            filter_cols.append(token_str)
+    if parsed.column_map:
+        column_map_path = Path(parsed.column_map)
+        mapping_obj = _load_yaml_or_json(column_map_path)
+        if not isinstance(mapping_obj, Mapping):
+            raise ValueError("--column-map must describe a mapping of {old: new}")
+        for key, value in mapping_obj.items():
+            rename_map[str(key)] = str(value)
+
+    columns_param: Optional[Union[Sequence[str], Mapping[str, str]]] = None
+    if rename_map and filter_cols:
+        columns_param = {col: rename_map.get(col, col) for col in filter_cols}
+    elif rename_map:
+        columns_param = rename_map
+    elif filter_cols:
+        columns_param = filter_cols
+
+    try:
+        df_raw = load_returns(
+            Path(parsed.csv),
+            freq=parsed.data_freq,
+            tz=parsed.data_tz,
+            pit=not parsed.no_pit,
+            columns=columns_param,
+            dropna=parsed.dropna,
+            backend=parsed.io_backend,
+        )
+    except (LoaderError, CalendarAlignmentError, PITViolationError) as exc:
+        raise ValueError(f"Failed to load returns: {exc}") from exc
+
     df, returns_preview, date_index = _sanitize_frame(
-        df, drop_duplicates=parsed.drop_duplicates, label="returns"
+        df_raw, drop_duplicates=parsed.drop_duplicates, label="returns"
     )
-    benchmark_df = _read_csv(Path(parsed.benchmark_csv)) if parsed.benchmark_csv else None
+
+    benchmark_df: Optional[Any] = None
+    if parsed.benchmark_csv:
+        try:
+            benchmark_df = load_returns(
+                Path(parsed.benchmark_csv),
+                freq=parsed.data_freq,
+                tz=parsed.data_tz,
+                pit=not parsed.no_pit,
+                dropna=parsed.dropna,
+                backend=parsed.io_backend,
+            )
+        except (LoaderError, CalendarAlignmentError, PITViolationError) as exc:
+            raise ValueError(f"Failed to load benchmark returns: {exc}") from exc
     factor_panel = load_factor_panel(Path(parsed.factors)) if parsed.factors else None
     slippage_cfg = parse_slippage(parsed.slippage)
     nt_band_spec = getattr(parsed, "nt_band", 0.0)
@@ -5975,19 +6178,24 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     asset_names_for_baseline = _extract_asset_names(df, returns_arr_for_baseline.shape[1])
     all_dates = list(date_index)
 
-    if parsed.baseline == "cap" and not parsed.cap_weights:
-        raise ValueError("--cap-weights must be supplied when --baseline=cap")
-
     baseline_series_full: Optional[np.ndarray] = None
     baseline_label: Optional[str] = None
     baseline_weights: Optional[np.ndarray] = None
-    if parsed.baseline:
-        baseline_label, baseline_series_full, baseline_weights = _compute_baseline_returns(
-            parsed.baseline,
-            returns_arr_for_baseline,
-            asset_names_for_baseline,
-            cap_weights_path=Path(parsed.cap_weights) if parsed.cap_weights else None,
-        )
+    baseline_turnover: Optional[float] = None
+    baseline_mode = str(parsed.baseline or "none").lower()
+    if baseline_mode != "none":
+        try:
+            baseline_res = compute_baseline(
+                baseline_mode,
+                returns_arr_for_baseline,
+                lambda_tc=float(parsed.lambda_tc),
+            )
+        except ValueError as exc:
+            raise ValueError(f"Failed to compute baseline '{baseline_mode}': {exc}") from exc
+        baseline_label = baseline_res.label
+        baseline_series_full = baseline_res.returns.astype(float_dtype, copy=False)
+        baseline_weights = baseline_res.weights.astype(float_dtype, copy=False)
+        baseline_turnover = float(baseline_res.turnover)
 
     shared_backtest_kwargs: Dict[str, Any] = dict(
         lookback=parsed.lookback,
@@ -6019,7 +6227,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         trading_days=parsed.trading_days,
         dtype=float_dtype,
         cov_cache_size=parsed.cache_cov,
-        max_workers=parsed.max_workers,
+        workers=parsed.workers,
+        prefetch=parsed.prefetch,
         decay=parsed.decay,
         drop_duplicates=parsed.drop_duplicates,
         deterministic=parsed.deterministic,
@@ -6075,6 +6284,8 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         results["baseline_label"] = baseline_label
         if baseline_weights is not None:
             results["baseline_weights"] = np.asarray(baseline_weights, dtype=float_dtype)
+        if baseline_turnover is not None:
+            results["baseline_turnover"] = float(baseline_turnover)
 
         trading_days = max(1, int(results.get("trading_days", 252)))
         ann_factor = math.sqrt(trading_days)

@@ -16,14 +16,14 @@ def _write_returns_csv(path: Path, returns: np.ndarray, assets: list[str], dates
     path.write_text("\n".join(rows), encoding="utf-8")
 
 
-def test_backtest_cli_baseline_equal(tmp_path: Path) -> None:
+def test_backtest_cli_baseline_maxret(tmp_path: Path) -> None:
     rng = np.random.default_rng(0)
     n_periods, n_assets = 32, 4
     returns = rng.normal(scale=0.01, size=(n_periods, n_assets))
     dates = [np.datetime64("2021-01-01") + np.timedelta64(i, "D") for i in range(n_periods)]
     assets = [f"A{i}" for i in range(n_assets)]
 
-    returns_path = tmp_path / "returns_equal.csv"
+    returns_path = tmp_path / "returns_maxret.csv"
     _write_returns_csv(returns_path, returns, assets, dates)
 
     out_dir = tmp_path / "baseline_equal"
@@ -36,7 +36,9 @@ def test_backtest_cli_baseline_equal(tmp_path: Path) -> None:
             "--step",
             "5",
             "--baseline",
-            "equal",
+            "maxret",
+            "--lambda-tc",
+            "2.5",
             "--skip-plot",
             "--out",
             str(out_dir),
@@ -44,7 +46,7 @@ def test_backtest_cli_baseline_equal(tmp_path: Path) -> None:
     )
 
     metrics_path = out_dir / "metrics.csv"
-    baseline_equity = out_dir / "equity_baseline_equal.csv"
+    baseline_equity = out_dir / "equity_baseline_maxret.csv"
     equity_plot = out_dir / "equity.png"
 
     assert metrics_path.exists()
@@ -56,22 +58,17 @@ def test_backtest_cli_baseline_equal(tmp_path: Path) -> None:
     assert "hit_rate_vs_baseline" in metrics_text
 
 
-def test_backtest_cli_baseline_cap(tmp_path: Path) -> None:
+def test_backtest_cli_baseline_riskparity(tmp_path: Path) -> None:
     rng = np.random.default_rng(1)
     n_periods, n_assets = 28, 3
     returns = rng.normal(scale=0.008, size=(n_periods, n_assets))
     dates = [np.datetime64("2022-01-01") + np.timedelta64(i, "D") for i in range(n_periods)]
     assets = [f"A{i}" for i in range(n_assets)]
 
-    returns_path = tmp_path / "returns_cap.csv"
+    returns_path = tmp_path / "returns_rp.csv"
     _write_returns_csv(returns_path, returns, assets, dates)
 
-    weights_path = tmp_path / "weights_cap.csv"
-    weight_rows = ["asset,weight"]
-    weight_rows.extend(f"{asset},{0.5 if idx == 0 else 0.25}" for idx, asset in enumerate(assets))
-    weights_path.write_text("\n".join(weight_rows), encoding="utf-8")
-
-    out_dir = tmp_path / "baseline_cap"
+    out_dir = tmp_path / "baseline_rp"
     main(
         [
             "--csv",
@@ -81,9 +78,9 @@ def test_backtest_cli_baseline_cap(tmp_path: Path) -> None:
             "--step",
             "4",
             "--baseline",
-            "cap",
-            "--cap-weights",
-            str(weights_path),
+            "riskparity",
+            "--lambda-tc",
+            "1.0",
             "--skip-plot",
             "--out",
             str(out_dir),
@@ -91,7 +88,7 @@ def test_backtest_cli_baseline_cap(tmp_path: Path) -> None:
     )
 
     metrics_path = out_dir / "metrics.csv"
-    baseline_equity = out_dir / "equity_baseline_cap.csv"
+    baseline_equity = out_dir / "equity_baseline_riskparity.csv"
 
     assert metrics_path.exists()
     assert baseline_equity.exists()
