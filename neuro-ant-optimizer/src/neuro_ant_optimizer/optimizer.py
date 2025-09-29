@@ -54,6 +54,8 @@ class OptimizerConfig:
     te_target: float = 0.0
     lambda_te: float = 0.0
     gamma_turnover: float = 0.0
+    gamma_turnover_vector: Optional[np.ndarray] = None
+    risk_eval_batch: int = 1024
 
     def __post_init__(self) -> None:
         if self.n_ants <= 0:
@@ -86,6 +88,15 @@ class OptimizerConfig:
             raise ValueError("lambda_te must be non-negative")
         if self.gamma_turnover < 0.0:
             raise ValueError("gamma_turnover must be non-negative")
+        if self.gamma_turnover_vector is not None:
+            gamma_vec = np.asarray(self.gamma_turnover_vector, dtype=float)
+            if gamma_vec.ndim != 1:
+                raise ValueError("gamma_turnover_vector must be one-dimensional")
+            if np.any(gamma_vec < 0.0):
+                raise ValueError("gamma_turnover_vector entries must be non-negative")
+            object.__setattr__(self, "gamma_turnover_vector", gamma_vec)
+        if self.risk_eval_batch <= 0:
+            raise ValueError("risk_eval_batch must be positive")
 
     @classmethod
     def from_overrides(cls, overrides: Optional[Dict[str, Any]] = None) -> "OptimizerConfig":
@@ -262,19 +273,7 @@ class NeuroAntPortfolioOptimizer:
                 )
             trans_log = np.log(np.clip(cached_T, 1e-12, None)) * float(alpha)
             if self.risk_net is not None and beta:
-                with torch.no_grad():
-                    identity = torch.eye(
-                        self.n_assets,
-                        device=self.risk_net.param_device,
-                        dtype=self.risk_net.param_dtype,
-                    )
-                    diag = (
-                        torch.diagonal(self.risk_net(identity), dim1=-2, dim2=-1)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
-                risk_bias = np.log(np.clip(diag, 1e-6, None)) * beta
+                risk_bias = self._compute_risk_bias(beta)
             else:
                 risk_bias = np.zeros(self.n_assets, dtype=float)
             portfolios: List[np.ndarray] = []
@@ -448,15 +447,56 @@ class NeuroAntPortfolioOptimizer:
             if self.cfg.lambda_te > 0.0:
                 te = self._tracking_error(weights, mu, cov, benchmark)
                 base -= float(self.cfg.lambda_te) * te
-            if (
-                self.cfg.gamma_turnover > 0.0
-                and constraints.prev_weights is not None
-            ):
-                prev = np.asarray(constraints.prev_weights, dtype=float)
-                turnover = float(np.abs(weights - prev).sum())
-                base -= float(self.cfg.gamma_turnover) * turnover
+            penalty = self._turnover_penalty(weights, constraints)
+            if penalty:
+                base -= penalty
             return float(base)
         return self._sharpe(weights, mu, cov)
+
+    def _compute_risk_bias(self, beta: float) -> np.ndarray:
+        if self.risk_net is None or beta == 0.0:
+            return np.zeros(self.n_assets, dtype=float)
+        batch = max(1, int(self.cfg.risk_eval_batch))
+        identity = torch.eye(
+            self.n_assets,
+            device=self.risk_net.param_device,
+            dtype=self.risk_net.param_dtype,
+        )
+        diag_vals = np.empty(self.n_assets, dtype=float)
+        with torch.no_grad():
+            for start in range(0, self.n_assets, batch):
+                end = min(start + batch, self.n_assets)
+                chunk = identity[start:end]
+                preds = self.risk_net(chunk)
+                rows = torch.arange(end - start, device=preds.device)
+                cols = torch.arange(start, end, device=preds.device)
+                diag_slice = preds[rows, cols]
+                diag_vals[start:end] = diag_slice.detach().cpu().numpy()
+        diag_vals = np.clip(diag_vals, 1e-6, None)
+        return np.log(diag_vals) * float(beta)
+
+    def _turnover_penalty(self, weights: np.ndarray, constraints: PortfolioConstraints) -> float:
+        penalty = 0.0
+        prev = constraints.prev_weights
+        if prev is None:
+            delta = np.abs(np.asarray(weights, dtype=float))
+        else:
+            prev_arr = np.asarray(prev, dtype=float)
+            if prev_arr.shape != weights.shape:
+                raise ValueError("prev_weights dimension mismatch with weights")
+            delta = np.abs(np.asarray(weights, dtype=float) - prev_arr)
+        if self.cfg.gamma_turnover > 0.0:
+            penalty += float(self.cfg.gamma_turnover) * float(delta.sum())
+        gamma_vec = None
+        if constraints.turnover_gamma is not None:
+            gamma_vec = np.asarray(constraints.turnover_gamma, dtype=float)
+        elif self.cfg.gamma_turnover_vector is not None:
+            gamma_vec = np.asarray(self.cfg.gamma_turnover_vector, dtype=float)
+        if gamma_vec is not None:
+            if gamma_vec.shape != delta.shape:
+                raise ValueError("gamma_turnover_vector dimension mismatch with weights")
+            penalty += float(delta @ gamma_vec)
+        return penalty
 
     def _build_constraint_workspace(
         self, constraints: PortfolioConstraints

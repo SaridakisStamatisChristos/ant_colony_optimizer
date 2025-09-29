@@ -53,9 +53,19 @@ except ModuleNotFoundError:  # pragma: no cover - minimal environments
     pd = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
+    import polars as pl  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - minimal environments
+    pl = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
     import yaml  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - minimal environments
     yaml = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    from numba import njit  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - minimal environments
+    njit = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
     from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -474,6 +484,7 @@ def _main_sweep(argv: Sequence[str]) -> None:
     metric_columns = ["sharpe", "ann_return", "ann_vol", "max_drawdown"]
     breach_columns = [
         "sector_breaches",
+        "sector_penalty",
         "active_breaches",
         "group_breaches",
         "factor_bound_breaches",
@@ -589,6 +600,7 @@ _STANDARD_METRIC_KEYS: Tuple[str, ...] = (
     "ann_vol",
     "max_drawdown",
     "avg_turnover",
+    "avg_sector_penalty",
     "avg_slippage_bps",
     "downside_vol",
     "sortino",
@@ -816,6 +828,7 @@ if _PYDANTIC_AVAILABLE:
         te_target: float = Field(ge=0.0, default=0.0)
         lambda_te: float = Field(ge=0.0, default=0.0)
         gamma_turnover: float = Field(ge=0.0, default=0.0)
+        gamma_by_sector: Optional[Any] = None
         refine_every: int = Field(ge=1, default=1)
         out_format: Literal["csv", "parquet"] = "csv"
         save_weights: bool = False
@@ -890,6 +903,7 @@ else:
             "te_target": 0.0,
             "lambda_te": 0.0,
             "gamma_turnover": 0.0,
+            "gamma_by_sector": None,
             "refine_every": 1,
             "out_format": "csv",
             "save_weights": False,
@@ -1010,6 +1024,9 @@ else:
                 if field in raw:
                     value = raw[field]
                     data[field] = None if value is None else str(value).strip()
+
+            if "gamma_by_sector" in raw:
+                data["gamma_by_sector"] = raw["gamma_by_sector"]
 
             if "baseline" in raw:
                 value = raw["baseline"]
@@ -1577,6 +1594,204 @@ def _prepare_factor_bounds(
         return None, None, {}
 
     return lower, upper, manifest
+
+
+def _infer_sector_map(
+    frame: Any, asset_names: Sequence[str]
+) -> Tuple[Optional[List[int]], Dict[int, str]]:
+    if pd is None or not hasattr(frame, "columns"):
+        return None, {}
+    columns = getattr(frame, "columns")
+    if isinstance(columns, pd.MultiIndex) and columns.nlevels >= 2:
+        sectors = [str(val) for val in columns.get_level_values(0)]
+        sector_index: Dict[str, int] = {}
+        sector_map: List[int] = []
+        sector_name_map: Dict[int, str] = {}
+        for idx, label in enumerate(sectors):
+            key = label or f"sector_{idx}"
+            sec_id = sector_index.setdefault(key, len(sector_index))
+            sector_map.append(sec_id)
+            sector_name_map[sec_id] = key
+        if len(sector_map) == len(asset_names):
+            return sector_map, sector_name_map
+    return None, {}
+
+
+def _prepare_turnover_penalties(
+    spec: Any,
+    asset_names: Sequence[str],
+    inferred_sector_map: Optional[List[int]],
+    inferred_sector_names: Dict[int, str],
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[List[int]],
+    Dict[int, str],
+    List[Dict[str, Any]],
+]:
+    data = _maybe_load_structure(spec)
+    if data is None:
+        return None, inferred_sector_map, dict(inferred_sector_names), []
+
+    entries: List[Tuple[str, Any]] = []
+    if isinstance(data, Mapping):
+        entries = [(str(key), value) for key, value in data.items()]
+    elif isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        for value in data:
+            if not isinstance(value, Mapping):
+                raise ValueError("gamma_by_sector list entries must be mappings")
+            name = value.get("sector") or value.get("name") or value.get("label") or value.get("asset")
+            if name is None:
+                raise ValueError("gamma_by_sector entries must include a sector or asset name")
+            entries.append((str(name), value))
+    else:
+        raise ValueError("gamma_by_sector specification must be a mapping or list of mappings")
+
+    n_assets = len(asset_names)
+    gamma_vector = np.zeros(n_assets, dtype=float)
+    assigned = np.zeros(n_assets, dtype=bool)
+    asset_index = {name: idx for idx, name in enumerate(asset_names)}
+    sector_map_arr = (
+        np.asarray(inferred_sector_map, dtype=int) if inferred_sector_map is not None else None
+    )
+    sector_name_map = dict(inferred_sector_names)
+    sector_index = {name: sid for sid, name in sector_name_map.items()}
+    manifest: List[Dict[str, Any]] = []
+    default_gamma: Optional[float] = None
+
+    def _ensure_sector_array() -> np.ndarray:
+        nonlocal sector_map_arr
+        if sector_map_arr is None:
+            sector_map_arr = np.full(n_assets, -1, dtype=int)
+        return sector_map_arr
+
+    for raw_name, raw_value in entries:
+        key_lower = raw_name.lower()
+        if key_lower == "default":
+            if isinstance(raw_value, Mapping):
+                gamma_raw = (
+                    raw_value.get("gamma")
+                    or raw_value.get("penalty")
+                    or raw_value.get("weight")
+                )
+            else:
+                gamma_raw = raw_value
+            gamma_val = _coerce_optional_float(gamma_raw)
+            if gamma_val is None:
+                raise ValueError("gamma_by_sector default entry must include a numeric value")
+            default_gamma = float(gamma_val)
+            continue
+
+        if isinstance(raw_value, Mapping):
+            members = raw_value.get("members") or raw_value.get("assets")
+            gamma_raw = raw_value.get("gamma") or raw_value.get("penalty") or raw_value.get("weight")
+            if gamma_raw is None:
+                raise ValueError(f"gamma_by_sector entry '{raw_name}' missing gamma value")
+            gamma_val_opt = _coerce_optional_float(gamma_raw)
+            if gamma_val_opt is None:
+                raise ValueError(f"gamma_by_sector entry '{raw_name}' gamma must be numeric")
+            gamma_val = float(gamma_val_opt)
+            if members is not None:
+                members_seq = list(members)
+                sector_array = _ensure_sector_array()
+                sec_id = sector_index.setdefault(raw_name, len(sector_index))
+                sector_name_map[sec_id] = raw_name
+                assigned_members: List[str] = []
+                for member in members_seq:
+                    asset = str(member)
+                    idx = asset_index.get(asset)
+                    if idx is None:
+                        raise ValueError(f"gamma_by_sector references unknown asset '{asset}'")
+                    if sector_array[idx] not in {-1, sec_id}:
+                        raise ValueError(
+                            f"Asset '{asset}' assigned to multiple sectors in gamma_by_sector"
+                        )
+                    sector_array[idx] = sec_id
+                    gamma_vector[idx] = gamma_val
+                    assigned[idx] = True
+                    assigned_members.append(asset)
+                manifest.append(
+                    {
+                        "sector": raw_name,
+                        "gamma": gamma_val,
+                        "members": assigned_members,
+                    }
+                )
+                continue
+            gamma_target = raw_name
+            sector_array = _ensure_sector_array()
+            sec_id = sector_index.get(gamma_target)
+            if sec_id is None:
+                raise ValueError(
+                    f"gamma_by_sector entry '{raw_name}' missing members and no inferred sector mapping"
+                )
+            member_idx = np.nonzero(sector_array == sec_id)[0]
+            if member_idx.size == 0:
+                raise ValueError(
+                    f"gamma_by_sector entry '{raw_name}' has no assets in inferred sector mapping"
+                )
+            members_list = [asset_names[i] for i in member_idx]
+            for idx in member_idx:
+                gamma_vector[idx] = gamma_val
+                assigned[idx] = True
+            manifest.append(
+                {
+                    "sector": raw_name,
+                    "gamma": gamma_val,
+                    "members": members_list,
+                }
+            )
+            continue
+
+        if isinstance(raw_value, (float, int, np.floating, np.integer)):
+            gamma_val = float(raw_value)
+            idx = asset_index.get(raw_name)
+            if idx is not None:
+                gamma_vector[idx] = gamma_val
+                assigned[idx] = True
+                manifest.append({"asset": raw_name, "gamma": gamma_val})
+                continue
+            sector_array = _ensure_sector_array()
+            sec_id = sector_index.get(raw_name)
+            if sec_id is None:
+                raise ValueError(
+                    f"gamma_by_sector entry '{raw_name}' does not match an asset or inferred sector"
+                )
+            member_idx = np.nonzero(sector_array == sec_id)[0]
+            if member_idx.size == 0:
+                raise ValueError(
+                    f"gamma_by_sector entry '{raw_name}' has no members to assign"
+                )
+            members_list = [asset_names[i] for i in member_idx]
+            for idx in member_idx:
+                gamma_vector[idx] = gamma_val
+                assigned[idx] = True
+            manifest.append(
+                {
+                    "sector": raw_name,
+                    "gamma": gamma_val,
+                    "members": members_list,
+                }
+            )
+            continue
+
+        raise ValueError(
+            "gamma_by_sector entries must be numeric values or mappings with 'members'/'gamma' keys"
+        )
+
+    if default_gamma is not None:
+        for idx in range(n_assets):
+            if not assigned[idx]:
+                gamma_vector[idx] = default_gamma
+                assigned[idx] = True
+
+    gamma_out: Optional[np.ndarray]
+    if np.any(assigned) or default_gamma is not None:
+        gamma_out = gamma_vector
+    else:
+        gamma_out = None
+
+    sector_map_list = sector_map_arr.tolist() if sector_map_arr is not None else inferred_sector_map
+    return gamma_out, sector_map_list, sector_name_map, manifest
 
 
 def _serialize_args(args: argparse.Namespace) -> Dict[str, Any]:
@@ -2560,13 +2775,65 @@ def _hierarchical_risk_parity_weights(cov: np.ndarray) -> np.ndarray:
         return np.ones(n, dtype=float) / n
     return final / total_weight
 
+if njit is not None:  # pragma: no cover - exercised in environments with numba
+    @njit(cache=True)
+    def _abs_assign_nb(out: np.ndarray, src: np.ndarray) -> None:
+        for i in range(src.shape[0]):
+            out[i] = abs(src[i])
 
-def turnover(previous: Optional[np.ndarray], current: np.ndarray) -> float:
+    @njit(cache=True)
+    def _diff_abs_assign_nb(out: np.ndarray, prev: np.ndarray, curr: np.ndarray) -> None:
+        for i in range(curr.shape[0]):
+            out[i] = abs(curr[i] - prev[i])
+else:  # pragma: no cover - fallback
+    def _abs_assign_nb(out: np.ndarray, src: np.ndarray) -> None:
+        out[:] = np.abs(src)
+
+    def _diff_abs_assign_nb(out: np.ndarray, prev: np.ndarray, curr: np.ndarray) -> None:
+        np.subtract(curr, prev, out=out)
+        np.abs(out, out=out)
+
+
+def _turnover_penalty_components(
+    previous: Optional[np.ndarray],
+    current: np.ndarray,
+    gamma: Optional[np.ndarray] = None,
+    *,
+    out: Optional[np.ndarray] = None,
+) -> Tuple[float, float, np.ndarray]:
+    current_arr = np.asarray(current, dtype=float)
+    buffer = out
+    if buffer is None or buffer.shape != current_arr.shape:
+        buffer = np.empty_like(current_arr, dtype=float)
+    else:
+        buffer = np.asarray(buffer, dtype=float)
+    if previous is None:
+        _abs_assign_nb(buffer, current_arr)
+    else:
+        prev_arr = np.asarray(previous, dtype=float)
+        if prev_arr.shape != current_arr.shape:
+            raise ValueError("previous weights dimension mismatch")
+        _diff_abs_assign_nb(buffer, prev_arr, current_arr)
+    turnover_val = float(buffer.sum())
+    penalty_val = 0.0
+    if gamma is not None:
+        gamma_arr = np.asarray(gamma, dtype=float)
+        if gamma_arr.shape != buffer.shape:
+            raise ValueError("turnover penalty vector dimension mismatch")
+        penalty_val = float(buffer @ gamma_arr)
+    return turnover_val, penalty_val, buffer
+
+
+def turnover(
+    previous: Optional[np.ndarray],
+    current: np.ndarray,
+    *,
+    out: Optional[np.ndarray] = None,
+) -> float:
     """Compute the L1 turnover between two weight vectors."""
 
-    if previous is None:
-        return float(np.abs(current).sum())
-    return float(np.abs(current - previous).sum())
+    turnover_val, _, _ = _turnover_penalty_components(previous, current, out=out)
+    return float(turnover_val)
 
 
 def max_drawdown(equity_curve: np.ndarray) -> float:
@@ -2990,6 +3257,7 @@ def backtest(
     te_target: float = 0.0,
     lambda_te: float = 0.0,
     gamma_turnover: float = 0.0,
+    gamma_by_sector: Optional[Any] = None,
     risk_free_rate: float = 0.0,
     trading_days: int = 252,
     progress_callback: Optional[ProgressCallback] = None,
@@ -3122,10 +3390,12 @@ def backtest(
             "Benchmark series required for tracking_error/info_ratio/te_target/multi_term objectives"
         )
 
-    asset_names = (
-        list(getattr(df, "columns", []))
-        if hasattr(df, "columns") and getattr(df, "columns") is not None
-        else [f"A{i}" for i in range(n_assets)]
+    asset_names = _extract_asset_names(df, n_assets)
+    inferred_sector_map, inferred_sector_names = _infer_sector_map(df, asset_names)
+    sector_lookup = (
+        {name: inferred_sector_map[idx] for idx, name in enumerate(asset_names)}
+        if inferred_sector_map is not None
+        else None
     )
 
     factor_panel: Optional[FactorPanel] = None
@@ -3156,6 +3426,12 @@ def backtest(
             raise ValueError("Factor assets failed to align with returns columns")
         returns = returns[:, reorder_indices]
         asset_names = list(factor_panel.assets)
+        if sector_lookup is not None:
+            remapped = [sector_lookup.get(name, -1) for name in asset_names]
+            if any(val != -1 for val in remapped):
+                inferred_sector_map = remapped
+            else:
+                inferred_sector_map = None
         n_periods, n_assets = returns.shape
         if factor_panel.loadings.shape[1] != n_assets:
             raise ValueError("Factor panel asset dimension mismatch after alignment")
@@ -3174,6 +3450,19 @@ def backtest(
 
     if returns.shape[1] == 0:
         raise ValueError("No assets remain after aligning factors with returns")
+
+    turnover_gamma_vec, effective_sector_map, sector_name_map, gamma_manifest = (
+        _prepare_turnover_penalties(
+            gamma_by_sector,
+            asset_names,
+            inferred_sector_map,
+            inferred_sector_names,
+        )
+    )
+    if gamma_manifest:
+        constraint_manifest["sector_penalties"] = gamma_manifest
+    elif gamma_by_sector is not None:
+        constraint_manifest["sector_penalties"] = []
 
     warm_path_obj: Optional[Path] = None
     warm_dates: List[Any] = []
@@ -3216,6 +3505,10 @@ def backtest(
     optimizer.cfg.te_target = float(te_target)
     optimizer.cfg.lambda_te = float(lambda_te)
     optimizer.cfg.gamma_turnover = float(gamma_turnover)
+    if turnover_gamma_vec is not None:
+        optimizer.cfg.gamma_turnover_vector = turnover_gamma_vec.astype(float, copy=False)
+    else:
+        optimizer.cfg.gamma_turnover_vector = None
     constraints = _build_constraints(returns.shape[1])
     constraints.factor_tolerance = factor_tolerance
     constraints.min_active_weight = float("-inf") if min_active_val is None else float(min_active_val)
@@ -3226,6 +3519,21 @@ def backtest(
     else:
         constraints.benchmark_weights = None
         constraints.benchmark_mask = None
+    if effective_sector_map is not None:
+        constraints.sector_map = list(effective_sector_map)
+    if sector_name_map:
+        constraints.sector_name_map = dict(sector_name_map)
+    else:
+        constraints.sector_name_map = None
+    if turnover_gamma_vec is not None:
+        constraints.turnover_gamma = turnover_gamma_vec.astype(float_dtype, copy=False)
+    else:
+        constraints.turnover_gamma = None
+    turnover_gamma_array = (
+        np.asarray(constraints.turnover_gamma, dtype=float)
+        if constraints.turnover_gamma is not None
+        else None
+    )
     if group_map is not None and group_bounds is not None:
         constraints.active_group_map = group_map
         constraints.active_group_bounds = group_bounds
@@ -3266,11 +3574,15 @@ def backtest(
     )
     slippage_costs = np.zeros(n_windows, dtype=float_dtype)
     turnovers_arr = np.zeros(n_windows, dtype=float_dtype)
+    sector_penalties_arr = np.zeros(n_windows, dtype=float_dtype)
     cursor = 0
 
     factor_index_map: Optional[Dict[Any, int]] = None
     if factor_panel is not None:
         factor_index_map = factor_panel.index_map()
+
+    turnover_pre_buffer = np.empty(n_assets, dtype=float)
+    turnover_buffer = np.empty(n_assets, dtype=float)
 
     warm_vector: Optional[np.ndarray] = None
     if warm_matrix.size and len(asset_names):
@@ -3487,7 +3799,10 @@ def backtest(
         projection_iters.append(int(getattr(result, "projection_iterations", 0)))
         w_opt = np.asarray(result.weights, dtype=float_dtype)
         warm_applied_flag = prev_weights_is_warm
-        turn_pre = turnover(prev_weights, w_opt)
+        turn_pre_val, _, _ = _turnover_penalty_components(
+            prev_weights, w_opt, out=turnover_pre_buffer
+        )
+        turn_pre = float(turn_pre_val)
         w_target = w_opt
         nt_band_hits = 0
         if nt_band_value > 0.0:
@@ -3501,7 +3816,14 @@ def backtest(
             participation_cap = slippage.params.get("participation")
         w, participation_breaches = _apply_participation_cap(prev_weights, w, participation_cap)
         w = np.asarray(w, dtype=float_dtype)
-        turn = turnover(prev_weights, w)
+        turn_val, penalty_val, _ = _turnover_penalty_components(
+            prev_weights,
+            w,
+            gamma=turnover_gamma_array,
+            out=turnover_buffer,
+        )
+        turn = float(turn_val)
+        sector_penalty_val = float(penalty_val)
         weights.append(w)
         rebalance_dates.append(rebalance_date)
 
@@ -3537,6 +3859,7 @@ def backtest(
                 factor_attr_records.append(attr_row)
 
         turnovers_arr[window_idx] = float(turn)
+        sector_penalties_arr[window_idx] = float(sector_penalty_val)
         turnover_violation = False
         if np.isfinite(constraints.max_turnover):
             if float(turn) > float(constraints.max_turnover) + 1e-9:
@@ -3605,10 +3928,15 @@ def backtest(
                 unique_shifted = np.unique(shifted)
                 exposures_values = counts[unique_shifted]
                 labels = unique_shifted + offset
-                sector_exposures = {
-                    f"sector_{int(label)}": float(value)
-                    for label, value in zip(labels, exposures_values)
-                }
+                sector_name_lookup = getattr(constraints, "sector_name_map", None) or {}
+                sector_exposures = {}
+                for raw_label, value in zip(labels, exposures_values):
+                    label_int = int(raw_label)
+                    if label_int < 0:
+                        continue
+                    display = sector_name_lookup.get(label_int)
+                    key = f"sector_{display}" if display else f"sector_{label_int}"
+                    sector_exposures[key] = float(value)
                 cap = float(constraints.max_sector_concentration)
                 sector_breaches = int(np.count_nonzero(exposures_values > cap + 1e-9))
         active_breaches = 0
@@ -3776,6 +4104,7 @@ def backtest(
                 "nt_band_hits": int(nt_band_hits),
                 "participation_breaches": int(participation_breaches),
                 "sector_breaches": int(sector_breaches),
+                "sector_penalty": float(sector_penalty_val),
                 "active_breaches": int(active_breaches),
                 "group_breaches": int(group_breaches),
                 "factor_bound_breaches": int(factor_bound_breaches),
@@ -3814,6 +4143,7 @@ def backtest(
                     "factor": int(factor_bound_breaches),
                     "sector": int(sector_breaches),
                 },
+                "sector_penalty": float(sector_penalty_val),
                 "block": {
                     "sharpe": float(block_sharpe),
                     "sortino": float(block_sortino),
@@ -3849,6 +4179,9 @@ def backtest(
         float(slippage_costs_arr.mean() * 1e4) if slippage_costs_arr.size else 0.0
     )
     turnovers_used = turnovers_arr[: len(weights)] if n_windows else np.array([])
+    sector_penalties_used = (
+        sector_penalties_arr[: len(weights)] if n_windows else np.array([])
+    )
     slippage_net_returns: Optional[np.ndarray] = None
     if slippage is not None:
         slippage_net_returns = net_slip_returns_arr.copy()
@@ -3889,6 +4222,9 @@ def backtest(
         realized_cvar = 0.0
     mdd = max_drawdown(equity)
     avg_turn = float(turnovers_used.mean()) if turnovers_used.size else 0.0
+    avg_sector_penalty = (
+        float(sector_penalties_used.mean()) if sector_penalties_used.size else 0.0
+    )
     pain_idx = _pain_index(equity)
     calmar_ratio = float(ann_return / mdd) if mdd > 1e-12 else 0.0
     pain_ratio = float(ann_return / pain_idx) if pain_idx > 1e-12 else 0.0
@@ -3936,18 +4272,21 @@ def backtest(
         "ann_vol": ann_vol,
         "max_drawdown": mdd,
         "avg_turnover": avg_turn,
+        "avg_sector_penalty": avg_sector_penalty,
         "downside_vol": downside_vol,
         "sortino": sortino,
         "realized_cvar": realized_cvar,
         "tracking_error": tracking_error,
         "info_ratio": info_ratio,
         "turnover_adj_sharpe": turnover_adj_sharpe,
+        "sector_penalties": sector_penalties_used,
         "calmar_ratio": calmar_ratio,
         "pain_ratio": pain_ratio,
         "hit_rate": hit_rate,
         "te_target": float(optimizer.cfg.te_target),
         "lambda_te": float(optimizer.cfg.lambda_te),
         "gamma_turnover": float(optimizer.cfg.gamma_turnover),
+        "gamma_turnover_vector": turnover_gamma_vec,
         "risk_free_rate": annual_rf,
         "periodic_risk_free": periodic_rf,
         "trading_days": int(trading_days),
@@ -3965,6 +4304,7 @@ def backtest(
         "factor_attr": factor_attr_records,
         "factor_diagnostics": factor_diagnostics.to_dict() if factor_diagnostics else None,
         "constraint_manifest": constraint_manifest,
+        "sector_name_map": sector_name_map,
         "warnings": warnings_list,
         "cov_cache_size": int(max_cov_cache),
         "cov_cache_hits": int(cov_cache_hits),
@@ -4842,6 +5182,7 @@ def _write_rebalance_report(path: Path, results: Dict[str, Any]) -> None:
         "nt_band_hits",
         "participation_breaches",
         "sector_breaches",
+        "sector_penalty",
         "active_breaches",
         "group_breaches",
         "factor_bound_breaches",
@@ -4957,6 +5298,71 @@ def _write_exposures(path: Path, results: Dict[str, Any]) -> None:
 
 
 def _read_csv(csv_path: Path):
+    class _Frame:
+        def __init__(
+            self,
+            arr: np.ndarray,
+            idx: Sequence[str],
+            cols: Optional[Sequence[str]] = None,
+        ) -> None:
+            self._arr = arr
+            converted: List[Any] = []
+            for val in idx:
+                try:
+                    converted.append(np.datetime64(val))
+                except Exception:
+                    converted.append(val)
+            self._idx = converted
+            self._cols = list(cols) if cols is not None else []
+
+        def to_numpy(self, dtype=float):  # pragma: no cover - simple proxy
+            return self._arr.astype(dtype)
+
+        @property
+        def index(self):  # pragma: no cover - simple accessor
+            return self._idx
+
+        @property
+        def columns(self):  # pragma: no cover - simple accessor
+            return self._cols
+
+        def filter_rows(self, mask: np.ndarray) -> "_Frame":
+            mask = np.asarray(mask, dtype=bool)
+            indices = [self._idx[i] for i in np.nonzero(mask)[0]]
+            return _Frame(self._arr[mask], indices, self._cols)
+
+    size_bytes = 0
+    try:
+        size_bytes = csv_path.stat().st_size
+    except OSError:  # pragma: no cover - filesystem edge case
+        size_bytes = 0
+
+    use_polars = pl is not None and (pd is None or size_bytes > 8_000_000)
+    if use_polars:
+        try:
+            frame = pl.read_csv(csv_path, try_parse_dates=True)
+            if pd is not None:
+                pdf = frame.to_pandas()
+                if not pdf.empty and pdf.columns.size:
+                    first_col = pdf.columns[0]
+                    pdf = pdf.set_index(first_col)
+                    if pd is not None:
+                        pdf.index = pd.to_datetime(pdf.index, errors="ignore")
+                return pdf
+            if frame.width == 0:
+                return _Frame(np.empty((0, 0), dtype=float), [], [])
+            cols = frame.columns
+            if not cols:
+                return _Frame(np.empty((0, 0), dtype=float), [], [])
+            values_np = frame.select(cols[1:]).to_numpy()
+            if values_np.size:
+                values_np = values_np.astype(float)
+            dates = frame.select(cols[0]).to_series().to_list()
+            return _Frame(values_np, dates, cols[1:])
+        except Exception:  # pragma: no cover - fallback on parse issues
+            if pd is None:
+                raise
+            # fall back to pandas parsing for complex headers
     if pd is not None:
         return pd.read_csv(csv_path, index_col=0, parse_dates=True)
 
@@ -4991,39 +5397,17 @@ def _read_csv(csv_path: Path):
     if header_cols and values.size and values.shape[1] != len(header_cols):
         header_cols = [f"w{i}" for i in range(values.shape[1])]
 
-    class _Frame:
-        def __init__(
-            self,
-            arr: np.ndarray,
-            idx: Sequence[str],
-            cols: Optional[Sequence[str]] = None,
-        ):
-            self._arr = arr
-            self._idx = [np.datetime64(d) for d in idx]
-            self._cols = list(cols) if cols is not None else []
-
-        def to_numpy(self, dtype=float):
-            return self._arr.astype(dtype)
-
-        @property
-        def index(self):
-            return self._idx
-
-        @property
-        def columns(self):
-            return self._cols
-
-        def filter_rows(self, mask: np.ndarray) -> "_Frame":
-            mask = np.asarray(mask, dtype=bool)
-            indices = [self._idx[i] for i in np.nonzero(mask)[0]]
-            return _Frame(self._arr[mask], indices, self._cols)
-
     return _Frame(values, dates, header_cols)
 
 
 def _extract_asset_names(frame: Any, n_assets: int) -> List[str]:
     if hasattr(frame, "columns") and getattr(frame, "columns") is not None:
-        cols = [str(col) for col in frame.columns]
+        cols_obj = frame.columns
+        if pd is not None and isinstance(cols_obj, pd.MultiIndex):
+            level = cols_obj.get_level_values(-1)
+            cols = [str(col) for col in level]
+        else:
+            cols = [str(col) for col in cols_obj]
         if len(cols) == n_assets:
             return cols
     return [f"A{i}" for i in range(n_assets)]
@@ -5259,6 +5643,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Penalty weight applied to turnover in multi_term objective",
+    )
+    parser.add_argument(
+        "--gamma-by-sector",
+        type=str,
+        default=None,
+        help="YAML/JSON mapping of sector-level turnover penalties",
     )
     parser.add_argument(
         "--warm-start",
@@ -5547,6 +5937,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
         te_target=parsed.te_target,
         lambda_te=parsed.lambda_te,
         gamma_turnover=parsed.gamma_turnover,
+        gamma_by_sector=parsed.gamma_by_sector,
         risk_free_rate=float(parsed.rf_bps) / 1e4,
         trading_days=parsed.trading_days,
         dtype=float_dtype,

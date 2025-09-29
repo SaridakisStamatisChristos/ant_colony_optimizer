@@ -43,8 +43,8 @@ def test_parquet_outputs_created_when_requested(tmp_path: Path, monkeypatch) -> 
     rebalance_csv = tmp_path / "rebalance_report.csv"
     _write_csv(
         rebalance_csv,
-        ["date", "gross_ret", "net_tx_ret", "net_slip_ret", "turnover", "tx_cost", "slippage_cost", "sector_breaches", "active_breaches", "group_breaches", "factor_bound_breaches", "factor_inf_norm", "factor_missing", "first_violation", "feasible", "projection_iterations", "block_sharpe", "block_sortino", "block_info_ratio", "block_tracking_error"],
-        [["2020-01-02", "0.01", "0.01", "0.01", "0.1", "0.0", "0.0", "0", "0", "0", "0", "0", "False", "", "True", "0", "0.0", "0.0", "", ""]],
+        ["date", "gross_ret", "net_tx_ret", "net_slip_ret", "turnover", "tx_cost", "slippage_cost", "sector_breaches", "sector_penalty", "active_breaches", "group_breaches", "factor_bound_breaches", "factor_inf_norm", "factor_missing", "first_violation", "feasible", "projection_iterations", "block_sharpe", "block_sortino", "block_info_ratio", "block_tracking_error"],
+        [["2020-01-02", "0.01", "0.01", "0.01", "0.1", "0.0", "0.0", "0", "0.0", "0", "0", "0", "0", "False", "", "True", "0", "0.0", "0.0", "", ""]],
     )
     metrics_csv = tmp_path / "metrics.csv"
     _write_csv(metrics_csv, ["metric", "value"], [["sharpe", "0.0"]])

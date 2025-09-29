@@ -11,9 +11,11 @@ class PortfolioConstraints:
     equality_enforce: bool = True
     leverage_limit: float = 1.0
     sector_map: Optional[List[int]] = None
+    sector_name_map: Optional[Dict[int, str]] = None
     max_sector_concentration: float = 0.4
     prev_weights: Optional[np.ndarray] = None
     max_turnover: float = 0.3
+    turnover_gamma: Optional[np.ndarray] = None
     factor_loadings: Optional[np.ndarray] = None
     factor_targets: Optional[np.ndarray] = None
     factor_tolerance: float = 1e-6

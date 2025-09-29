@@ -53,6 +53,7 @@ def test_cli_json_logging_schema(tmp_path: Path) -> None:
         "breaches",
         "block",
         "timings",
+        "sector_penalty",
     }
     expected_cost_keys = {"tx", "slippage"}
     expected_breach_keys = {"active", "group", "factor", "sector"}
@@ -74,6 +75,7 @@ def test_cli_json_logging_schema(tmp_path: Path) -> None:
         assert isinstance(payload["warm_applied"], bool)
         assert isinstance(payload["decay"], float)
         assert isinstance(payload["feasible"], bool)
+        assert isinstance(payload["sector_penalty"], float)
 
         costs = payload["costs"]
         assert set(costs) == expected_cost_keys
