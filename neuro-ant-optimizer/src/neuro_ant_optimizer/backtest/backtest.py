@@ -864,7 +864,7 @@ if _PYDANTIC_AVAILABLE:
         tx_cost_mode: Literal["none", "upfront", "amortized", "posthoc"] = "posthoc"
         rf_bps: float = 0.0
         trading_days: int = Field(ge=1, default=252)
-        data_freq: str = "B"
+        data_freq: str = "D"
         data_tz: str = "UTC"
         pit: bool = True
         dropna: Literal["none", "any", "all"] = "none"
@@ -947,7 +947,7 @@ else:
             "tx_cost_mode": "posthoc",
             "rf_bps": 0.0,
             "trading_days": 252,
-            "data_freq": "B",
+            "data_freq": "D",
             "data_tz": "UTC",
             "pit": True,
             "dropna": "none",
@@ -3503,7 +3503,9 @@ def backtest(
     rebalance_callback: Optional[RebalanceLogCallback] = None,
     dtype: np.dtype = np.float64,
     cov_cache_size: int = 8,
+    workers: Optional[int] = None,
     max_workers: Optional[int] = None,
+    prefetch: int = 2,
     warm_start: Optional[Any] = None,
     warm_align: str = "last_row",
     decay: float = 0.0,
@@ -3580,13 +3582,20 @@ def backtest(
     if float_dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
         float_dtype = np.dtype(np.float64)
     workers_value: Optional[int] = None
+    if workers is not None and max_workers is not None:
+        raise ValueError("Specify either workers or max_workers, not both")
     if workers is not None:
         workers_value = int(workers)
     elif max_workers is not None:
         workers_value = int(max_workers)
     if workers_value is not None and workers_value <= 0:
         raise ValueError("workers must be positive when provided")
-    prefetch_chunks = max(1, int(prefetch))
+    try:
+        prefetch_chunks = int(prefetch)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+        raise ValueError("prefetch must be an integer") from exc
+    if prefetch_chunks < 1:
+        raise ValueError("prefetch must be >= 1")
 
     df, returns_arr, dates = _sanitize_frame(
         df, drop_duplicates=drop_duplicates, label="returns"
@@ -3963,6 +3972,7 @@ def backtest(
             executor = ProcessPoolExecutor(max_workers=workers_value)
 
         def submit(index: int) -> None:
+            nonlocal cov_cache_hits, cov_cache_misses, cov_cache_evictions
             start_idx = rebalance_points[index]
             end_idx = min(start_idx + step, n_periods)
             train_window = returns[start_idx - lookback : start_idx]
@@ -4227,10 +4237,16 @@ def backtest(
                 }
             )
 
+        if test.size:
+            block_asset_returns = (
+                np.prod(1.0 + np.asarray(test, dtype=float), axis=0) - 1.0
+            )
+        else:
+            block_asset_returns = np.zeros_like(w, dtype=float)
+
         period_asset_returns.append(np.asarray(block_asset_returns, dtype=float))
         period_dates_for_brinson.append(rebalance_date)
         if compute_factor_attr and current_factor_snapshot is not None:
-            block_asset_returns = np.prod(1.0 + np.asarray(test, dtype=float), axis=0) - 1.0
             attr_row = _compute_factor_attr_row(
                 rebalance_date,
                 current_factor_snapshot,
@@ -6190,7 +6206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-freq",
         type=str,
-        default="B",
+        default="D",
         help="Expected calendar frequency for the returns index (e.g. B, D, W)",
     )
     parser.add_argument(
