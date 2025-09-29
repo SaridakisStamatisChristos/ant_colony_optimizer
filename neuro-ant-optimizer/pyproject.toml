@@ -74,6 +74,9 @@ addopts = "-q"
 markers = [
   "slow: tests that cover multiprocessing or longer running behaviour",
 ]
+filterwarnings = [
+  "ignore:cannot collect test class 'TestClient' because it has a __init__ constructor:pytest.PytestCollectionWarning",
+]
 
 [tool.ruff]
 line-length = 100
