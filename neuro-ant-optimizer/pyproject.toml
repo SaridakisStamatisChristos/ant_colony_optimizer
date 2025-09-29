@@ -24,6 +24,7 @@ dependencies = [
   "numpy>=1.23",
   "torch>=2.0",
   "scipy>=1.10",
+  "psutil>=5.9",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",

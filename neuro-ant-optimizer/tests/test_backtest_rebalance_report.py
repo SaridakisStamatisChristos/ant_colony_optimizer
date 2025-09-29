@@ -116,6 +116,7 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         assert record["nt_band_hits"] == 0
         assert record["participation_breaches"] == 0
         assert record["sector_breaches"] == 0
+        assert record["sector_penalty"] == pytest.approx(0.0)
         assert record["active_breaches"] == 0
         assert record["group_breaches"] == 0
         assert record["factor_bound_breaches"] == 0
@@ -156,8 +157,8 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     assert text[0] == (
         "date,gross_ret,net_tx_ret,net_slip_ret,turnover,turnover_pre_decay,"
         "turnover_post_decay,tx_cost,slippage_cost,nt_band_hits,participation_breaches,"
-        "sector_breaches,active_breaches,group_breaches,factor_bound_breaches,factor_inf_norm,"
-        "factor_missing,first_violation,feasible,projection_iterations,block_sharpe,"
+        "sector_breaches,sector_penalty,active_breaches,group_breaches,factor_bound_breaches,"
+        "factor_inf_norm,factor_missing,first_violation,feasible,projection_iterations,block_sharpe,"
         "block_sortino,block_info_ratio,block_tracking_error,warm_applied,decay"
     )
 
