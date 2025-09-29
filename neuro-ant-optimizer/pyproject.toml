@@ -64,6 +64,9 @@ arrow = ["pyarrow>=15.0"]
 
 [project.scripts]
 neuro-ant-backtest = "neuro_ant_optimizer.backtest.backtest:main"
+neuro-ant-intraday = "neuro_ant_optimizer.intraday.cli:main"
+neuro-ant-sim = "neuro_ant_optimizer.live.cli:main"
+neuro-ant-scenario = "neuro_ant_optimizer.scenario.cli:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"
