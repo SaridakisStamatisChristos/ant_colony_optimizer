@@ -31,3 +31,8 @@ Replay a run with `python -m neuro_ant_optimizer.backtest.reproduce --manifest r
 - Covariance caching (`--cache-cov`) defaults to `8`. Increase it when sliding windows overlap heavily; set it to `0` to force a cold path when benchmarking improvements.
 - Slippage and transaction-cost modelling add computation. Disable them when validating core optimization logic to minimize noise.
 - Use the new vectorized ant loop (enabled by default) to improve training throughput; benchmark scripts in `bench/` report wall-time improvements when compared to the previous per-ant PyTorch calls.
+
+## Optional test dependencies
+
+- `tests/test_drop_duplicates.py` imports pandas with `pytest.importorskip`, so the whole module is skipped when pandas is unavailable.【F:tests/test_drop_duplicates.py†L3-L58】
+- `tests/test_perf_parallel.py` exercises the multiprocessing backtest path only when pandas is installed; each test explicitly skips with a "pandas is required" message if the dependency is missing.【F:tests/test_perf_parallel.py†L1-L90】

@@ -142,6 +142,14 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
         assert record["block_sortino"] == pytest.approx(expected_block_sortino)
         assert record["block_info_ratio"] is None
         assert record["block_tracking_error"] is None
+        assert record["slippage_cost"] == pytest.approx(0.0)
+        assert record["pre_trade_ok"] is True
+        assert record["pre_trade_breach_count"] == 0
+        assert record["post_trade_breach_count"] == 0
+        assert record["breach_count"] == 0
+        assert record["first_breach"] is None
+        assert record["pre_trade_reasons"] == ""
+        assert record["post_trade_reasons"] == ""
         assert record["warm_applied"] is False
         assert record["decay"] == pytest.approx(0.0)
 
@@ -154,13 +162,45 @@ def test_rebalance_report_and_net_returns(tmp_path: Path, monkeypatch) -> None:
     report_path = tmp_path / "rebalance_report.csv"
     bt._write_rebalance_report(report_path, results)
     text = report_path.read_text().splitlines()
-    assert text[0] == (
-        "date,gross_ret,net_tx_ret,net_slip_ret,turnover,turnover_pre_decay,"
-        "turnover_post_decay,tx_cost,slippage_cost,nt_band_hits,participation_breaches,"
-        "sector_breaches,sector_penalty,active_breaches,group_breaches,factor_bound_breaches,"
-        "factor_inf_norm,factor_missing,first_violation,feasible,projection_iterations,block_sharpe,"
-        "block_sortino,block_info_ratio,block_tracking_error,warm_applied,decay"
+    expected_header = ",".join(
+        [
+            "date",
+            "gross_ret",
+            "net_tx_ret",
+            "net_slip_ret",
+            "turnover",
+            "turnover_pre_decay",
+            "turnover_post_decay",
+            "tx_cost",
+            "slippage_cost",
+            "nt_band_hits",
+            "participation_breaches",
+            "sector_breaches",
+            "sector_penalty",
+            "active_breaches",
+            "group_breaches",
+            "factor_bound_breaches",
+            "factor_inf_norm",
+            "factor_missing",
+            "first_violation",
+            "feasible",
+            "projection_iterations",
+            "block_sharpe",
+            "block_sortino",
+            "block_info_ratio",
+            "block_tracking_error",
+            "pre_trade_ok",
+            "pre_trade_breach_count",
+            "post_trade_breach_count",
+            "breach_count",
+            "first_breach",
+            "pre_trade_reasons",
+            "post_trade_reasons",
+            "warm_applied",
+            "decay",
+        ]
     )
+    assert text[0] == expected_header
 
 
 def test_active_bounds_fall_back_for_missing_benchmark(monkeypatch) -> None:
