@@ -101,6 +101,26 @@ jobs:
         with:
           name: wheel-${{ matrix.os }}-py${{ matrix.python-version }}
           path: dist/*.whl
+  slow-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-slow-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Install slow-check dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,backtest,io,polars]"
+      - name: Run slow checks harness
+        run: python scripts/run_slow_checks.py
   release:
     name: release build
     runs-on: ubuntu-latest
