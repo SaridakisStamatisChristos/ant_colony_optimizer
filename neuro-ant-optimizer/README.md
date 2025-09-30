@@ -157,6 +157,15 @@ The command writes artifacts to `quickstart_artifacts/`, appends to `runs.csv`, 
 a zipped copy under `quickstart_archives/`. Inspect the outputs or open the example
 notebooks to explore the generated metrics.
 
+### Replay a recorded manifest
+
+```bash
+neuro-ant-reproduce --manifest runs/.../run_config.json --out bt_out_replay
+```
+
+The reproducibility CLI replays a captured configuration manifest and regenerates the
+backtest artifacts under the directory provided via `--out`.
+
 ### Run the full test suite
 
 ```bash
@@ -166,6 +175,15 @@ make test-all
 
 > Some tests are skipped without pandas; installing the backtest extras enables those
 > scenarios locally.
+
+### Slow checks
+
+The long-running regression harness that mirrors CI coverage lives in
+[`docs/slow_test_guide.md`](docs/slow_test_guide.md). For deeper determinism guidance and a
+full walkthrough of manifest replay tooling, see the
+[`docs/reproducibility.md`](docs/reproducibility.md) companion guide. Both references
+explain the scenarios, expected artifacts, and tips for reproducing the checks locally
+before pushing.
 
 ---
 

@@ -11,9 +11,10 @@ import os
 import sys
 import tempfile
 import uuid
-from dataclasses import dataclass
-from pathlib import Path
 from collections.abc import Mapping
+from dataclasses import dataclass
+from importlib import import_module
+from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Sequence
 
 import numpy as np
@@ -31,8 +32,6 @@ from neuro_ant_optimizer.backtest.backtest import (  # noqa: E402
     SlippageConfig,
     backtest,
 )
-
-from importlib import import_module
 
 backtest_cli = import_module("neuro_ant_optimizer.backtest.backtest")
 create_app = import_module("service.app").create_app
@@ -186,6 +185,15 @@ def run_backtest_case(
     _write_weights_csv(out_dir, result["rebalance_dates"], result["weights"], result["asset_names"])
     _write_rebalance_report(out_dir, result.get("rebalance_records", []))
     _write_metrics_csv(out_dir, result)
+
+    records = result.get("rebalance_records") or []
+    feasible_count = sum(
+        1
+        for record in records
+        if isinstance(record, Mapping) and bool(record.get("feasible"))
+    )
+    if feasible_count == 0:
+        raise AssertionError("slow checks harness produced no feasible rebalances")
 
     summary_row = {
         "run": out_dir.name,
