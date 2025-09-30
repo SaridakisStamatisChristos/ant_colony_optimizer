@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2
+- Deterministic slow-check harness with tightened CI timeouts and CLI smoke coverage.
+- README polish covering reproducibility commands plus links to the in-depth guides.
+- Packaging and tooling refresh ahead of the v0.4.2 wheel release.
+
 ## 0.4.1
 - Covariance model extensions, benchmark objective tweaks, and risk-free handling refinements.
 - Expanded rebalance report schema with stability checks and fixture coverage.

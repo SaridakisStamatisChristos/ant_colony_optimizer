@@ -14,7 +14,7 @@ neuro_ant_optimizer = ["py.typed", "examples/configs/*.yaml"]
 
 [project]
 name = "neuro-ant-optimizer"
-version = "0.4.1"
+version = "0.4.2"
 description = "Neural-guided Ant Colony Portfolio Optimizer with robust constraints"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "MIT"}

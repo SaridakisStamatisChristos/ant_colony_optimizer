@@ -86,6 +86,8 @@ jobs:
       - name: CLI smoke (backtest)
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && matrix.extras == ''
         run: |
+          neuro-ant-backtest --help >/dev/null
+          neuro-ant-reproduce --help >/dev/null
           neuro-ant-optimizer/src/neuro_ant_optimizer/backtest/backtest.py >/dev/null 2>&1 || true
           python -c "import sys,subprocess; subprocess.check_call(['neuro-ant-backtest','--csv','neuro-ant-optimizer/backtest/sample_returns.csv','--lookback','5','--step','2','--ewma_span','3','--objective','sharpe','--out','neuro-ant-optimizer/backtest/out_ci'])"
       - name: Build wheel
@@ -103,6 +105,13 @@ jobs:
           path: dist/*.whl
   slow-checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONHASHSEED: "0"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -125,7 +134,7 @@ jobs:
     name: release build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test]
+    needs: [test, slow-checks]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
